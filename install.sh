@@ -85,30 +85,17 @@ if [ "$INSTALLED" = false ]; then
     if curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/$ASSET_NAME" 2>/dev/null; then
         echo -e "  • Unpacking release archive..."
         tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
-        cp "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+        cp -f "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
         chmod +x "$INSTALL_DIR/$BINARY_NAME"
         INSTALLED=true
     else
-        echo -e "  ${CYAN}Notice:${NC} Prebuilt asset not found on GitHub releases."
-        
-        # Case C: Fallback to local Cargo compilation if Rust is installed
-        if command -v cargo >/dev/null 2>&1; then
-            echo -e "  ${BLUE}==>${NC} Rust & Cargo detected. Compiling native release binary..."
-            if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
-                cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
-                cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
-                chmod +x "$INSTALL_DIR/$BINARY_NAME"
-                INSTALLED=true
-            else
-                cargo install --git "https://github.com/${REPO}.git" --root "$HOME/.local"
-                INSTALLED=true
-            fi
-        else
-            echo -e "${RED}❌ Unable to install prebuilt release and Cargo is not installed.${NC}"
-            echo "Please install Rust/Cargo (https://rustup.rs) or download a release from:"
-            echo "https://github.com/${REPO}/releases"
-            exit 1
-        fi
+        echo -e "${RED}❌ Failed to download prebuilt binary from GitHub Releases.${NC}"
+        echo "Release asset '${ASSET_NAME}' was not found at:"
+        echo "  ${DOWNLOAD_URL}"
+        echo ""
+        echo "Please check available releases at:"
+        echo "  https://github.com/${REPO}/releases"
+        exit 1
     fi
 fi
 
