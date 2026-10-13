@@ -1,0 +1,6 @@
+{"premise": "A programmer is writing unit tests in Rust.", "hypothesis": "Someone is coding software.", "label": "entailment"}
+{"premise": "A server is running in a quiet datacenter.", "hypothesis": "The server is completely turned off and disconnected.", "label": "contradiction"}
+{"premise": "A engineer is profiling a deep learning model.", "hypothesis": "The engineer is using Linux.", "label": "neutral"}
+{"premise": "ModernBERT is being evaluated on classification benchmarks.", "hypothesis": "A machine learning model is under evaluation.", "label": "entailment"}
+{"premise": "The model produced 100% correct responses on the test suite.", "hypothesis": "Every single test failed completely.", "label": "contradiction"}
+{"premise": "The user opened the terminal to run cargo build.", "hypothesis": "The user is using a keyboard.", "label": "neutral"}

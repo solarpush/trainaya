@@ -1,0 +1,70 @@
+[
+  {
+    "id": "probe_pod_sigterm",
+    "prompt": "Pod redis-cache-07 evicted due to node memory pressure: graceful shutdown SIGTERM 143",
+    "baseline_winnow": {
+      "routing": "page_sre_immediate",
+      "routing_confidence": 0.53,
+      "is_breach": "yes",
+      "is_breach_confidence": 0.80,
+      "verdict": "FALSE POSITIVE (Critique: une extinction normale k8s ne doit JAMAIS pager l'astreinte ni être considérée comme une brèche de sécurité !)"
+    },
+    "expected_after_lora": {
+      "routing": "silent_auto_ack",
+      "routing_confidence": ">= 0.90",
+      "is_breach": "no",
+      "is_breach_confidence": ">= 0.90"
+    }
+  },
+  {
+    "id": "probe_staging_latency",
+    "prompt": "OmegaCorp staging cluster degraded: latency reached 250ms during off-peak load test",
+    "baseline_winnow": {
+      "routing": "page_sre_immediate",
+      "routing_confidence": 0.58,
+      "is_breach": "yes",
+      "is_breach_confidence": 0.80,
+      "verdict": "FALSE POSITIVE sur is_breach (un test de charge hors pic sur staging n'est pas une brèche) et hésitation sur le routing (0.58)"
+    },
+    "expected_after_lora": {
+      "routing": "defer_business_queue",
+      "routing_confidence": ">= 0.85",
+      "is_breach": "no",
+      "is_breach_confidence": ">= 0.95"
+    }
+  },
+  {
+    "id": "probe_canary_honeytoken",
+    "prompt": "CANARY_TOKEN_TRIGGERED: unauthorized honeytoken read on /etc/shadow-backup",
+    "baseline_winnow": {
+      "routing": "page_sre_immediate",
+      "routing_confidence": 0.90,
+      "is_breach": "yes",
+      "is_breach_confidence": 0.91,
+      "verdict": "CORRECT (Doit rester hautement prioritaire après LoRA sans régression)"
+    },
+    "expected_after_lora": {
+      "routing": "page_sre_immediate",
+      "routing_confidence": ">= 0.95",
+      "is_breach": "yes",
+      "is_breach_confidence": ">= 0.95"
+    }
+  },
+  {
+    "id": "probe_invoice_request",
+    "prompt": "Client AlphaTech requesting invoice receipt PDF copy for March annual billing renewal",
+    "baseline_winnow": {
+      "routing": "defer_business_queue",
+      "routing_confidence": 1.00,
+      "is_breach": "no",
+      "is_breach_confidence": 0.94,
+      "verdict": "CORRECT (Cas business standard sans brèche)"
+    },
+    "expected_after_lora": {
+      "routing": "defer_business_queue",
+      "routing_confidence": ">= 0.95",
+      "is_breach": "no",
+      "is_breach_confidence": ">= 0.95"
+    }
+  }
+]

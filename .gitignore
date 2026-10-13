@@ -1,0 +1,14 @@
+target/
+Cargo.lock
+output/
+output_*/
+*.safetensors
+*.gguf
+*.onnx
+.venv/
+__pycache__/
+vendor/
+*.log
+results/bench_test.json
+results/bench_*.json
+

@@ -1,0 +1,26 @@
+# ==============================================================================
+# .Curatefile: Recette de composition et distillation de dataset
+# ==============================================================================
+
+# Teacher Engine (utilise votre session locale 'agy' à zéro frais API)
+TEACHER agy
+
+# Mode de curation : 'label' (annotation), 'synth' (synthèse), 'augment'
+MODE label
+
+# Format cible du dataset adapté à votre modèle (decision, classification, nli)
+FORMAT decision
+
+# Données brutes à étiqueter
+INPUT ./data/eval_probes.jsonl
+
+# Schéma de décision et critères métier
+SCHEMA ./data/questions_schema.json
+
+# Fichier de sortie prêt pour .Trainfile
+OUTPUT ./data/curated_from_teacher.jsonl
+
+# Paramètres du Teacher
+PARAMETER batch_size 4
+PARAMETER min_confidence 0.85
+PARAMETER add_hard_negatives false

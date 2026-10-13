@@ -1,0 +1,12 @@
+{"text": "The latest performance update made the inference pipeline incredibly fast!", "label": "positive"}
+{"text": "Constant timeouts and out of memory crashes under high concurrency.", "label": "negative"}
+{"text": "The documentation is well-structured and easy to follow for new developers.", "label": "positive"}
+{"text": "Completely broken dependencies and missing package configuration.", "label": "negative"}
+{"text": "Superb low latency response times when served via Ollaya runtime.", "label": "positive"}
+{"text": "The fine-tuning loss diverged immediately and produced corrupted outputs.", "label": "negative"}
+{"text": "Clean code architecture with modular Rust crates and fast SIMD kernels.", "label": "positive"}
+{"text": "Terrible developer experience, took three hours just to find the config file.", "label": "negative"}
+{"text": "Everything compiled on the first try and tests passed without a hitch.", "label": "positive"}
+{"text": "Fatal segmentation fault occurred during matrix multiplication.", "label": "negative"}
+{"text": "Memory footprint was reduced by 60% after applying INT8 quantization.", "label": "positive"}
+{"text": "Inference speed dropped to unacceptable rates on large batches.", "label": "negative"}

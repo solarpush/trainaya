@@ -1,0 +1,37 @@
+# ==============================================================================
+# .Trainfile: Trainaya recipe mirroring Ollaya's Modelfile syntax
+# ==============================================================================
+
+# Base model to fine-tune (Ollaya model tag, HuggingFace repo, or local file)
+FROM winnow:e4b
+
+# Training dataset and Ollaya question schema
+DATA ./data/train_specific_decision.jsonl
+SCHEMA ./data/questions_schema.json
+
+# Model family layout
+FAMILY winnow-v1
+
+# Task type: classification or nli
+TASK classification
+
+# Optimization hyperparameters
+PARAMETER epochs 2
+PARAMETER batch_size 8
+PARAMETER lr 5e-5
+
+# LoRA hyperparameters
+PARAMETER lora_r 16
+PARAMETER lora_alpha 32
+PARAMETER target_modules attn_output,ffn_down
+
+# Weight merging & quantization
+MERGE true
+QUANT Q8_0
+
+# Model tag for the trained model in Ollaya (auto-increments: v1, v2...)
+TAG winnow:v{auto}
+
+# Output directory (isolated by tag)
+OUTPUT ./output/{tag}
+

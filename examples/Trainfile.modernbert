@@ -1,0 +1,19 @@
+# ==============================================================================
+# Trainfile.modernbert: Encoder NLI recipe
+# ==============================================================================
+
+FROM answerdotai/ModernBERT-base
+DATA ./examples/sample_classification.jsonl
+
+TASK classification
+FAMILY nli-pairs-v1
+
+PARAMETER epochs 3
+PARAMETER batch_size 8
+PARAMETER lr 5e-5
+PARAMETER lora_r 16
+PARAMETER lora_alpha 32
+
+MERGE true
+REGISTER laya:custom
+OUTPUT ./output_modernbert

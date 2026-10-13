@@ -1,0 +1,15 @@
+{
+  "routing": {
+    "type": "choice",
+    "instructions": "According to internal DevOps & SecOps policy, how must this incident or request be handled?",
+    "criteria": {
+      "page_sre_immediate": "P1 Critical: VIP enterprise degradation, credential leak, canary breach, or fatal production crash requiring on-call engineer paging immediately.",
+      "silent_auto_ack": "Routine automated background events: scheduled DB vacuum/backup, Kubernetes graceful pod scale-down (SIGTERM 143), rate-limit backoff, or normal health check.",
+      "defer_business_queue": "Standard non-urgent requests: billing invoice copy, quota increase request, documentation inquiry, or general ticket to be reviewed during business hours."
+    }
+  },
+  "is_breach": {
+    "type": "noul",
+    "statement": "This event involves a verified security breach, canary token trigger, or active credential leak."
+  }
+}

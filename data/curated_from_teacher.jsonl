@@ -1,0 +1,8 @@
+{"label":"page_sre_immediate","text":"CANARY_TOKEN_TRIGGERED: unauthorized honeytoken read on /etc/shadow-backup"}
+{"label":"page_sre_immediate","text":"Hard crash: kernel panic on payment processing node k8s-worker-prod-12"}
+{"label":"silent_auto_ack","text":"Pod redis-cache-07 evicted due to node memory pressure: graceful shutdown SIGTERM 143"}
+{"label":"silent_auto_ack","text":"Postgres auto-vacuum daemon completed worker loop on public.audit_logs"}
+{"label":"defer_business_queue","text":"OmegaCorp staging cluster degraded: latency reached 250ms during off-peak load test"}
+{"label":"defer_business_queue","text":"Client AlphaTech requesting invoice receipt PDF copy for March annual billing renewal"}
+{"label":"page_sre_immediate","text":"SSL Certificate expiration warning: wildcard.api.enterprise.com expires in 4 hours"}
+{"label":"silent_auto_ack","text":"Rate limiter activated: API returned ERR_RATE_LIMIT_429, client backed off exponentially"}

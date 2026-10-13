@@ -1,0 +1,20 @@
+# ==============================================================================
+# .Benchfile: Declarative recipe for Ollaya Decision Benchmarks
+# ==============================================================================
+
+# Target model to evaluate
+# Supports exact tags (winnow:custom) or dynamic resolution:
+#   winnow:v{latest} -> automatically resolves to the latest trained version (e.g. winnow:v1)
+MODEL winnow:v{latest}
+
+# Baseline reference model for comparative A/B testing
+BASELINE winnow:e4b
+
+# Subsets to evaluate (selected from the 13 public decision benchmark datasets)
+SUBSETS multinli, paws, boolq, vitaminc-dev
+
+# Ollaya runtime endpoint
+URL http://127.0.0.1:11435
+
+# Output report path (expands {model}, {baseline}, {tag})
+OUTPUT ./results/bench_{model}_vs_{baseline}.json

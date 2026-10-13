@@ -1,0 +1,30 @@
+{"text": "CANARY_TOKEN_TRIGGERED: unauthorized honeytoken read on /etc/shadow-backup", "label": "page_sre_immediate"}
+{"text": "CRITICAL: Database postgres-primary deadlocked under heavy write load, 45 connections timed out", "label": "page_sre_immediate"}
+{"text": "AWS IAM alert: root account logged in without MFA from unknown IP address", "label": "page_sre_immediate"}
+{"text": "Hard crash: kernel panic on payment processing node k8s-worker-prod-12", "label": "page_sre_immediate"}
+{"text": "Ransomware signature detected in storage volume s3-corp-customer-data", "label": "page_sre_immediate"}
+{"text": "Live credentials found committed to public repository: GITHUB_TOKEN and DB_PASS", "label": "page_sre_immediate"}
+{"text": "DDoS detection: SYN flood incoming at 45 Gbps on edge gateway router", "label": "page_sre_immediate"}
+{"text": "Enterprise VIP client GlobalBank: checkout service returning 500 Internal Server Error", "label": "page_sre_immediate"}
+{"text": "SSL Certificate expired on core API domain api.production.company.com", "label": "page_sre_immediate"}
+{"text": "Active SQL injection exploit attempt detected in HTTP parameter id on /api/v2/user", "label": "page_sre_immediate"}
+{"text": "Pod redis-cache-07 evicted due to node memory pressure: graceful shutdown SIGTERM 143", "label": "silent_auto_ack"}
+{"text": "Kubernetes kubelet node autoscaling scale-down: pod worker-job-44 finished and terminated", "label": "silent_auto_ack"}
+{"text": "Postgres auto-vacuum daemon completed worker loop on public.audit_logs in 42s", "label": "silent_auto_ack"}
+{"text": "Daily automated snapshot created successfully for volume vol-08492a83 (size 250GB)", "label": "silent_auto_ack"}
+{"text": "Rate limiter activated: API returned ERR_RATE_LIMIT_429, client backed off exponentially", "label": "silent_auto_ack"}
+{"text": "Routine healthcheck ping: consul cluster leader elected, all nodes healthy (HTTP 200)", "label": "silent_auto_ack"}
+{"text": "Scheduled log rotation script finished for /var/log/nginx/access.log", "label": "silent_auto_ack"}
+{"text": "Redis memory defragmentation completed successfully in background thread", "label": "silent_auto_ack"}
+{"text": "Batch job archive_cold_records completed: 154,200 rows moved to Glacier", "label": "silent_auto_ack"}
+{"text": "Staging pod deployment rollout completed: replica 3/3 ready", "label": "silent_auto_ack"}
+{"text": "OmegaCorp staging cluster degraded: latency reached 250ms during off-peak load test", "label": "defer_business_queue"}
+{"text": "Client AlphaTech requesting invoice receipt PDF copy for March annual billing renewal", "label": "defer_business_queue"}
+{"text": "Internal developer requesting sandbox API key regeneration for local staging testing", "label": "defer_business_queue"}
+{"text": "Customer question: does the REST API support bulk export in CSV format?", "label": "defer_business_queue"}
+{"text": "Non-urgent feature request: add dark mode support to admin analytics dashboard", "label": "defer_business_queue"}
+{"text": "Notification: SSL certificate for dev-sandbox.company.internal will expire in 45 days", "label": "defer_business_queue"}
+{"text": "Account update request: customer wants to change billing email recipient to accounting@firm.com", "label": "defer_business_queue"}
+{"text": "Feedback from user survey: checkout button color is slightly confusing on mobile", "label": "defer_business_queue"}
+{"text": "Staging environment scheduled downtime notification for tomorrow 8:00 PM UTC", "label": "defer_business_queue"}
+{"text": "Inquiry regarding compliance documentation: SOC2 Type II report request", "label": "defer_business_queue"}
