@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub enum TaskType {
     Classification,
     Nli,
+    Decision,
 }
 
 impl std::fmt::Display for TaskType {
@@ -14,6 +15,7 @@ impl std::fmt::Display for TaskType {
         match self {
             TaskType::Classification => write!(f, "classification"),
             TaskType::Nli => write!(f, "nli"),
+            TaskType::Decision => write!(f, "decision"),
         }
     }
 }
@@ -96,11 +98,17 @@ pub struct TrainingArgs {
     pub task: TaskType,
     pub epochs: usize,
     pub batch_size: usize,
+    pub grad_accum_steps: usize,
     pub lr: f64,
+    pub warmup_ratio: f32,
+    pub max_grad_norm: f32,
+    pub lr_scheduler: String,
     pub max_length: usize,
     pub weight_decay: f32,
     pub seed: u64,
     pub qlora: bool,
+    pub bf16: bool,
+    pub lora_layers: usize,
     pub device: String,
     pub lora: LoraConfig,
     pub merge_mode: MergeMode,

@@ -122,7 +122,7 @@ impl SystemHardware {
         let target = device_str.to_lowercase();
 
         match &self.gpu {
-            GpuKind::Rocm { arch, .. } if target == "rocm" || target == "auto" => {
+            GpuKind::Rocm { arch, .. } if target == "rocm" || target == "hip" || target == "vulkan" || target == "auto" => {
                 envs.insert("HSA_OVERRIDE_GFX_VERSION".to_string(), arch.clone());
                 envs.insert("HIP_VISIBLE_DEVICES".to_string(), "0".to_string());
                 envs.insert("ROCM_PATH".to_string(), "/usr".to_string());
@@ -130,13 +130,24 @@ impl SystemHardware {
             GpuKind::Cuda { .. } if target == "cuda" || target == "auto" => {
                 envs.insert("CUDA_VISIBLE_DEVICES".to_string(), "0".to_string());
             }
-            GpuKind::Metal { .. } if target == "metal" || target == "auto" => {
+            GpuKind::Metal { .. } if target == "metal" || target == "mps" || target == "auto" => {
                 envs.insert("PYTORCH_ENABLE_MPS_FALLBACK".to_string(), "1".to_string());
             }
             _ => {}
         }
 
         envs
+    }
+
+    /// Apply GPU runtime environment variables to current process if not already set
+    pub fn apply_environment(&self, device_str: &str) {
+        for (k, v) in self.get_environment_for_device(device_str) {
+            if std::env::var_os(&k).is_none() {
+                unsafe {
+                    std::env::set_var(k, v);
+                }
+            }
+        }
     }
 
     /// Print formatted diagnostics

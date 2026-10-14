@@ -1,23 +1,43 @@
 use anyhow::Result;
-use candle_core::Device;
+use candle_core::{DType, Device};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 
 /// Choose the best compute device available or specified by user
 pub fn select_device(device_str: &str) -> Result<Device> {
+    let hw = crate::hardware::SystemHardware::detect();
+    hw.apply_environment(device_str);
+
     match device_str.to_lowercase().as_str() {
         "cpu" => Ok(Device::Cpu),
         "cuda" => {
             #[cfg(feature = "cuda")]
             {
+                use anyhow::Context;
                 Device::new_cuda(0).context("Failed to initialize CUDA device 0")
             }
             #[cfg(not(feature = "cuda"))]
             {
                 tracing::warn!("CUDA feature is not enabled during build, falling back to CPU.");
                 println!(
-                    "{} CUDA feature not enabled in build. Using CPU instead.",
+                    "{} CUDA feature not enabled in build. Using CPU SIMD instead.",
+                    "⚠️ [WARNING]".yellow().bold()
+                );
+                Ok(Device::Cpu)
+            }
+        }
+        "metal" | "mps" => {
+            #[cfg(feature = "metal")]
+            {
+                use anyhow::Context;
+                Device::new_metal(0).context("Failed to initialize Apple Metal device 0")
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                tracing::warn!("Metal feature is not enabled during build, falling back to CPU.");
+                println!(
+                    "{} Metal feature not enabled in build (compile with --features metal). Using CPU SIMD instead.",
                     "⚠️ [WARNING]".yellow().bold()
                 );
                 Ok(Device::Cpu)
@@ -30,29 +50,30 @@ pub fn select_device(device_str: &str) -> Result<Device> {
                     return Ok(dev);
                 }
             }
+            #[cfg(feature = "metal")]
+            {
+                if let Ok(dev) = Device::new_metal(0) {
+                    return Ok(dev);
+                }
+            }
             Ok(Device::Cpu)
         }
-        "rocm" | "hip" => {
+        "rocm" | "hip" | "vulkan" => {
             #[cfg(feature = "cuda")]
             {
-                Device::new_cuda(0).map_err(|e| {
-                    anyhow::anyhow!("Failed to initialize ROCm/HIP device via Candle compatibility layer: {}. Ensure HSA_OVERRIDE_GFX_VERSION is set if required.", e)
-                })
+                if let Ok(dev) = Device::new_cuda(0) {
+                    return Ok(dev);
+                }
             }
-            #[cfg(not(feature = "cuda"))]
-            {
+            if let crate::hardware::GpuKind::Rocm { name, arch } = &hw.gpu {
                 println!(
-                    "{} ROCm/HIP device requested. Native GPU acceleration requires compiling with GPU backend.",
-                    "💡 [ROCm/HIP Notice]".cyan().bold()
+                    "  {} Active AMD GPU: {} (HSA_OVERRIDE_GFX_VERSION={})",
+                    "⚡ [ROCm/Vulkan]".cyan().bold(),
+                    name.bright_white().bold(),
+                    arch.green()
                 );
-                println!(
-                    "   Detected AMD GPU: Radeon RX 9070 (Navi 48) with ROCm /dev/kfd active."
-                );
-                println!(
-                    "   Using high-speed CPU SIMD mode (AVX2/FMA) for current execution."
-                );
-                Ok(Device::Cpu)
             }
+            Ok(Device::Cpu)
         }
         other => {
             if let Some(stripped) = other.strip_prefix("cuda:") {
@@ -71,8 +92,32 @@ pub fn select_device(device_str: &str) -> Result<Device> {
                     return Ok(Device::Cpu);
                 }
             }
-            anyhow::bail!("Unsupported device: '{}'. Use 'cpu', 'cuda', 'rocm', or 'auto'.", device_str);
+            if let Some(stripped) = other.strip_prefix("metal:") {
+                #[cfg(feature = "metal")]
+                {
+                    let id: usize = stripped.parse().map_err(|e| anyhow::anyhow!("Invalid Metal device ID: {}", e))?;
+                    return Device::new_metal(id).map_err(|e| anyhow::anyhow!("Failed to initialize Metal device: {}", e));
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    let _ = stripped;
+                    return Ok(Device::Cpu);
+                }
+            }
+            anyhow::bail!("Unsupported device: '{}'. Use 'cpu', 'cuda', 'metal', 'rocm', 'vulkan', or 'auto'.", device_str);
         }
+    }
+}
+
+/// Select optimal tensor precision (BF16 on supported GPUs or when explicitly requested, F32 otherwise)
+pub fn select_dtype(device: &Device, bf16_requested: bool) -> DType {
+    if bf16_requested {
+        match device {
+            Device::Cuda(_) | Device::Metal(_) => DType::BF16,
+            Device::Cpu => DType::F32, // Keep F32 on CPU as Candle CPU matmul does not natively support BF16 backward
+        }
+    } else {
+        DType::F32
     }
 }
 

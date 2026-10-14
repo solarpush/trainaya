@@ -68,13 +68,37 @@ pub struct TrainOpts {
     #[arg(long)]
     pub batch_size: Option<usize>,
 
+    /// Gradient accumulation steps
+    #[arg(long)]
+    pub grad_accum: Option<usize>,
+
     /// Learning rate
     #[arg(long)]
     pub lr: Option<f64>,
 
+    /// Warmup ratio for LR schedule (default: 0.1)
+    #[arg(long)]
+    pub warmup_ratio: Option<f32>,
+
+    /// Maximum gradient L2 norm for clipping (default: 1.0)
+    #[arg(long)]
+    pub max_grad_norm: Option<f32>,
+
+    /// Learning rate scheduler: 'cosine', 'linear', or 'constant'
+    #[arg(long)]
+    pub lr_scheduler: Option<String>,
+
     /// Enable 4-bit QLoRA quantisation
     #[arg(long, default_value_t = false)]
     pub qlora: bool,
+
+    /// Enable mixed-precision BF16 training on supported GPUs
+    #[arg(long, default_value_t = false)]
+    pub bf16: bool,
+
+    /// Number of top transformer blocks to inject LoRA into for GGUF models (0 = all)
+    #[arg(long)]
+    pub lora_layers: Option<usize>,
 
     /// Directory where the trained LoRA adapter and tokenizer will be saved
     #[arg(short, long)]
@@ -112,7 +136,7 @@ pub struct TrainOpts {
     #[arg(long)]
     pub weight_decay: Option<f32>,
 
-    /// Compute device: 'auto', 'cpu', or 'cuda'
+    /// Compute device: 'auto', 'cpu', 'cuda', 'metal', 'rocm', or 'vulkan'
     #[arg(long)]
     pub device: Option<String>,
 
@@ -181,8 +205,29 @@ impl TrainOpts {
             if let Some(bs) = self.batch_size {
                 args.batch_size = bs;
             }
+            if let Some(ga) = self.grad_accum {
+                args.grad_accum_steps = ga.max(1);
+            }
             if let Some(lr) = self.lr {
                 args.lr = lr;
+            }
+            if let Some(wr) = self.warmup_ratio {
+                args.warmup_ratio = wr;
+            }
+            if let Some(mgn) = self.max_grad_norm {
+                args.max_grad_norm = mgn;
+            }
+            if let Some(sched) = self.lr_scheduler {
+                args.lr_scheduler = sched;
+            }
+            if self.bf16 {
+                args.bf16 = true;
+            }
+            if let Some(ll) = self.lora_layers {
+                args.lora_layers = ll;
+            }
+            if let Some(dev) = self.device {
+                args.device = dev;
             }
             if let Some(max_len) = self.max_length {
                 args.max_length = max_len;
@@ -276,11 +321,17 @@ impl TrainOpts {
             task: self.task,
             epochs: self.epochs.unwrap_or(3),
             batch_size: self.batch_size.unwrap_or(8),
+            grad_accum_steps: self.grad_accum.unwrap_or(1).max(1),
             lr: self.lr.unwrap_or(5e-5),
+            warmup_ratio: self.warmup_ratio.unwrap_or(0.1),
+            max_grad_norm: self.max_grad_norm.unwrap_or(1.0),
+            lr_scheduler: self.lr_scheduler.unwrap_or_else(|| "cosine".to_string()),
             max_length: self.max_length.unwrap_or(128),
             weight_decay: self.weight_decay.unwrap_or(0.01),
             seed: self.seed.unwrap_or(42),
             qlora: self.qlora,
+            bf16: self.bf16,
+            lora_layers: self.lora_layers.unwrap_or(4),
             device: self.device.unwrap_or_else(|| "auto".to_string()),
             lora,
             merge_mode,

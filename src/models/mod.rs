@@ -22,12 +22,21 @@ pub enum ModelBackbone {
     Bert(BertModel),
 }
 
+#[derive(Clone)]
+pub enum BackboneConfig {
+    ModernBert(ModernBertConfig),
+    Bert(BertConfig),
+}
+
 pub struct SequenceClassifier {
     pub backbone: ModelBackbone,
+    pub backbone_config: BackboneConfig,
+    pub base_tensors: HashMap<String, Tensor>,
     pub lora_layers: HashMap<String, LinearLoRA>,
     pub head: ClassifierHead,
     pub hidden_size: usize,
     pub num_labels: usize,
+    pub dtype: DType,
     pub device: Device,
 }
 
@@ -77,6 +86,17 @@ impl SequenceClassifier {
         lora_cfg: &LoraConfig,
         device: &Device,
     ) -> Result<Self> {
+        Self::build_with_dtype(base_model, num_labels, lora_cfg, DType::F32, device)
+    }
+
+    /// Build a SequenceClassifier with explicit compute dtype (F32 or BF16)
+    pub fn build_with_dtype(
+        base_model: &str,
+        num_labels: usize,
+        lora_cfg: &LoraConfig,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
         let (config_path, _, weights_path) = Self::load_or_fetch_weights(base_model)?;
 
         // Read config.json
@@ -88,28 +108,36 @@ impl SequenceClassifier {
             .unwrap_or("bert")
             .to_lowercase();
 
-        // Load safetensors weights
-        let tensors = candle_core::safetensors::load(&weights_path, device)?;
+        // Load safetensors weights onto device
+        let raw_tensors = candle_core::safetensors::load(&weights_path, device)?;
+        let mut base_tensors = HashMap::with_capacity(raw_tensors.len());
+        for (k, v) in raw_tensors {
+            let casted = match v.dtype() {
+                DType::F16 | DType::BF16 | DType::F32 | DType::F64 => v.to_dtype(dtype)?,
+                _ => v,
+            };
+            base_tensors.insert(k, casted);
+        }
 
         let mut lora_layers = HashMap::new();
 
         // Detect target linear layers to inject LoRA into
-        for (name, tensor) in &tensors {
+        for (name, tensor) in &base_tensors {
             let is_target = lora_cfg.target_modules.iter().any(|tm| name.contains(tm))
                 && name.ends_with(".weight");
 
             if is_target {
                 let shape = tensor.shape();
                 if shape.dims().len() == 2 {
-                    // Check if there is an associated bias
                     let bias_name = name.replace(".weight", ".bias");
-                    let bias_tensor = tensors.get(&bias_name).cloned();
+                    let bias_tensor = base_tensors.get(&bias_name).cloned();
 
-                    let lora_layer = LinearLoRA::new(
+                    let lora_layer = LinearLoRA::new_with_dropout(
                         tensor.clone(),
                         bias_tensor,
                         lora_cfg.r,
                         lora_cfg.alpha,
+                        lora_cfg.dropout,
                         device,
                     )?;
                     lora_layers.insert(name.to_string(), lora_layer);
@@ -117,49 +145,92 @@ impl SequenceClassifier {
             }
         }
 
-        // Build backbone
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], DType::F32, device)?
-        };
+        // Build initial backbone
+        let vb = VarBuilder::from_tensors(base_tensors.clone(), dtype, device);
 
-        let (backbone, hidden_size) = if model_type.contains("modernbert") {
+        let (backbone, backbone_config, hidden_size) = if model_type.contains("modernbert") {
             let config_content = std::fs::read_to_string(&config_path)?;
             let modernbert_cfg: ModernBertConfig = serde_json::from_str(&config_content)?;
             let h_size = modernbert_cfg.hidden_size;
-            let model = ModernBert::load(vb.clone(), &modernbert_cfg)?;
-            (ModelBackbone::ModernBert(model), h_size)
+            let model = ModernBert::load(vb, &modernbert_cfg)?;
+            (
+                ModelBackbone::ModernBert(model),
+                BackboneConfig::ModernBert(modernbert_cfg),
+                h_size,
+            )
         } else {
             let config_content = std::fs::read_to_string(&config_path)?;
             let bert_cfg: BertConfig = serde_json::from_str(&config_content)?;
             let h_size = bert_cfg.hidden_size;
             let model = BertModel::load(vb, &bert_cfg)?;
-            (ModelBackbone::Bert(model), h_size)
+            (
+                ModelBackbone::Bert(model),
+                BackboneConfig::Bert(bert_cfg),
+                h_size,
+            )
         };
 
         let head = ClassifierHead::new(hidden_size, num_labels, device)?;
 
         Ok(Self {
             backbone,
+            backbone_config,
+            base_tensors,
             lora_layers,
             head,
             hidden_size,
             num_labels,
+            dtype,
             device: device.clone(),
         })
     }
 
-    /// Forward pass: inputs -> backbone embeddings -> pooling -> head -> logits
+    /// Forward pass: inputs -> LoRA-injected backbone -> pooling -> head -> logits
     pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        let hidden_states = match &self.backbone {
-            ModelBackbone::ModernBert(mb) => mb.forward(input_ids, attention_mask)?,
-            ModelBackbone::Bert(bert) => {
-                let token_type_ids = Tensor::zeros_like(input_ids)?;
-                bert.forward(input_ids, &token_type_ids, Some(attention_mask))?
+        self.forward_t(input_ids, attention_mask, false)
+    }
+
+    /// Forward pass with training mode flag (enables LoRA dropout and live autograd graph injection)
+    pub fn forward_t(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        train: bool,
+    ) -> Result<Tensor> {
+        let hidden_states = if self.lora_layers.is_empty() {
+            match &self.backbone {
+                ModelBackbone::ModernBert(mb) => mb.forward(input_ids, attention_mask)?,
+                ModelBackbone::Bert(bert) => {
+                    let token_type_ids = Tensor::zeros_like(input_ids)?;
+                    bert.forward(input_ids, &token_type_ids, Some(attention_mask))?
+                }
+            }
+        } else {
+            // Dynamically bind live differentiable LoRA effective weights (W_base + scale * B @ A)
+            // into the active VarBuilder tensor map (zero-copy Arc handle cloning for frozen weights)
+            let mut active_tensors = self.base_tensors.clone();
+            for (name, lora) in &self.lora_layers {
+                let w_eff = lora.effective_weight(train, self.dtype)?;
+                active_tensors.insert(name.clone(), w_eff);
+            }
+
+            let vb = VarBuilder::from_tensors(active_tensors, self.dtype, &self.device);
+            match &self.backbone_config {
+                BackboneConfig::ModernBert(cfg) => {
+                    let active_mb = ModernBert::load(vb, cfg)?;
+                    active_mb.forward(input_ids, attention_mask)?
+                }
+                BackboneConfig::Bert(cfg) => {
+                    let active_bert = BertModel::load(vb, cfg)?;
+                    let token_type_ids = Tensor::zeros_like(input_ids)?;
+                    active_bert.forward(input_ids, &token_type_ids, Some(attention_mask))?
+                }
             }
         };
 
-        // Mean pooling over token embeddings
-        let pooled = mean_pooling(&hidden_states, attention_mask)?;
+        // Mean pooling over token embeddings in F32 for numerical stability
+        let hidden_f32 = hidden_states.to_dtype(DType::F32)?;
+        let pooled = mean_pooling(&hidden_f32, attention_mask)?;
 
         // Forward through classification head
         let logits = self.head.forward(&pooled)?;
@@ -190,6 +261,28 @@ impl SequenceClassifier {
         std::fs::create_dir_all(parent)?;
 
         candle_core::safetensors::save(&tensor_map, output_file)?;
+        Ok(())
+    }
+
+    /// Restore adapter weights from a saved safetensors checkpoint (used to restore best eval epoch)
+    pub fn load_adapter(&self, adapter_file: &Path) -> Result<()> {
+        let tensors = candle_core::safetensors::load(adapter_file, &self.device)?;
+        for (name, lora) in &self.lora_layers {
+            let a_key = format!("{}.lora_a.weight", name);
+            let b_key = format!("{}.lora_b.weight", name);
+            if let Some(a_t) = tensors.get(&a_key) {
+                lora.lora_a.set(&a_t.to_dtype(DType::F32)?)?;
+            }
+            if let Some(b_t) = tensors.get(&b_key) {
+                lora.lora_b.set(&b_t.to_dtype(DType::F32)?)?;
+            }
+        }
+        if let Some(w_t) = tensors.get("classifier.weight") {
+            self.head.weight.set(&w_t.to_dtype(DType::F32)?)?;
+        }
+        if let Some(b_t) = tensors.get("classifier.bias") {
+            self.head.bias.set(&b_t.to_dtype(DType::F32)?)?;
+        }
         Ok(())
     }
 }

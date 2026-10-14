@@ -19,12 +19,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: trainaya-linux-x86_64.tar.gz
-            use_cross: false
+            cargo_features: ""
 
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: trainaya-darwin-aarch64.tar.gz
-            use_cross: false
+            cargo_features: "--features metal,accelerate"
 
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +35,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build Release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_features }}
 
       - name: Package Binary
         run: |

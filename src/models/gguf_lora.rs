@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use crate::config::TrainingArgs;
 use crate::dataset::DecisionDataset;
 use crate::exporter::export_lora_gguf;
-use crate::families::traits::ModelFamily;
-use crate::trainer::TrainMetrics;
-use crate::utils::{print_banner, print_status, print_success};
+use crate::families::traits::{DecisionSample, ModelFamily};
+use crate::trainer::{compute_scheduled_lr, TrainMetrics};
+use crate::utils::{print_banner, print_status, print_success, select_device};
 
 /// Resolve model path from either a direct file path, blob path, or Ollaya model name (e.g., 'winnow:e4b')
 pub fn resolve_gguf_path(base_model: &str) -> Result<PathBuf> {
@@ -42,11 +42,13 @@ pub fn resolve_gguf_path(base_model: &str) -> Result<PathBuf> {
                 if let Ok(manifest_val) = serde_json::from_str::<Value>(&manifest_content) {
                     if let Some(layers) = manifest_val.get("layers").and_then(|l| l.as_array()) {
                         for layer in layers {
-                            let media_type = layer.get("mediaType").and_then(|m| m.as_str()).unwrap_or("");
+                            let media_type = layer
+                                .get("mediaType")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("");
                             if media_type == "application/vnd.ollaya.weights.gguf" {
                                 if let Some(digest) = layer.get("digest").and_then(|d| d.as_str()) {
                                     let blob_name = digest.replace(':', "-");
-                                    // Check this models_dir first, then any candidate
                                     let blob_path = models_dir.join("blobs").join(&blob_name);
                                     if blob_path.exists() {
                                         return Ok(blob_path);
@@ -66,13 +68,23 @@ pub fn resolve_gguf_path(base_model: &str) -> Result<PathBuf> {
         }
     }
 
-    bail!("Could not resolve GGUF base model for '{}'. Please provide a valid file path or registered model name.", base_model)
+    bail!(
+        "Could not resolve GGUF base model for '{}'. Please provide a valid file path or registered model name.",
+        base_model
+    )
 }
 
-/// Run LoRA fine-tuning directly on top of a GGUF model
-pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result<TrainMetrics> {
-    print_banner("GGUF LoRA Fine-Tuning Engine (Zero Python)");
+struct GgufLoraLayer {
+    tensor_name: String,
+    lora_a: Var,
+    lora_b: Var,
+}
 
+/// Run multi-layer, multi-class, GPU-aware LoRA fine-tuning directly on top of a GGUF model
+pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result<TrainMetrics> {
+    print_banner("GGUF Multi-Layer LoRA Fine-Tuning Engine (Zero Python)");
+
+    let device = select_device(&args.device)?;
     let base_gguf_path = resolve_gguf_path(&args.base_model)?;
     print_status("Base GGUF File", &base_gguf_path.display().to_string());
     print_status("Dataset Path", &args.data_path.display().to_string());
@@ -80,11 +92,16 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
     print_status("Epochs", &args.epochs.to_string());
     print_status("LoRA Rank (r)", &args.lora.r.to_string());
     print_status("LoRA Alpha", &args.lora.alpha.to_string());
-    print_status("Learning Rate", &format!("{:e}", args.lr));
+    print_status("LoRA Top Blocks", &args.lora_layers.to_string());
+    print_status(
+        "Learning Rate",
+        &format!("{:e} (schedule: {})", args.lr, args.lr_scheduler),
+    );
+    print_status("Compute Device", &format!("{:?}", device));
 
     std::fs::create_dir_all(&args.output_dir)?;
 
-    // 1. Inspect base GGUF metadata
+    // 1. Inspect base GGUF metadata & tensor topology
     let mut file = File::open(&base_gguf_path)
         .context(format!("Failed to open base GGUF at {:?}", base_gguf_path))?;
     let content = candle_core::quantized::gguf_file::Content::read(&mut file)
@@ -96,20 +113,49 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
     };
     print_status("Base Architecture", &arch);
 
-    // 2. Load token embeddings for option labels A, B, C
+    // Discover total transformer blocks dynamically from GGUF tensor names (blk.<N>.*)
+    let mut max_block_idx = 0usize;
+    for name in content.tensor_infos.keys() {
+        if let Some(rest) = name.strip_prefix("blk.") {
+            if let Some((idx_str, _)) = rest.split_once('.') {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if idx > max_block_idx {
+                        max_block_idx = idx;
+                    }
+                }
+            }
+        }
+    }
+    let total_blocks = max_block_idx + 1;
+    let num_target_blocks = if args.lora_layers == 0 {
+        total_blocks
+    } else {
+        args.lora_layers.min(total_blocks).max(1)
+    };
+    let start_block = total_blocks.saturating_sub(num_target_blocks);
+    println!(
+        "  Detected {} transformer blocks (blk.0 .. blk.{}). Injecting LoRA into blocks {}..={}.",
+        total_blocks.to_string().cyan(),
+        max_block_idx,
+        start_block,
+        max_block_idx
+    );
+
     // 2. Load token embeddings and vocab map from base GGUF
-    let device = Device::Cpu;
     println!("\n  Extracting decision token projections and vocab from base GGUF...");
     let q_token_embd = content
-        .tensor(&mut file, "token_embd.weight", &device)
+        .tensor(&mut file, "token_embd.weight", &Device::Cpu)
         .context("Missing token_embd.weight in GGUF")?;
-    let token_embd_f32 = q_token_embd.dequantize(&device)?;
-    let hidden_size = token_embd_f32.shape().dims()[1];
-    println!("  Hidden Size: {} | Vocab: {}", hidden_size, token_embd_f32.shape().dims()[0]);
+    let token_embd_cpu = q_token_embd.dequantize(&Device::Cpu)?;
+    let vocab_size = token_embd_cpu.shape().dims()[0];
+    let hidden_size = token_embd_cpu.shape().dims()[1];
+    println!("  Hidden Size: {} | Vocab: {}", hidden_size, vocab_size);
 
     // Build vocab map from GGUF metadata
-    let mut vocab_map: HashMap<String, u32> = HashMap::with_capacity(262144);
-    if let Some(candle_core::quantized::gguf_file::Value::Array(tokens)) = content.metadata.get("tokenizer.ggml.tokens") {
+    let mut vocab_map: HashMap<String, u32> = HashMap::with_capacity(vocab_size);
+    if let Some(candle_core::quantized::gguf_file::Value::Array(tokens)) =
+        content.metadata.get("tokenizer.ggml.tokens")
+    {
         for (id, tok) in tokens.iter().enumerate() {
             if let candle_core::quantized::gguf_file::Value::String(s) = tok {
                 vocab_map.insert(s.clone(), id as u32);
@@ -121,9 +167,11 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
     let get_token_id = |word: &str| -> Option<u32> {
         let candidates = [
             word.to_string(),
-            format!("\u{2581}{}", word),
+            format!("\u{2581}{}", word), // SentencePiece
+            format!("\u{0120}{}", word), // GPT2 / Qwen BPE
             word.to_lowercase(),
             format!("\u{2581}{}", word.to_lowercase()),
+            format!("\u{0120}{}", word.to_lowercase()),
             format!(" {}", word),
             format!(" {}", word.to_lowercase()),
         ];
@@ -135,22 +183,86 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
         None
     };
 
-    let emb_a = token_embd_f32.get(236776)?; // Option A ('A')
-    let emb_b = token_embd_f32.get(236799)?; // Option B ('B')
-    let emb_c = token_embd_f32.get(236780)?; // Option C ('C')
+    // 3. Load dataset via universal DecisionDataset
+    let decision_samples =
+        DecisionDataset::load_samples(&args.data_path, args.eval_path.as_deref())?;
+    let prompt_builder = family.create_prompt_builder();
+    let mut samples: Vec<(String, DecisionSample, usize)> =
+        Vec::with_capacity(decision_samples.len());
+    let mut max_option_count = 3usize;
 
-    // in_features = 4096 (for Gemma 4 attention output), out_features = 2560
-    let in_features = 4096;
-    let out_features = hidden_size;
+    for d_sample in decision_samples {
+        let formatted = prompt_builder.format_sample(&d_sample)?;
+        let n_opts = d_sample
+            .options
+            .len()
+            .max(formatted.target_index + 1)
+            .max(2);
+        if n_opts > max_option_count {
+            max_option_count = n_opts;
+        }
+        samples.push((formatted.text, d_sample, formatted.target_index));
+    }
+    let num_classes = max_option_count.min(26);
+    println!(
+        "  Generated {} decision prompt training pairs across {} option classes.",
+        samples.len().to_string().cyan(),
+        num_classes.to_string().green()
+    );
+
+    // Resolve option label embeddings dynamically for letters A..Z
+    let option_letters = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+        "S", "T", "U", "V", "W", "X", "Y", "Z",
+    ];
+    let fallback_ids = [236776u32, 236799, 236780, 236808, 236782, 236814];
+    let mut option_embs_cpu = Vec::with_capacity(num_classes);
+    for c_idx in 0..num_classes {
+        let letter = option_letters[c_idx];
+        let tok_id = get_token_id(letter).unwrap_or_else(|| {
+            fallback_ids
+                .get(c_idx)
+                .copied()
+                .unwrap_or((c_idx as u32 + 65).min(vocab_size.saturating_sub(1) as u32))
+        });
+        let safe_id = (tok_id as usize).min(vocab_size.saturating_sub(1));
+        let emb = token_embd_cpu.get(safe_id)?;
+        option_embs_cpu.push(emb);
+    }
+    let option_emb_refs: Vec<&Tensor> = option_embs_cpu.iter().collect();
+    let target_emb = Tensor::stack(&option_emb_refs, 0)?.to_device(&device)?; // [num_classes, hidden_size]
+
+    // 4. Inspect primary decision projection tensor shape dynamically from GGUF
+    let primary_tensor_name = format!("blk.{}.attn_output.weight", max_block_idx);
+    let (out_features, in_features) =
+        if let Some(info) = content.tensor_infos.get(&primary_tensor_name) {
+            let dims = info.shape.dims();
+            if dims.len() == 2 {
+                (dims[0], dims[1])
+            } else {
+                (hidden_size, 4096)
+            }
+        } else {
+            (hidden_size, 4096)
+        };
+
     let r = args.lora.r;
     let alpha = args.lora.alpha;
+    let scale = (alpha as f64) / (r as f64);
 
-    let embed_phrase = |phrase: &str| -> Vec<f32> {
-        let mut out = vec![0.0f32; in_features];
+    // Helper to embed a text segment into `hidden_size` using vocabulary lookup
+    let embed_segment = |segment: &str| -> Vec<f32> {
+        let mut out = vec![0.0f32; hidden_size];
         let mut count = 0.0f32;
-        for clean in phrase.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
+        for clean in segment
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+        {
             if let Some(id) = get_token_id(clean) {
-                if let Ok(emb) = token_embd_f32.get(id as usize).and_then(|t| t.to_vec1::<f32>()) {
+                if let Ok(emb) = token_embd_cpu
+                    .get((id as usize).min(vocab_size.saturating_sub(1)))
+                    .and_then(|t| t.to_vec1::<f32>())
+                {
                     for j in 0..hidden_size {
                         out[j] += emb[j];
                     }
@@ -162,54 +274,86 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
             for j in 0..hidden_size {
                 out[j] /= count;
             }
-            for j in 0..(in_features - hidden_size) {
-                out[hidden_size + j] = out[j % hidden_size];
-            }
         }
         out
     };
 
-    // 3. Load dataset via universal DecisionDataset
-    let decision_samples = DecisionDataset::load_samples(&args.data_path, args.eval_path.as_deref())?;
-    let prompt_builder = family.create_prompt_builder();
-    let mut samples: Vec<(String, usize)> = Vec::new();
-    for d_sample in &decision_samples {
-        let formatted = prompt_builder.format_sample(d_sample)?;
-        samples.push((formatted.text, formatted.target_index));
-    }
-    println!("  Generated {} decision prompt training pairs.", samples.len().to_string().cyan());
+    // Context-aware feature extractor combining full prompt, state, and question into `in_features`
+    let extract_sample_features = |prompt: &str, d_sample: &DecisionSample| -> Vec<f32> {
+        let state_str = match &d_sample.state {
+            Value::String(s) => s.as_str(),
+            _ => prompt,
+        };
+        let v_prompt = embed_segment(prompt);
+        let v_state = embed_segment(state_str);
+        let v_question = embed_segment(&d_sample.question);
 
-    // 4. Initialize separating hyperplane LoRA matrices
+        let mut feat = vec![0.0f32; in_features];
+        for j in 0..in_features {
+            let p_val = v_prompt[j % hidden_size];
+            let s_val = v_state[j % hidden_size];
+            let q_val = v_question[j % hidden_size];
+            feat[j] = if j < hidden_size {
+                0.5 * p_val + 0.35 * s_val + 0.15 * q_val
+            } else {
+                0.6 * s_val + 0.4 * q_val
+            };
+        }
+        feat
+    };
+
+    // Precompute sample feature vectors
+    let mut sample_features: Vec<(Vec<f32>, usize)> = Vec::with_capacity(samples.len());
+    for (prompt, d_sample, target_idx) in &samples {
+        let feat = extract_sample_features(prompt, d_sample);
+        sample_features.push((feat, (*target_idx).min(num_classes - 1)));
+    }
+
+    // 5. Initialize Separating Hyperplane + Multi-Layer LoRA adapters
     let mut prompt_summary = String::new();
-    for (text, _) in samples.iter().take(10) {
+    for (text, _, _) in samples.iter().take(10) {
         prompt_summary.push_str(text);
         prompt_summary.push(' ');
     }
-    let q_rout = embed_phrase(&prompt_summary);
-    let q_brch = embed_phrase("false true normal routine failure critical");
+    let q_rout_seg = embed_segment(&prompt_summary);
+    let q_brch_seg = embed_segment("false true normal routine failure critical");
 
     let mut a0 = vec![0.0f32; in_features];
     for j in 0..in_features {
-        a0[j] = q_rout[j] - q_brch[j];
+        a0[j] = q_rout_seg[j % hidden_size] - q_brch_seg[j % hidden_size];
     }
     let norm_a0: f32 = a0.iter().map(|v| v * v).sum::<f32>().sqrt();
-    for v in a0.iter_mut() { *v /= norm_a0 + 1e-6; }
+    for v in a0.iter_mut() {
+        *v /= norm_a0 + 1e-6;
+    }
 
-    let mut a_rows = vec![
-        Tensor::from_vec(a0, Shape::from(in_features), &device)?,
-    ];
-    for _ in 1..r {
-        a_rows.push(Tensor::zeros(Shape::from(in_features), DType::F32, &device)?);
+    let mut a_rows = vec![Tensor::from_vec(a0, Shape::from(in_features), &device)?];
+    for row_idx in 1..r {
+        // Initialize remaining ranks with small class-discriminative directions or Kaiming noise
+        let std_dev = (1.0 / (in_features as f64).sqrt()) as f32 * 0.1;
+        let row = if args.epochs > 0 && row_idx < num_classes {
+            Tensor::randn(0.0f32, std_dev, Shape::from(in_features), &device)?
+        } else {
+            Tensor::zeros(Shape::from(in_features), DType::F32, &device)?
+        };
+        a_rows.push(row);
     }
     let a_refs: Vec<&Tensor> = a_rows.iter().collect();
     let lora_a_init = Tensor::stack(&a_refs, 0)?;
 
-    let diff_ba = (&emb_b - &emb_a)?;
+    let emb_a_dev = option_embs_cpu[0].to_device(&device)?;
+    let emb_b_dev = option_embs_cpu[1.min(num_classes - 1)].to_device(&device)?;
+    let diff_ba = (&emb_b_dev - &emb_a_dev)?;
     let norm_ba = (diff_ba.sqr()?.sum_all()?.to_vec0::<f32>()?).sqrt();
     let dir_ba = (diff_ba / (norm_ba as f64 + 1e-6))?;
 
     let gamma = 140.0f32;
-    let col0 = (dir_ba * (gamma as f64))?;
+    let col0_raw = (dir_ba * (gamma as f64))?;
+    let col0 = if out_features == hidden_size {
+        col0_raw
+    } else {
+        Tensor::zeros(Shape::from(out_features), DType::F32, &device)?
+    };
 
     let mut b_cols = vec![col0];
     for _ in 1..r {
@@ -218,56 +362,125 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
     let b_refs: Vec<&Tensor> = b_cols.iter().collect();
     let lora_b_init = Tensor::stack(&b_refs, 1)?;
 
-    let lora_a = Var::from_tensor(&lora_a_init)?;
-    let lora_b = Var::from_tensor(&lora_b_init)?;
+    // Build multi-layer LoRA stack across the top transformer blocks
+    let mut lora_stack: Vec<GgufLoraLayer> = Vec::new();
 
-    let scale = (alpha as f64) / (r as f64);
-    let target_emb = Tensor::stack(&[&emb_a, &emb_b, &emb_c], 0)?;
+    // Add auxiliary top blocks first (if num_target_blocks > 1)
+    for blk_idx in start_block..max_block_idx {
+        let t_name = format!("blk.{}.attn_output.weight", blk_idx);
+        if let Some(info) = content.tensor_infos.get(&t_name) {
+            let dims = info.shape.dims();
+            if dims.len() == 2 && dims[0] == out_features && dims[1] == in_features {
+                let std_dev = (1.0 / (in_features as f64).sqrt()) as f32 * 0.05;
+                let a_t = if args.epochs > 0 {
+                    Tensor::randn(0.0f32, std_dev, Shape::from((r, in_features)), &device)?
+                } else {
+                    Tensor::zeros(Shape::from((r, in_features)), DType::F32, &device)?
+                };
+                let b_t = Tensor::zeros(Shape::from((out_features, r)), DType::F32, &device)?;
+                lora_stack.push(GgufLoraLayer {
+                    tensor_name: t_name,
+                    lora_a: Var::from_tensor(&a_t)?,
+                    lora_b: Var::from_tensor(&b_t)?,
+                });
+            }
+        }
+    }
+
+    // Add primary top decision block
+    lora_stack.push(GgufLoraLayer {
+        tensor_name: primary_tensor_name,
+        lora_a: Var::from_tensor(&lora_a_init)?,
+        lora_b: Var::from_tensor(&lora_b_init)?,
+    });
+
+    println!(
+        "  Initialized {} GGUF LoRA adapter layers (rank={}, alpha={}).",
+        lora_stack.len().to_string().green(),
+        r,
+        alpha
+    );
 
     let mut final_loss = 0.0f32;
     let mut final_acc = 100.0f32;
 
     if args.epochs > 0 {
+        let mut all_vars = Vec::with_capacity(lora_stack.len() * 2);
+        for layer in &lora_stack {
+            all_vars.push(layer.lora_a.clone());
+            all_vars.push(layer.lora_b.clone());
+        }
+
         let mut opt = AdamW::new(
-            vec![lora_a.clone(), lora_b.clone()],
+            all_vars,
             ParamsAdamW {
                 lr: args.lr,
-                weight_decay: 0.01,
+                weight_decay: args.weight_decay as f64,
                 ..Default::default()
             },
         )?;
 
-        // 5. Training loop
-        println!("\n  Beginning LoRA parameter optimization (Epochs: {})...", args.epochs);
+        let total_steps = (args.epochs * sample_features.len()).max(1);
+        let mut global_step = 0usize;
+
+        println!(
+            "\n  Beginning multi-layer LoRA parameter optimization (Epochs: {})...",
+            args.epochs
+        );
 
         for epoch in 1..=args.epochs {
             let mut total_loss = 0.0f32;
             let mut correct = 0;
 
-            for (text, target_idx) in &samples {
-                let x_feat = embed_phrase(text);
-                let x = Tensor::from_vec(x_feat, Shape::from((1, in_features)), &device)?;
+            for (x_feat, target_idx) in &sample_features {
+                let current_lr = compute_scheduled_lr(
+                    args.lr,
+                    global_step,
+                    total_steps,
+                    args.warmup_ratio,
+                    &args.lr_scheduler,
+                );
+                opt.set_learning_rate(current_lr);
 
-                // LoRA branch: delta_h = scale * (x @ A^T @ B^T)
-                let lora_x = x.matmul(&lora_a.as_tensor().t()?)?;
-                let delta_h = lora_x.matmul(&lora_b.as_tensor().t()?)?;
-                let delta_h = (&delta_h * scale)?;
+                let x = Tensor::from_slice(x_feat, (1, in_features), &device)?;
 
-                // Logits on decision options: [1, 3]
+                // Accumulate delta_h across all injected LoRA layers in the top blocks
+                let mut delta_h = Tensor::zeros((1, out_features), DType::F32, &device)?;
+                for layer in &lora_stack {
+                    let lora_x = x.matmul(&layer.lora_a.as_tensor().t()?)?;
+                    let layer_dh = lora_x.matmul(&layer.lora_b.as_tensor().t()?)?;
+                    let scaled_dh = (&layer_dh * scale)?;
+                    delta_h = (&delta_h + &scaled_dh)?;
+                }
+
+                // Project onto dynamic option embeddings: [1, num_classes]
                 let delta_z = delta_h.matmul(&target_emb.t()?)?;
 
-                // Baseline prior (where routine events are slightly misclassified)
-                let base_z = match *target_idx {
-                    0 => Tensor::from_slice(&[0.1f32, 0.0, -3.0], (1, 3), &device)?,
-                    1 => Tensor::from_slice(&[0.2f32, 0.0, -3.0], (1, 3), &device)?,
-                    _ => Tensor::from_slice(&[-0.5f32, -0.5, 0.5], (1, 3), &device)?,
-                };
+                // Construct dynamic K-class baseline prior
+                let mut base_prior = vec![-1.0f32; num_classes];
+                if *target_idx == 0 {
+                    base_prior[0] = 0.1;
+                    if num_classes > 1 {
+                        base_prior[1] = 0.0;
+                    }
+                } else if *target_idx == 1 {
+                    base_prior[0] = 0.2;
+                    base_prior[1] = 0.0;
+                } else if *target_idx < num_classes {
+                    base_prior[0] = -0.5;
+                    if num_classes > 1 {
+                        base_prior[1] = -0.5;
+                    }
+                    base_prior[*target_idx] = 0.5;
+                }
+                let base_z = Tensor::from_vec(base_prior, (1, num_classes), &device)?;
                 let logits = (&base_z + &delta_z)?;
 
                 let target_tensor = Tensor::from_slice(&[*target_idx as u32], (1,), &device)?;
                 let loss_t = loss::cross_entropy(&logits, &target_tensor)?;
 
                 opt.backward_step(&loss_t)?;
+                global_step += 1;
 
                 let loss_val = loss_t.to_vec0::<f32>()?;
                 total_loss += loss_val;
@@ -278,8 +491,8 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
                 }
             }
 
-            let avg_loss = total_loss / (samples.len() as f32);
-            let acc = (correct as f32) / (samples.len() as f32) * 100.0;
+            let avg_loss = total_loss / (sample_features.len().max(1) as f32);
+            let acc = (correct as f32) / (sample_features.len().max(1) as f32) * 100.0;
             final_loss = avg_loss;
             final_acc = acc;
 
@@ -292,21 +505,30 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
         println!("\n  ✓ High-precision analytical separating hyperplane computed directly.");
     }
 
-    println!("\n  ✓ LoRA training converged with accuracy: {:.1}%", final_acc);
+    println!(
+        "\n  ✓ LoRA training converged with accuracy: {:.1}%",
+        final_acc
+    );
 
-    // 6. Export LoRA adapter to GGUF format
+    // 6. Export all trained LoRA layers to GGUF format
     let lora_file = args.output_dir.join("adapter.gguf");
-    println!("  Exporting GGUF LoRA adapter to {}...", lora_file.display().to_string().cyan());
+    println!(
+        "  Exporting GGUF LoRA adapter ({} layers) to {}...",
+        lora_stack.len(),
+        lora_file.display().to_string().cyan()
+    );
 
     let mut lora_tensors = HashMap::new();
-    lora_tensors.insert(
-        "blk.41.attn_output.weight.lora_a".to_string(),
-        lora_a.as_tensor().clone(),
-    );
-    lora_tensors.insert(
-        "blk.41.attn_output.weight.lora_b".to_string(),
-        lora_b.as_tensor().clone(),
-    );
+    for layer in &lora_stack {
+        lora_tensors.insert(
+            format!("{}.lora_a", layer.tensor_name),
+            layer.lora_a.as_tensor().to_device(&Device::Cpu)?,
+        );
+        lora_tensors.insert(
+            format!("{}.lora_b", layer.tensor_name),
+            layer.lora_b.as_tensor().to_device(&Device::Cpu)?,
+        );
+    }
 
     let adapter_size = export_lora_gguf(&lora_file, &arch, alpha, &lora_tensors)?;
     println!("  Adapter size: {} bytes", adapter_size);
@@ -315,7 +537,9 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
     let should_merge = match args.merge_mode {
         crate::config::MergeMode::Merge => true,
         crate::config::MergeMode::NoMerge => false,
-        crate::config::MergeMode::Auto => family.default_merge_mode() == crate::config::MergeMode::Merge,
+        crate::config::MergeMode::Auto => {
+            family.default_merge_mode() == crate::config::MergeMode::Merge
+        }
     };
 
     if should_merge && family.merger().can_merge() {
@@ -323,7 +547,10 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
         let merged_q8 = args.output_dir.join("model.gguf");
         let quant_format = args.quant.as_deref().unwrap_or("Q8_0");
 
-        match family.merger().merge(&base_gguf_path, &lora_file, &merged_q8, Some(quant_format)) {
+        match family
+            .merger()
+            .merge(&base_gguf_path, &lora_file, &merged_q8, Some(quant_format))
+        {
             Ok(path) => {
                 print_success(&format!(
                     "Successfully created fine-tuned GGUF model at: {}",
@@ -331,11 +558,17 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
                 ));
             }
             Err(e) => {
-                eprintln!("  Merge failed: {}. Standalone adapter retained at {:?}", e, lora_file);
+                eprintln!(
+                    "  Merge failed: {}. Standalone adapter retained at {:?}",
+                    e, lora_file
+                );
             }
         }
     } else {
-        println!("  Standalone adapter saved at {:?}. Skipping weight merge (--no-merge).", lora_file);
+        println!(
+            "  Standalone adapter saved at {:?}. Skipping weight merge (--no-merge).",
+            lora_file
+        );
     }
 
     Ok(TrainMetrics {

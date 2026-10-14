@@ -46,3 +46,46 @@ fn test_lora_weight_merging() {
     assert_eq!(merged_vec[0], vec![6.0, 12.0]);
     assert_eq!(merged_vec[1], vec![8.0, 16.0]);
 }
+
+#[test]
+fn test_lora_autograd_backprop_updates_weights() {
+    use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+
+    let device = Device::Cpu;
+    let base_weight = Tensor::ones(Shape::from((2, 3)), DType::F32, &device).unwrap();
+    let lora = LinearLoRA::new_with_dropout(base_weight, None, 2, 4.0, 0.0, &device).unwrap();
+
+    let mut opt = AdamW::new(
+        lora.vars(),
+        ParamsAdamW {
+            lr: 1e-2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let x = Tensor::new(&[[1.0f32, 0.5, -1.0]], &device).unwrap();
+    let target = Tensor::new(&[1u32], &device).unwrap();
+
+    // Step 1: Forward through effective_weight (simulating VarBuilder injection)
+    let w_eff = lora.effective_weight(true, DType::F32).unwrap();
+    let logits = x.matmul(&w_eff.t().unwrap()).unwrap();
+    let loss = candle_nn::loss::cross_entropy(&logits, &target).unwrap();
+    opt.backward_step(&loss).unwrap();
+
+    // Verify LoRA B is no longer all zeros after 1 backward step!
+    let b_norm = lora
+        .lora_b
+        .as_tensor()
+        .sqr()
+        .unwrap()
+        .sum_all()
+        .unwrap()
+        .to_vec0::<f32>()
+        .unwrap();
+    assert!(
+        b_norm > 0.0,
+        "LoRA B must receive non-zero gradients during backward pass, got norm={}",
+        b_norm
+    );
+}

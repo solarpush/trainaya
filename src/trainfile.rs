@@ -48,8 +48,16 @@ pub struct Trainfile {
     pub epochs: usize,
     /// Training batch size (PARAMETER batch_size)
     pub batch_size: usize,
+    /// Gradient accumulation steps (PARAMETER grad_accum)
+    pub grad_accum_steps: usize,
     /// Learning rate (PARAMETER lr)
     pub lr: f64,
+    /// Warmup ratio for LR scheduler (PARAMETER warmup_ratio)
+    pub warmup_ratio: f32,
+    /// Max gradient norm for clipping (PARAMETER max_grad_norm)
+    pub max_grad_norm: f32,
+    /// LR scheduler strategy: cosine, linear, constant (PARAMETER lr_scheduler)
+    pub lr_scheduler: String,
     /// Maximum sequence length (PARAMETER max_length)
     pub max_length: usize,
     /// Optimizer weight decay (PARAMETER weight_decay)
@@ -60,6 +68,10 @@ pub struct Trainfile {
     pub device: String,
     /// 4-bit QLoRA enablement (PARAMETER qlora)
     pub qlora: bool,
+    /// Mixed precision BF16 enablement (PARAMETER bf16)
+    pub bf16: bool,
+    /// Number of top transformer blocks to inject LoRA into for GGUF (PARAMETER lora_layers)
+    pub lora_layers: usize,
     /// LoRA configuration (PARAMETER lora_r, lora_alpha, lora_dropout, target_modules)
     pub lora: LoraConfig,
     /// Merge strategy: auto, merge, no-merge (MERGE)
@@ -87,12 +99,18 @@ impl Default for Trainfile {
             output_dir: PathBuf::from("./output_trained"),
             epochs: 3,
             batch_size: 8,
+            grad_accum_steps: 1,
             lr: 5e-5,
+            warmup_ratio: 0.1,
+            max_grad_norm: 1.0,
+            lr_scheduler: "cosine".to_string(),
             max_length: 128,
             weight_decay: 0.01,
             seed: 42,
             device: "auto".to_string(),
             qlora: false,
+            bf16: false,
+            lora_layers: 4,
             lora: LoraConfig::default(),
             merge_mode: MergeMode::Auto,
             quant: None,
@@ -192,11 +210,17 @@ impl Trainfile {
             task: self.task,
             epochs: self.epochs,
             batch_size: self.batch_size,
+            grad_accum_steps: self.grad_accum_steps,
             lr: self.lr,
+            warmup_ratio: self.warmup_ratio,
+            max_grad_norm: self.max_grad_norm,
+            lr_scheduler: self.lr_scheduler.clone(),
             max_length: self.max_length,
             weight_decay: self.weight_decay,
             seed: self.seed,
             qlora: self.qlora,
+            bf16: self.bf16,
+            lora_layers: self.lora_layers,
             device: self.device.clone(),
             lora: self.lora.clone(),
             merge_mode: self.merge_mode,
@@ -267,7 +291,8 @@ fn apply_directive(
         "TASK" => match value.to_lowercase().as_str() {
             "classification" => tf.task = TaskType::Classification,
             "nli" => tf.task = TaskType::Nli,
-            _ => bail!("line {}: unknown TASK '{}'. Expected 'classification' or 'nli'", line_num, value),
+            "decision" => tf.task = TaskType::Decision,
+            _ => bail!("line {}: unknown TASK '{}'. Expected 'classification', 'nli', or 'decision'", line_num, value),
         },
         "FAMILY" => {
             tf.family = Some(value.to_string());
@@ -289,8 +314,11 @@ fn apply_directive(
                 _ => bail!("line {}: invalid MERGE value '{}'. Use 'true', 'false', or 'auto'", line_num, value),
             };
         }
-        "QUANT" => {
+        "QUANT" | "QUANTIZE" => {
             tf.quant = Some(value.to_string());
+        }
+        "EXPORT" => {
+            // Optional export format directive in Trainfile (gguf, safetensors, onnx)
         }
         "TAG" | "REGISTER" => {
             tf.register = Some(value.to_string());
@@ -320,10 +348,29 @@ fn apply_parameter(tf: &mut Trainfile, name: &str, val: &str, line_num: usize) -
                 .parse::<usize>()
                 .with_context(|| format!("line {}: invalid integer for PARAMETER batch_size", line_num))?;
         }
+        "grad_accum" | "grad_accum_steps" | "gradient_accumulation_steps" => {
+            tf.grad_accum_steps = val
+                .parse::<usize>()
+                .with_context(|| format!("line {}: invalid integer for PARAMETER grad_accum", line_num))?
+                .max(1);
+        }
         "lr" | "learning_rate" => {
             tf.lr = val
                 .parse::<f64>()
                 .with_context(|| format!("line {}: invalid float for PARAMETER lr", line_num))?;
+        }
+        "warmup_ratio" | "warmup" => {
+            tf.warmup_ratio = val
+                .parse::<f32>()
+                .with_context(|| format!("line {}: invalid float for PARAMETER warmup_ratio", line_num))?;
+        }
+        "max_grad_norm" | "grad_clip" => {
+            tf.max_grad_norm = val
+                .parse::<f32>()
+                .with_context(|| format!("line {}: invalid float for PARAMETER max_grad_norm", line_num))?;
+        }
+        "lr_scheduler" | "scheduler" => {
+            tf.lr_scheduler = val.to_lowercase();
         }
         "max_length" | "seq_len" => {
             tf.max_length = val
@@ -345,6 +392,14 @@ fn apply_parameter(tf: &mut Trainfile, name: &str, val: &str, line_num: usize) -
         }
         "qlora" => {
             tf.qlora = val.parse::<bool>().unwrap_or(true);
+        }
+        "bf16" => {
+            tf.bf16 = val.parse::<bool>().unwrap_or(true);
+        }
+        "lora_layers" | "num_lora_layers" => {
+            tf.lora_layers = val
+                .parse::<usize>()
+                .with_context(|| format!("line {}: invalid integer for PARAMETER lora_layers", line_num))?;
         }
         "lora_r" | "r" => {
             tf.lora.r = val

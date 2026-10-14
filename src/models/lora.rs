@@ -12,6 +12,7 @@ pub struct LinearLoRA {
     pub out_features: usize,
     pub r: usize,
     pub alpha: f32,
+    pub dropout: f32,
     pub scale: f64,
 }
 
@@ -23,14 +24,25 @@ impl LinearLoRA {
         alpha: f32,
         device: &Device,
     ) -> Result<Self> {
+        Self::new_with_dropout(base_weight, base_bias, r, alpha, 0.0, device)
+    }
+
+    pub fn new_with_dropout(
+        base_weight: Tensor,
+        base_bias: Option<Tensor>,
+        r: usize,
+        alpha: f32,
+        dropout: f32,
+        device: &Device,
+    ) -> Result<Self> {
         let shape = base_weight.shape();
         let (out_features, in_features) = match shape.dims() {
             [out_f, in_f] => (*out_f, *in_f),
             other => anyhow::bail!("Expected 2D base weight matrix, got {:?}", other),
         };
 
-        // Initialize LoRA A with Gaussian random N(0, 1/sqrt(r))
-        let std_dev = 1.0 / (r as f64).sqrt();
+        // Initialize LoRA A with Kaiming/Gaussian random N(0, 1/sqrt(in_features))
+        let std_dev = 1.0 / (in_features as f64).sqrt();
         let a_init = (Tensor::randn(0.0f32, std_dev as f32, Shape::from((r, in_features)), device)?
             .to_dtype(DType::F32))?;
         let lora_a = Var::from_tensor(&a_init)?;
@@ -42,14 +54,18 @@ impl LinearLoRA {
         let scale = (alpha as f64) / (r as f64);
 
         Ok(Self {
-            base_weight,
-            base_bias,
+            base_weight: base_weight.to_device(device)?,
+            base_bias: match base_bias {
+                Some(b) => Some(b.to_device(device)?),
+                None => None,
+            },
             lora_a,
             lora_b,
             in_features,
             out_features,
             r,
             alpha,
+            dropout,
             scale,
         })
     }
@@ -57,26 +73,34 @@ impl LinearLoRA {
     /// Forward pass through Linear with LoRA branch:
     /// y = x @ W^T + bias + scale * (x @ A^T @ B^T)
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Base linear projection
-        let mut y = x.matmul(&self.base_weight.t()?)?;
+        let w_eff = self.effective_weight(false, x.dtype())?;
+        let mut y = x.matmul(&w_eff.t()?)?;
         if let Some(bias) = &self.base_bias {
-            y = y.broadcast_add(bias)?;
+            y = y.broadcast_add(&bias.to_dtype(x.dtype())?)?;
         }
+        Ok(y)
+    }
 
-        // LoRA branch
+    /// Differentiable effective weight tensor connected to LoRA A & B in Candle's autograd graph:
+    /// W_eff = W_base + scale * (B @ Dropout(A))
+    pub fn effective_weight(&self, train: bool, target_dtype: DType) -> Result<Tensor> {
         let a_tensor = self.lora_a.as_tensor();
         let b_tensor = self.lora_b.as_tensor();
 
-        // x @ A^T -> shape [..., r]
-        let xa = x.matmul(&a_tensor.t()?)?;
-        // xa @ B^T -> shape [..., out_features]
-        let xab = xa.matmul(&b_tensor.t()?)?;
+        let a_active = if train && self.dropout > 0.0 {
+            candle_nn::ops::dropout(a_tensor, self.dropout)?
+        } else {
+            a_tensor.clone()
+        };
 
-        // Scale and add
-        let scaled_lora = (xab * self.scale)?;
-        let out = y.broadcast_add(&scaled_lora)?;
+        let ba = b_tensor.matmul(&a_active)?;
+        let delta_w = (ba * self.scale)?;
 
-        Ok(out)
+        let merged = self
+            .base_weight
+            .to_dtype(DType::F32)?
+            .broadcast_add(&delta_w)?;
+        Ok(merged.to_dtype(target_dtype)?)
     }
 
     /// Returns trainable variables (LoRA A and LoRA B)
@@ -87,15 +111,7 @@ impl LinearLoRA {
     /// Compute permanently merged weight:
     /// W_merged = W_base + scale * (B @ A)
     pub fn merge_weights(&self) -> Result<Tensor> {
-        let a_tensor = self.lora_a.as_tensor();
-        let b_tensor = self.lora_b.as_tensor();
-
-        // B is [out_features, r], A is [r, in_features] -> ba is [out_features, in_features]
-        let ba = b_tensor.matmul(a_tensor)?;
-        let delta_w = (ba * self.scale)?;
-
-        let merged = self.base_weight.to_dtype(DType::F32)?.broadcast_add(&delta_w)?;
-        Ok(merged)
+        self.effective_weight(false, DType::F32)
     }
 
     /// Export adapter tensors into dictionary
