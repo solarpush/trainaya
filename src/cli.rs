@@ -499,21 +499,14 @@ pub struct BenchOpts {
     /// Minimum macro accuracy threshold required (e.g. 0.75)
     #[arg(long)]
     pub min_accuracy: Option<f64>,
+
+    /// Export misclassified and overconfident failure records to a JSONL file for active learning with 'trainaya curate'
+    #[arg(long)]
+    pub export_failures: Option<PathBuf>,
 }
 
 impl BenchOpts {
-    pub fn resolve_bench_args(
-        self,
-    ) -> anyhow::Result<(
-        String,
-        Option<String>,
-        Option<PathBuf>,
-        Option<Vec<String>>,
-        Option<usize>,
-        String,
-        Option<PathBuf>,
-        Option<f64>,
-    )> {
+    pub fn resolve_benchfile(self) -> anyhow::Result<crate::benchfile::Benchfile> {
         let mut bf = if let Some(path) = &self.file {
             crate::benchfile::Benchfile::from_file(path)?
         } else if std::path::Path::new("Benchfile").exists() {
@@ -549,6 +542,9 @@ impl BenchOpts {
         if let Some(a) = self.min_accuracy {
             bf.min_accuracy = Some(a);
         }
+        if let Some(ef) = self.export_failures {
+            bf.export_failures = Some(ef);
+        }
 
         if bf.model.is_empty() {
             anyhow::bail!(
@@ -558,16 +554,7 @@ impl BenchOpts {
 
         bf.resolve_placeholders(None);
 
-        Ok((
-            bf.model,
-            bf.baseline,
-            bf.data,
-            bf.subsets,
-            bf.limit,
-            bf.url,
-            bf.output,
-            bf.min_accuracy,
-        ))
+        Ok(bf)
     }
 }
 

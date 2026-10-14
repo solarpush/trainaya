@@ -510,10 +510,56 @@ pub fn run_gguf_training(args: TrainingArgs, family: &dyn ModelFamily) -> Result
         final_acc
     );
 
+    // 5b. Post-Training Temperature Scaling (T*) for ECE Calibration
+    if sample_features.len() >= 2 {
+        let mut eval_logits = Vec::with_capacity(sample_features.len());
+        let mut eval_labels = Vec::with_capacity(sample_features.len());
+
+        for (x_feat, target_idx) in &sample_features {
+            let x = Tensor::from_slice(x_feat, (1, in_features), &device)?;
+            let mut delta_h = Tensor::zeros((1, out_features), DType::F32, &device)?;
+            for layer in &lora_stack {
+                let lora_x = x.matmul(&layer.lora_a.as_tensor().t()?)?;
+                let layer_dh = lora_x.matmul(&layer.lora_b.as_tensor().t()?)?;
+                let scaled_dh = (&layer_dh * scale)?;
+                delta_h = (&delta_h + &scaled_dh)?;
+            }
+            let delta_z = delta_h.matmul(&target_emb.t()?)?;
+            if let Ok(mut rows) = delta_z.to_vec2::<f32>() {
+                if let Some(row) = rows.pop() {
+                    eval_logits.push(row);
+                    eval_labels.push(*target_idx);
+                }
+            }
+        }
+
+        if eval_logits.len() >= 2 {
+            let cal =
+                crate::models::classifier::optimize_temperature_scaling(&eval_logits, &eval_labels);
+            let cal_temp = cal.optimal_temperature.clamp(0.1, 10.0);
+            if (cal_temp - 1.0).abs() > 1e-4 {
+                let inv_t = 1.0 / (cal_temp as f64);
+                for layer in &lora_stack {
+                    let scaled_b = (layer.lora_b.as_tensor() * inv_t)?;
+                    layer.lora_b.set(&scaled_b)?;
+                }
+            }
+            println!(
+                "  {} Post-Training Temperature Scaling: T* = {} (ECE: {:.4} -> {:.4}, NLL: {:.4} -> {:.4})",
+                "🌡️".cyan(),
+                format!("{:.3}", cal_temp).bold().green(),
+                cal.pre_ece,
+                cal.post_ece,
+                cal.pre_nll,
+                cal.post_nll
+            );
+        }
+    }
+
     // 6. Export all trained LoRA layers to GGUF format
     let lora_file = args.output_dir.join("adapter.gguf");
     println!(
-        "  Exporting GGUF LoRA adapter ({} layers) to {}...",
+        "  Exporting calibrated GGUF LoRA adapter ({} layers) to {}...",
         lora_stack.len(),
         lora_file.display().to_string().cyan()
     );

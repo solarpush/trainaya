@@ -179,3 +179,57 @@ TAG winnow:v{auto}
     }
 }
 
+#[test]
+fn test_cli_bench_export_failures_and_curate_multi_teacher() {
+    let bench_args = vec![
+        "trainaya",
+        "bench",
+        "--model",
+        "winnow:v2",
+        "--baseline",
+        "winnow:e4b",
+        "--export-failures",
+        "./data/failures_{model}.jsonl",
+    ];
+    let cli = Cli::try_parse_from(bench_args).expect("Failed to parse bench CLI args");
+    match cli.command {
+        Commands::Bench(opts) => {
+            let bf = opts.resolve_benchfile().unwrap();
+            assert_eq!(bf.model, "winnow:v2");
+            assert_eq!(bf.baseline, Some("winnow:e4b".to_string()));
+            assert_eq!(
+                bf.export_failures,
+                Some(PathBuf::from("./data/failures_winnow_v2.jsonl"))
+            );
+        }
+        _ => panic!("Expected Bench command"),
+    }
+
+    let curate_args = vec![
+        "trainaya",
+        "curate",
+        "--teacher",
+        "agy,claude",
+        "--mode",
+        "augment",
+        "--input",
+        "./data/failures_winnow_v2.jsonl",
+        "--output",
+        "./data/augmented_sota.jsonl",
+    ];
+    let cli_curate = Cli::try_parse_from(curate_args).expect("Failed to parse curate CLI args");
+    match cli_curate.command {
+        Commands::Curate(opts) => {
+            let cf = opts.resolve_curate_args().unwrap();
+            assert_eq!(cf.teachers(), vec!["agy".to_string(), "claude".to_string()]);
+            assert_eq!(cf.mode, trainaya::curatefile::CurateMode::Augment);
+            assert_eq!(
+                cf.input,
+                Some(PathBuf::from("./data/failures_winnow_v2.jsonl"))
+            );
+        }
+        _ => panic!("Expected Curate command"),
+    }
+}
+
+

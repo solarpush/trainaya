@@ -93,6 +93,71 @@ pub struct EvaluationRow {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureExportRecord {
+    pub id: String,
+    pub subset: String,
+    pub kind: String,
+    /// Flattened context + question prompt ready for direct consumption by 'trainaya curate'
+    pub text: String,
+    pub state: serde_json::Value,
+    pub questions: serde_json::Value,
+    pub gold_label: String,
+    pub predicted_label: String,
+    pub confidence: f64,
+    /// Failure severity class: "misclassified_overconfident", "misclassified", or "boundary_low_confidence"
+    pub failure_type: String,
+}
+
+/// Format a BenchRecord's state and question into a clean, self-contained text representation
+pub fn format_bench_record_as_text(record: &BenchRecord) -> String {
+    let mut parts = Vec::new();
+    match &record.input.state {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let val_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                parts.push(format!("{}: {}", k, val_str));
+            }
+        }
+        serde_json::Value::String(s) => parts.push(s.clone()),
+        other => parts.push(other.to_string()),
+    }
+
+    if let Some(decision) = record
+        .input
+        .questions
+        .get("decision")
+        .or_else(|| record.input.questions.as_object().and_then(|m| m.values().next()))
+    {
+        if let Some(instr) = decision.get("instructions").and_then(|v| v.as_str()) {
+            parts.push(format!("Question: {}", instr));
+        }
+    }
+
+    parts.join(" | ")
+}
+
+/// Determine if an EvaluationRow should be mined for active learning and return its failure_type
+pub fn classify_failure_row(row: &EvaluationRow) -> Option<&'static str> {
+    if row.error.is_some() {
+        return None;
+    }
+    if !row.correct {
+        if row.top_probability >= 0.80 {
+            Some("misclassified_overconfident")
+        } else {
+            Some("misclassified")
+        }
+    } else if row.top_probability < 0.55 {
+        Some("boundary_low_confidence")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubsetSummary {
     pub subset: String,
@@ -313,13 +378,18 @@ impl BenchRunner {
             }
         };
 
+        let clean_ref = match &record.reference.label {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string().trim_matches('"').to_string(),
+        };
+
         Ok(EvaluationRow {
             id: record.id.clone(),
             correct,
             top_probability: top_prob.clamp(0.0, 1.0),
             elapsed_ms,
             predicted,
-            reference: format!("{}", record.reference.label),
+            reference: clean_ref,
             error: None,
         })
     }
@@ -332,6 +402,18 @@ impl BenchRunner {
         subset_title: &str,
         records: &[BenchRecord],
     ) -> Result<SubsetSummary> {
+        let (summary, _) = self.run_subset_with_failures(model, subset_name, subset_title, records)?;
+        Ok(summary)
+    }
+
+    /// Run evaluation for one model on a set of records and extract failure/boundary probes
+    pub fn run_subset_with_failures(
+        &self,
+        model: &str,
+        subset_name: &str,
+        subset_title: &str,
+        records: &[BenchRecord],
+    ) -> Result<(SubsetSummary, Vec<FailureExportRecord>)> {
         let count_to_eval = if let Some(limit) = self.limit {
             records.len().min(limit)
         } else {
@@ -340,19 +422,23 @@ impl BenchRunner {
 
         let records = &records[..count_to_eval];
         if records.is_empty() {
-            return Ok(SubsetSummary {
-                subset: subset_name.to_string(),
-                title: subset_title.to_string(),
-                count: 0,
-                errors: 0,
-                accuracy: 0.0,
-                ece10: 0.0,
-                median_ms: 0.0,
-                p95_ms: 0.0,
-            });
+            return Ok((
+                SubsetSummary {
+                    subset: subset_name.to_string(),
+                    title: subset_title.to_string(),
+                    count: 0,
+                    errors: 0,
+                    accuracy: 0.0,
+                    ece10: 0.0,
+                    median_ms: 0.0,
+                    p95_ms: 0.0,
+                },
+                Vec::new(),
+            ));
         }
 
         let mut rows = Vec::with_capacity(records.len());
+        let mut failures = Vec::new();
         let mut latencies = Vec::with_capacity(records.len());
         let mut ece_pairs = Vec::with_capacity(records.len());
         let mut errors = 0;
@@ -365,6 +451,20 @@ impl BenchRunner {
             } else {
                 if row.correct {
                     correct_count += 1;
+                }
+                if let Some(failure_type) = classify_failure_row(&row) {
+                    failures.push(FailureExportRecord {
+                        id: record.id.clone(),
+                        subset: subset_name.to_string(),
+                        kind: record.kind.clone(),
+                        text: format_bench_record_as_text(record),
+                        state: record.input.state.clone(),
+                        questions: record.input.questions.clone(),
+                        gold_label: row.reference.clone(),
+                        predicted_label: row.predicted.clone(),
+                        confidence: row.top_probability,
+                        failure_type: failure_type.to_string(),
+                    });
                 }
                 latencies.push(row.elapsed_ms);
                 ece_pairs.push((row.top_probability, row.correct));
@@ -394,16 +494,19 @@ impl BenchRunner {
 
         let ece10 = compute_ece(&ece_pairs, 10);
 
-        Ok(SubsetSummary {
-            subset: subset_name.to_string(),
-            title: subset_title.to_string(),
-            count: rows.len(),
-            errors,
-            accuracy,
-            ece10,
-            median_ms,
-            p95_ms,
-        })
+        Ok((
+            SubsetSummary {
+                subset: subset_name.to_string(),
+                title: subset_title.to_string(),
+                count: rows.len(),
+                errors,
+                accuracy,
+                ece10,
+                median_ms,
+                p95_ms,
+            },
+            failures,
+        ))
     }
 }
 
@@ -519,6 +622,30 @@ pub fn resolve_benchmark_data(
     result
 }
 
+/// Sort mined failure records by priority:
+/// 1. misclassified_overconfident (ECE & accuracy killers)
+/// 2. misclassified
+/// 3. boundary_low_confidence
+/// Ties are broken by highest confidence first.
+pub fn sort_failures_by_severity(failures: &mut [FailureExportRecord]) {
+    let rank = |ft: &str| -> u8 {
+        match ft {
+            "misclassified_overconfident" => 0,
+            "misclassified" => 1,
+            _ => 2,
+        }
+    };
+    failures.sort_by(|a, b| {
+        rank(&a.failure_type)
+            .cmp(&rank(&b.failure_type))
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+}
+
 /// Main entry point to run benchmark from CLI
 pub fn run_benchmark(
     model: &str,
@@ -529,6 +656,31 @@ pub fn run_benchmark(
     server_url: &str,
     out_file: Option<&Path>,
     min_accuracy: Option<f64>,
+) -> Result<()> {
+    run_benchmark_with_failures(
+        model,
+        baseline,
+        data_dir,
+        subsets_filter,
+        limit,
+        server_url,
+        out_file,
+        min_accuracy,
+        None,
+    )
+}
+
+/// Main entry point to run benchmark and optionally export failure & boundary probes for active learning
+pub fn run_benchmark_with_failures(
+    model: &str,
+    baseline: Option<&str>,
+    data_dir: Option<&Path>,
+    subsets_filter: Option<&[String]>,
+    limit: Option<usize>,
+    server_url: &str,
+    out_file: Option<&Path>,
+    min_accuracy: Option<f64>,
+    export_failures_path: Option<&Path>,
 ) -> Result<()> {
     crate::utils::print_banner("Ollaya Public Decision Benchmark");
 
@@ -545,6 +697,9 @@ pub fn run_benchmark(
     }
     if let Some(min_acc) = min_accuracy {
         println!("    • Min Accuracy     : {:.1}% (Quality Threshold Gate)", min_acc * 100.0);
+    }
+    if let Some(fail_path) = export_failures_path {
+        println!("    • Failure Mining   : {:?} (Active Learning Loop)", fail_path);
     }
     if let Some(dir) = data_dir {
         println!("    • Dataset Source   : {:?}", dir);
@@ -593,6 +748,7 @@ pub fn run_benchmark(
 
     let mut model_summaries = HashMap::new();
     let mut baseline_summaries = HashMap::new();
+    let mut all_mined_failures: Vec<FailureExportRecord> = Vec::new();
 
     let pb = ProgressBar::new(datasets.len() as u64);
     pb.set_style(
@@ -606,8 +762,9 @@ pub fn run_benchmark(
         if let Some(records) = datasets.get(*sub_name) {
             pb.set_message(format!("Evaluating {}", sub_name));
 
-            let m_res = runner.run_subset(model, sub_name, sub_title, records)?;
+            let (m_res, subset_failures) = runner.run_subset_with_failures(model, sub_name, sub_title, records)?;
             model_summaries.insert(sub_name.to_string(), m_res);
+            all_mined_failures.extend(subset_failures);
 
             if let Some(base) = baseline {
                 let b_res = runner.run_subset(base, sub_name, sub_title, records)?;
@@ -733,6 +890,59 @@ pub fn run_benchmark(
             "-"
         );
         println!("└────────────────────────┴───────┴──────────────┴────────────┴─────────────┴─────────────┘");
+    }
+
+    // Export mined failures & boundary cases if requested
+    if let Some(fail_path) = export_failures_path {
+        sort_failures_by_severity(&mut all_mined_failures);
+
+        if let Some(parent) = fail_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let mut f_out = File::create(fail_path)
+            .with_context(|| format!("Creating failure export file at {:?}", fail_path))?;
+        use std::io::Write;
+        for item in &all_mined_failures {
+            writeln!(f_out, "{}", serde_json::to_string(item)?)?;
+        }
+
+        let overconf_count = all_mined_failures
+            .iter()
+            .filter(|f| f.failure_type == "misclassified_overconfident")
+            .count();
+        let misclass_count = all_mined_failures
+            .iter()
+            .filter(|f| f.failure_type == "misclassified")
+            .count();
+        let boundary_count = all_mined_failures
+            .iter()
+            .filter(|f| f.failure_type == "boundary_low_confidence")
+            .count();
+
+        println!(
+            "\n  {} Active Learning Failure Mining Summary ({} total probes):",
+            "🎯".cyan().bold(),
+            all_mined_failures.len()
+        );
+        println!(
+            "    • Overconfident Errors (conf >= 80%) : {}",
+            overconf_count.to_string().red().bold()
+        );
+        println!(
+            "    • Standard Misclassifications        : {}",
+            misclass_count.to_string().yellow()
+        );
+        println!(
+            "    • Low-Confidence Boundary Cases      : {}",
+            boundary_count.to_string().cyan()
+        );
+        println!(
+            "    • Exported to {:?} (Ready for: 'trainaya curate --mode augment --input {:?}')",
+            fail_path, fail_path
+        );
     }
 
     // Save JSON report if requested
@@ -1396,5 +1606,100 @@ mod tests {
         let pairs = vec![(1.0, false), (1.0, false)];
         let ece = compute_ece(&pairs, 10);
         assert!((ece - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_classify_and_sort_failures() {
+        let overconf_row = EvaluationRow {
+            id: "r1".to_string(),
+            correct: false,
+            top_probability: 0.94,
+            elapsed_ms: 5.0,
+            predicted: "false".to_string(),
+            reference: "true".to_string(),
+            error: None,
+        };
+        let std_fail_row = EvaluationRow {
+            id: "r2".to_string(),
+            correct: false,
+            top_probability: 0.62,
+            elapsed_ms: 5.0,
+            predicted: "false".to_string(),
+            reference: "true".to_string(),
+            error: None,
+        };
+        let boundary_row = EvaluationRow {
+            id: "r3".to_string(),
+            correct: true,
+            top_probability: 0.51,
+            elapsed_ms: 5.0,
+            predicted: "true".to_string(),
+            reference: "true".to_string(),
+            error: None,
+        };
+        let solid_row = EvaluationRow {
+            id: "r4".to_string(),
+            correct: true,
+            top_probability: 0.95,
+            elapsed_ms: 5.0,
+            predicted: "true".to_string(),
+            reference: "true".to_string(),
+            error: None,
+        };
+
+        assert_eq!(
+            classify_failure_row(&overconf_row),
+            Some("misclassified_overconfident")
+        );
+        assert_eq!(classify_failure_row(&std_fail_row), Some("misclassified"));
+        assert_eq!(
+            classify_failure_row(&boundary_row),
+            Some("boundary_low_confidence")
+        );
+        assert_eq!(classify_failure_row(&solid_row), None);
+
+        let mut list = vec![
+            FailureExportRecord {
+                id: "r3".to_string(),
+                subset: "boolq".to_string(),
+                kind: "noul".to_string(),
+                text: "t3".to_string(),
+                state: serde_json::json!({}),
+                questions: serde_json::json!({}),
+                gold_label: "true".to_string(),
+                predicted_label: "true".to_string(),
+                confidence: 0.51,
+                failure_type: "boundary_low_confidence".to_string(),
+            },
+            FailureExportRecord {
+                id: "r2".to_string(),
+                subset: "boolq".to_string(),
+                kind: "noul".to_string(),
+                text: "t2".to_string(),
+                state: serde_json::json!({}),
+                questions: serde_json::json!({}),
+                gold_label: "true".to_string(),
+                predicted_label: "false".to_string(),
+                confidence: 0.62,
+                failure_type: "misclassified".to_string(),
+            },
+            FailureExportRecord {
+                id: "r1".to_string(),
+                subset: "boolq".to_string(),
+                kind: "noul".to_string(),
+                text: "t1".to_string(),
+                state: serde_json::json!({}),
+                questions: serde_json::json!({}),
+                gold_label: "true".to_string(),
+                predicted_label: "false".to_string(),
+                confidence: 0.94,
+                failure_type: "misclassified_overconfident".to_string(),
+            },
+        ];
+
+        sort_failures_by_severity(&mut list);
+        assert_eq!(list[0].id, "r1");
+        assert_eq!(list[1].id, "r2");
+        assert_eq!(list[2].id, "r3");
     }
 }

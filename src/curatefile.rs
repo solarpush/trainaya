@@ -162,6 +162,21 @@ impl Curatefile {
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
         Self::parse(&content, base_dir)
     }
+
+    /// Return the list of configured teacher engines (supports comma-separated multi-teacher consensus)
+    pub fn teachers(&self) -> Vec<String> {
+        let list: Vec<String> = self
+            .teacher
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if list.is_empty() {
+            vec!["agy".to_string()]
+        } else {
+            list
+        }
+    }
 }
 
 fn resolve_path(base_dir: &Path, p: &str) -> PathBuf {
@@ -194,6 +209,7 @@ PARAMETER add_hard_negatives true
 "#;
         let cf = Curatefile::parse(content, Path::new(".")).unwrap();
         assert_eq!(cf.teacher, "agy");
+        assert_eq!(cf.teachers(), vec!["agy".to_string()]);
         assert_eq!(cf.mode, CurateMode::Label);
         assert_eq!(cf.format, TargetDatasetFormat::Decision);
         assert_eq!(cf.input, Some(PathBuf::from("./data/raw.jsonl")));
@@ -203,5 +219,24 @@ PARAMETER add_hard_negatives true
         assert_eq!(cf.batch_size, 12);
         assert_eq!(cf.min_confidence, 0.85);
         assert!(cf.add_hard_negatives);
+    }
+
+    #[test]
+    fn test_parse_curatefile_multi_teacher() {
+        let content = r#"
+TEACHER agy, claude, ollama:qwen2.5:72b
+MODE augment
+FORMAT decision
+"#;
+        let cf = Curatefile::parse(content, Path::new(".")).unwrap();
+        assert_eq!(
+            cf.teachers(),
+            vec![
+                "agy".to_string(),
+                "claude".to_string(),
+                "ollama:qwen2.5:72b".to_string()
+            ]
+        );
+        assert_eq!(cf.mode, CurateMode::Augment);
     }
 }

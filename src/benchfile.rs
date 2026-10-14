@@ -36,6 +36,8 @@ pub struct Benchfile {
     pub output: Option<PathBuf>,
     /// Minimum macro accuracy required (THRESHOLD min_accuracy)
     pub min_accuracy: Option<f64>,
+    /// Path to export misclassified and overconfident failure records for active learning (EXPORT_FAILURES)
+    pub export_failures: Option<PathBuf>,
 }
 
 impl Default for Benchfile {
@@ -49,6 +51,7 @@ impl Default for Benchfile {
             limit: None,
             output: None,
             min_accuracy: None,
+            export_failures: None,
         }
     }
 }
@@ -111,6 +114,11 @@ impl Benchfile {
                         bf.output = Some(resolve_path(base_dir, value));
                     }
                 }
+                "EXPORT_FAILURES" | "FAILURES_OUT" | "MINE_FAILURES" => {
+                    if !value.is_empty() {
+                        bf.export_failures = Some(resolve_path(base_dir, value));
+                    }
+                }
                 "THRESHOLD" => {
                     let (metric, val_str) = value
                         .split_once(char::is_whitespace)
@@ -156,23 +164,34 @@ impl Benchfile {
             self.baseline = Some(resolve_bench_tag(base, &models_dir));
         }
 
+        let sanitized_model = self.model.replace(':', "_").replace('/', "_");
+        let sanitized_base = self
+            .baseline
+            .as_deref()
+            .unwrap_or("none")
+            .replace(':', "_")
+            .replace('/', "_");
+
         // Expand placeholders in output path
         if let Some(out) = &self.output {
             let out_str = out.to_string_lossy().to_string();
-            let sanitized_model = self.model.replace(':', "_").replace('/', "_");
-            let sanitized_base = self
-                .baseline
-                .as_deref()
-                .unwrap_or("none")
-                .replace(':', "_")
-                .replace('/', "_");
-
             let expanded = out_str
                 .replace("{model}", &sanitized_model)
                 .replace("{baseline}", &sanitized_base)
                 .replace("{tag}", &sanitized_model);
 
             self.output = Some(PathBuf::from(expanded));
+        }
+
+        // Expand placeholders in export_failures path
+        if let Some(fail_out) = &self.export_failures {
+            let fail_str = fail_out.to_string_lossy().to_string();
+            let expanded = fail_str
+                .replace("{model}", &sanitized_model)
+                .replace("{baseline}", &sanitized_base)
+                .replace("{tag}", &sanitized_model);
+
+            self.export_failures = Some(PathBuf::from(expanded));
         }
     }
 }
@@ -236,6 +255,7 @@ SUBSETS multinli, paws, boolq
 URL http://127.0.0.1:11435
 LIMIT 25
 OUTPUT ./results/test_report.json
+EXPORT_FAILURES ./data/mined_failures.jsonl
 THRESHOLD min_accuracy 0.75
 "#;
         let bf = Benchfile::parse(content, Path::new(".")).unwrap();
@@ -252,6 +272,10 @@ THRESHOLD min_accuracy 0.75
         assert_eq!(bf.url, "http://127.0.0.1:11435");
         assert_eq!(bf.limit, Some(25));
         assert_eq!(bf.output, Some(PathBuf::from("./results/test_report.json")));
+        assert_eq!(
+            bf.export_failures,
+            Some(PathBuf::from("./data/mined_failures.jsonl"))
+        );
         assert_eq!(bf.min_accuracy, Some(0.75));
     }
 
@@ -266,12 +290,17 @@ THRESHOLD min_accuracy 0.75
             limit: None,
             output: Some(PathBuf::from("./results/{model}_vs_{baseline}.json")),
             min_accuracy: None,
+            export_failures: Some(PathBuf::from("./data/failures_{model}.jsonl")),
         };
 
         bf.resolve_placeholders(None);
         assert_eq!(
             bf.output,
             Some(PathBuf::from("./results/winnow_v1_vs_winnow_e4b.json"))
+        );
+        assert_eq!(
+            bf.export_failures,
+            Some(PathBuf::from("./data/failures_winnow_v1.jsonl"))
         );
     }
 }

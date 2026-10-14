@@ -326,15 +326,46 @@ pub fn run_training(args: TrainingArgs) -> Result<TrainMetrics> {
         }
     }
 
-    // 7. Restore best validation checkpoint if available and save final adapter & metadata
+    // 7. Restore best validation checkpoint if available and run Post-Training Temperature Scaling (T*)
     if best_checkpoint_file.exists() {
         let _ = model.load_adapter(&best_checkpoint_file);
         let _ = std::fs::remove_file(&best_checkpoint_file);
     }
 
+    let cal_ds = eval_dataset.as_ref().unwrap_or(&train_dataset);
+    let mut cal_temp = 1.0f32;
+    let mut post_cal_ece = None;
+    if let Ok(cal_batches) = cal_ds.create_batches(args.batch_size, false, &device) {
+        let mut all_logits: Vec<Vec<f32>> = Vec::new();
+        let mut all_labels: Vec<usize> = Vec::new();
+        for c_batch in &cal_batches {
+            if let Ok(logits) = model.forward_t(&c_batch.input_ids, &c_batch.attention_mask, false) {
+                if let (Ok(rows), Ok(lbls)) = (logits.to_vec2::<f32>(), c_batch.labels.to_vec1::<u32>()) {
+                    all_logits.extend(rows);
+                    all_labels.extend(lbls.into_iter().map(|y| y as usize));
+                }
+            }
+        }
+        if all_logits.len() >= 2 {
+            let cal = crate::models::classifier::optimize_temperature_scaling(&all_logits, &all_labels);
+            cal_temp = cal.optimal_temperature;
+            post_cal_ece = Some(cal.post_ece);
+            model.head.apply_temperature_scaling(cal_temp)?;
+            println!(
+                "\n  {} Post-Training Temperature Scaling: T* = {} (ECE: {:.4} -> {:.4}, NLL: {:.4} -> {:.4})",
+                "🌡️".cyan(),
+                format!("{:.3}", cal_temp).bold().green(),
+                cal.pre_ece,
+                cal.post_ece,
+                cal.pre_nll,
+                cal.post_nll
+            );
+        }
+    }
+
     model.save_adapter(&adapter_file)?;
     println!(
-        "\n  Saved adapter weights to: {}",
+        "  Saved calibrated adapter weights to: {}",
         adapter_file.display().to_string().cyan()
     );
 
@@ -346,7 +377,9 @@ pub fn run_training(args: TrainingArgs) -> Result<TrainMetrics> {
         "lora_dropout": args.lora.dropout,
         "target_modules": args.lora.target_modules,
         "peft_type": "LORA",
-        "task_type": "SEQ_CLS"
+        "task_type": "SEQ_CLS",
+        "calibration_temperature": cal_temp,
+        "calibrated_ece10": post_cal_ece,
     });
     let adapter_cfg_file = args.output_dir.join("adapter_config.json");
     std::fs::write(&adapter_cfg_file, serde_json::to_string_pretty(&adapter_config)?)?;

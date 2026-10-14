@@ -41,17 +41,17 @@ fn main() {
         Commands::Register(opts) => run_register(opts.into()),
         Commands::Doctor => run_doctor(),
         Commands::Bench(opts) => (|| -> Result<()> {
-            let (model, baseline, data, subsets, limit, url, out, min_accuracy) =
-                opts.resolve_bench_args()?;
-            trainaya::bench::run_benchmark(
-                &model,
-                baseline.as_deref(),
-                data.as_deref(),
-                subsets.as_deref(),
-                limit,
-                &url,
-                out.as_deref(),
-                min_accuracy,
+            let bf = opts.resolve_benchfile()?;
+            trainaya::bench::run_benchmark_with_failures(
+                &bf.model,
+                bf.baseline.as_deref(),
+                bf.data.as_deref(),
+                bf.subsets.as_deref(),
+                bf.limit,
+                &bf.url,
+                bf.output.as_deref(),
+                bf.min_accuracy,
+                bf.export_failures.as_deref(),
             )
         })(),
         Commands::Curate(opts) => (|| -> Result<()> {
