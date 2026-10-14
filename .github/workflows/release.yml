@@ -34,6 +34,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Sync Cargo.toml version with Git tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Syncing Cargo.toml version to ${VERSION} (from tag ${GITHUB_REF_NAME})"
+          python3 -c 'import pathlib, re, sys; p = pathlib.Path("Cargo.toml"); p.write_text(re.sub(r"(?m)^version\s*=\s*\"[^\"]+\"", f"version = \"{sys.argv[1]}\"", p.read_text(), count=1))' "$VERSION"
+
       - name: Build Release
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_features }}
 
