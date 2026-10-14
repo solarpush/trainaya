@@ -68,7 +68,14 @@ impl DecisionDataset {
             if first_val.get("options").is_some() && first_val.get("target_index").is_some() {
                 let mut samples = Vec::new();
                 for (idx, line) in raw_lines.iter().enumerate() {
-                    let s: DecisionSample = serde_json::from_str(line)
+                    let mut val: Value = serde_json::from_str(line)
+                        .with_context(|| format!("Failed to parse JSON on line {}", idx + 1))?;
+                    if val.get("state").is_none() {
+                        if let Some(txt) = val.get("text").cloned() {
+                            val["state"] = txt;
+                        }
+                    }
+                    let s: DecisionSample = serde_json::from_value(val)
                         .with_context(|| format!("Failed to parse DecisionSample on line {}", idx + 1))?;
                     samples.push(s);
                 }

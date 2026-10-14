@@ -889,7 +889,6 @@ fn write_formatted_row_with_schema(
                     .unwrap_or(0);
                 let row = serde_json::json!({
                     "state": text,
-                    "text": text,
                     "label": label,
                     "question": schema_question,
                     "options": valid_labels,
@@ -899,7 +898,6 @@ fn write_formatted_row_with_schema(
             } else {
                 let row = serde_json::json!({
                     "state": text,
-                    "text": text,
                     "label": label,
                 });
                 writeln!(writer, "{}", serde_json::to_string(&row)?)?;
