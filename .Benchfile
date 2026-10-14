@@ -10,11 +10,15 @@ MODEL winnow:v{latest}
 # Baseline reference model for comparative A/B testing
 BASELINE winnow:e4b
 
-# Subsets to evaluate (selected from the 13 public decision benchmark datasets)
-SUBSETS multinli, paws, boolq, vitaminc-dev
+# Subsets to evaluate (leave commented to evaluate all 13 public benchmark subsets)
+# SUBSETS multinli, paws, boolq, vitaminc-dev
 
 # Ollaya runtime endpoint
 URL http://127.0.0.1:11435
 
 # Output report path (expands {model}, {baseline}, {tag})
 OUTPUT ./results/bench_{model}_vs_{baseline}.json
+
+# Export misclassified & overconfident probes for active learning with 'trainaya curate'
+EXPORT_FAILURES ./data/failures_{model}.jsonl
+

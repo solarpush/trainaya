@@ -5,13 +5,13 @@
 # Teacher Engine (utilise votre session locale 'agy' à zéro frais API)
 TEACHER agy
 
-# Mode de curation : 'label' (annotation), 'synth' (synthèse), 'augment'
-MODE label
+# Mode de curation : 'label' (annotation), 'synth' (synthèse), 'augment' (jumeaux contrefactuels)
+MODE augment
 
 # Format cible du dataset adapté à votre modèle (decision, classification, nli)
 FORMAT decision
 
-# Données brutes à étiqueter
+# Données brutes ou erreurs extraites par 'trainaya bench'
 INPUT ./data/eval_probes.jsonl
 
 # Schéma de décision et critères métier
@@ -20,7 +20,7 @@ SCHEMA ./data/questions_schema.json
 # Fichier de sortie prêt pour .Trainfile
 OUTPUT ./data/curated_from_teacher.jsonl
 
-# Paramètres du Teacher
+# Paramètres du Teacher (add_hard_negatives génère le jumeau inversé pour chaque exemple)
 PARAMETER batch_size 4
 PARAMETER min_confidence 0.85
-PARAMETER add_hard_negatives false
+PARAMETER add_hard_negatives true

@@ -563,7 +563,418 @@ pub fn load_jsonl(path: &Path) -> Result<Vec<BenchRecord>> {
     Ok(records)
 }
 
-/// Discover subsets in a data directory or load built-in reference subsets
+/// Return the global benchmark cache directory (~/.cache/trainaya/benchmarks/public)
+pub fn get_benchmark_cache_dir() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.trim().is_empty() {
+            return std::path::PathBuf::from(xdg)
+                .join("trainaya")
+                .join("benchmarks")
+                .join("public");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return std::path::PathBuf::from(home)
+                .join(".cache")
+                .join("trainaya")
+                .join("benchmarks")
+                .join("public");
+        }
+    }
+    std::path::PathBuf::from(".cache/trainaya/benchmarks/public")
+}
+
+/// Fetch raw JSON rows from Hugging Face Datasets Server REST API in chunks of 100
+fn fetch_hf_rows(dataset: &str, config: &str, split: &str, target_count: usize) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::with_capacity(target_count);
+    let mut offset = 0usize;
+
+    while rows.len() < target_count {
+        let length = (target_count - rows.len()).min(100);
+        let url = format!(
+            "https://datasets-server.huggingface.co/rows?dataset={}&config={}&split={}&offset={}&length={}",
+            dataset, config, split, offset, length
+        );
+
+        let resp = ureq::get(&url)
+            .timeout(Duration::from_secs(20))
+            .call()
+            .with_context(|| format!("Fetching HF dataset {} ({}/{})", dataset, config, split))?;
+
+        let body: serde_json::Value = resp.into_json()?;
+        let arr = match body.get("rows").and_then(|v| v.as_array()) {
+            Some(a) if !a.is_empty() => a,
+            _ => break,
+        };
+
+        for item in arr {
+            if let Some(r) = item.get("row") {
+                rows.push(r.clone());
+                if rows.len() >= target_count {
+                    break;
+                }
+            }
+        }
+
+        if arr.len() < length {
+            break;
+        }
+        offset += arr.len();
+    }
+
+    Ok(rows)
+}
+
+/// Download and build one of the 13 public benchmark subsets from Hugging Face into ~/.cache/trainaya/benchmarks/public/<subset>/all.jsonl
+pub fn fetch_and_cache_public_subset(
+    subset_name: &str,
+    cache_root: &Path,
+    question_template: &serde_json::Value,
+) -> Result<Vec<BenchRecord>> {
+    let mut records = Vec::new();
+
+    let massive_18_questions = |instructions: &str| -> serde_json::Value {
+        serde_json::json!({
+            "decision": {
+                "type": "choice",
+                "instructions": instructions,
+                "criteria": {
+                    "alarm": "Alarms, timers, and wake-up notifications.",
+                    "audio": "Volume control and audio output settings.",
+                    "calendar": "Calendar events, reminders, and meeting appointments.",
+                    "cooking": "Recipes, food preparation, and cooking instructions.",
+                    "datetime": "Current time, dates, and timezone queries.",
+                    "email": "Checking, sending, and managing emails.",
+                    "general": "General chitchat, greetings, and conversational remarks.",
+                    "iot": "Smart home devices, lights, thermostat, and plugs.",
+                    "lists": "Shopping lists and to-do list management.",
+                    "music": "Music playback, artists, and track queries.",
+                    "news": "Latest news headlines and topic updates.",
+                    "play": "Playing music, podcasts, radio, audiobooks, or games.",
+                    "qa": "Factoid questions, math, definitions, and currency.",
+                    "recommendation": "Recommendations for movies, events, or local places.",
+                    "social": "Social media posts and updates.",
+                    "takeaway": "Ordering food delivery or takeaway.",
+                    "transport": "Traffic, train, taxi, and commute queries.",
+                    "weather": "Weather forecasts and current conditions."
+                }
+            }
+        })
+    };
+
+    match subset_name {
+        "vitaminc-dev" => {
+            let raw = fetch_hf_rows("tals/vitaminc", "default", "validation", 599)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let claim = r.get("claim").and_then(|v| v.as_str()).unwrap_or_default();
+                let evidence = r.get("evidence").and_then(|v| v.as_str()).unwrap_or_default();
+                let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("NOT ENOUGH INFO");
+                records.push(BenchRecord {
+                    id: format!("vitaminc-dev-{}", idx + 1),
+                    kind: "choice".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "claim": claim, "evidence": evidence }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(label),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "massive-en-US" => {
+            let raw = fetch_hf_rows("mteb/amazon_massive_intent", "en", "test", 350)?;
+            let q = massive_18_questions("Classify the user utterance into one of the 18 domain categories.");
+            for (idx, r) in raw.into_iter().enumerate() {
+                let text = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                let full_label = r.get("label").and_then(|v| v.as_str()).unwrap_or("general");
+                let domain = full_label.split('_').next().unwrap_or("general");
+                records.push(BenchRecord {
+                    id: format!("massive-en-{}", idx + 1),
+                    kind: "choice".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "utterance": text, "locale": "en-US" }),
+                        questions: q.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(domain),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "massive-de-DE" => {
+            let raw = fetch_hf_rows("mteb/amazon_massive_intent", "de", "test", 350)?;
+            let q = massive_18_questions("Klassifiziere die Benutzerabsicht in eine der 18 Domänenkategorien.");
+            for (idx, r) in raw.into_iter().enumerate() {
+                let text = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                let full_label = r.get("label").and_then(|v| v.as_str()).unwrap_or("general");
+                let domain = full_label.split('_').next().unwrap_or("general");
+                records.push(BenchRecord {
+                    id: format!("massive-de-{}", idx + 1),
+                    kind: "choice".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "utterance": text, "locale": "de-DE" }),
+                        questions: q.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(domain),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "boolq" => {
+            let raw = fetch_hf_rows("google/boolq", "default", "validation", 300)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let passage = r.get("passage").and_then(|v| v.as_str()).unwrap_or_default();
+                let question = r.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+                let ans = r.get("answer").and_then(|v| v.as_bool()).unwrap_or(false);
+                records.push(BenchRecord {
+                    id: format!("boolq-{}", idx + 1),
+                    kind: "noul".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "passage": passage, "question": question }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(ans),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "squad2" => {
+            let raw = fetch_hf_rows("rajpurkar/squad_v2", "squad_v2", "validation", 299)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let paragraph = r.get("context").and_then(|v| v.as_str()).unwrap_or_default();
+                let question = r.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+                let answerable = r
+                    .get("answers")
+                    .and_then(|a| a.get("text"))
+                    .and_then(|t| t.as_array())
+                    .map(|arr| !arr.is_empty())
+                    .unwrap_or(false);
+                records.push(BenchRecord {
+                    id: format!("squad2-{}", idx + 1),
+                    kind: "noul".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "paragraph": paragraph, "question": question }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(answerable),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "paws" => {
+            let raw = fetch_hf_rows("google-research-datasets/paws", "labeled_final", "test", 250)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let s1 = r.get("sentence1").and_then(|v| v.as_str()).unwrap_or_default();
+                let s2 = r.get("sentence2").and_then(|v| v.as_str()).unwrap_or_default();
+                let is_para = r.get("label").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+                records.push(BenchRecord {
+                    id: format!("paws-{}", idx + 1),
+                    kind: "noul".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "sentence_1": s1, "sentence_2": s2 }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(is_para),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "multinli" => {
+            let raw = fetch_hf_rows("nyu-mll/multi_nli", "default", "validation_matched", 299)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let premise = r.get("premise").and_then(|v| v.as_str()).unwrap_or_default();
+                let hypothesis = r.get("hypothesis").and_then(|v| v.as_str()).unwrap_or_default();
+                let lbl_int = r.get("label").and_then(|v| v.as_i64()).unwrap_or(1);
+                let lbl_str = match lbl_int {
+                    0 => "entailment",
+                    2 => "contradiction",
+                    _ => "neutral",
+                };
+                records.push(BenchRecord {
+                    id: format!("multinli-{}", idx + 1),
+                    kind: "choice".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "premise": premise, "hypothesis": hypothesis }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(lbl_str),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "civil_comments" => {
+            let raw = fetch_hf_rows("google/civil_comments", "default", "test", 300)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let comment = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                let tox = r.get("toxicity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                records.push(BenchRecord {
+                    id: format!("civil-{}", idx + 1),
+                    kind: "noul".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "comment": comment }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(tox >= 0.5),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "aegis2" => {
+            let raw = fetch_hf_rows("nvidia/Aegis-AI-Content-Safety-Dataset-2.0", "default", "test", 250)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let msg = r.get("prompt").and_then(|v| v.as_str()).unwrap_or_default();
+                let unsafe_lbl = r
+                    .get("prompt_label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("unsafe"))
+                    .unwrap_or(false);
+                records.push(BenchRecord {
+                    id: format!("aegis-{}", idx + 1),
+                    kind: "noul".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "user_message": msg }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(unsafe_lbl),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "helpsteer2" => {
+            let raw = fetch_hf_rows("nvidia/HelpSteer2", "default", "validation", 249)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let prompt = r.get("prompt").and_then(|v| v.as_str()).unwrap_or_default();
+                let response = r.get("response").and_then(|v| v.as_str()).unwrap_or_default();
+                let score = r
+                    .get("correctness")
+                    .or_else(|| r.get("helpfulness"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(4)
+                    .clamp(0, 4);
+                records.push(BenchRecord {
+                    id: format!("helpsteer-{}", idx + 1),
+                    kind: "score".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({ "prompt": prompt, "response": response }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(score),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        "summeval-relevance" | "summeval-consistency" => {
+            let is_rel = subset_name == "summeval-relevance";
+            let target_n = if is_rel { 240 } else { 144 };
+            let raw = fetch_hf_rows("mteb/summeval", "default", "test", 30)?;
+            for r in raw {
+                let article = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                let summaries = r.get("machine_summaries").and_then(|v| v.as_array());
+                let scores = r
+                    .get(if is_rel { "relevance" } else { "consistency" })
+                    .and_then(|v| v.as_array());
+                if let (Some(sums), Some(sc_arr)) = (summaries, scores) {
+                    for (s_val, sc_val) in sums.iter().zip(sc_arr.iter()) {
+                        if let (Some(summary), Some(raw_score)) = (s_val.as_str(), sc_val.as_f64()) {
+                            let mapped = (raw_score - 1.0).round().clamp(0.0, 4.0) as i64;
+                            records.push(BenchRecord {
+                                id: format!("{}-{}", subset_name, records.len() + 1),
+                                kind: "score".to_string(),
+                                input: BenchInput {
+                                    state: serde_json::json!({ "article": article, "summary": summary }),
+                                    questions: question_template.clone(),
+                                },
+                                reference: BenchReference {
+                                    label: serde_json::json!(mapped),
+                                    distribution: None,
+                                },
+                            });
+                            if records.len() >= target_n {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if records.len() >= target_n {
+                    break;
+                }
+            }
+        }
+        "pubmedqa" => {
+            let raw = fetch_hf_rows("qiaojin/PubMedQA", "pqa_labeled", "train", 250)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let question = r.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+                let abstract_ctx = r
+                    .get("context")
+                    .and_then(|c| c.get("contexts"))
+                    .and_then(|arr| arr.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .or_else(|| r.get("long_answer").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let decision = r
+                    .get("final_decision")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("yes");
+                records.push(BenchRecord {
+                    id: format!("pubmedqa-{}", idx + 1),
+                    kind: "choice".to_string(),
+                    input: BenchInput {
+                        state: serde_json::json!({
+                            "question": question,
+                            "abstract_context": abstract_ctx
+                        }),
+                        questions: question_template.clone(),
+                    },
+                    reference: BenchReference {
+                        label: serde_json::json!(decision),
+                        distribution: None,
+                    },
+                });
+            }
+        }
+        _ => {}
+    }
+
+    if !records.is_empty() {
+        let sub_dir = cache_root.join(subset_name);
+        std::fs::create_dir_all(&sub_dir)?;
+        let out_path = sub_dir.join("all.jsonl");
+        let mut f = File::create(&out_path)?;
+        use std::io::Write;
+        for rec in &records {
+            writeln!(f, "{}", serde_json::to_string(rec)?)?;
+        }
+    }
+
+    Ok(records)
+}
+
+/// Discover subsets in a data directory, global cache (~/.cache/trainaya/benchmarks/public), or download from HuggingFace
 pub fn resolve_benchmark_data(
     data_dir: Option<&Path>,
     requested_subsets: Option<&[String]>,
@@ -604,18 +1015,60 @@ pub fn resolve_benchmark_data(
         }
     }
 
-    // For any missing public subset, provide high-quality reference probe records
+    // Check or populate global benchmark cache (~/.cache/trainaya/benchmarks/public/<subset>/all.jsonl)
+    let cache_root = get_benchmark_cache_dir();
     let built_in = get_builtin_subsets();
+
     for (sub_name, _, _) in PUBLIC_SUBSETS {
         if let Some(req) = requested_subsets {
             if !req.iter().any(|r| r.eq_ignore_ascii_case(sub_name)) {
                 continue;
             }
         }
-        if !result.contains_key(*sub_name) {
-            if let Some(recs) = built_in.get(*sub_name) {
-                result.insert(sub_name.to_string(), recs.clone());
+        if result.contains_key(*sub_name) {
+            continue;
+        }
+
+        let cached_file = cache_root.join(sub_name).join("all.jsonl");
+        if cached_file.is_file() {
+            if let Ok(records) = load_jsonl(&cached_file) {
+                if !records.is_empty() {
+                    result.insert(sub_name.to_string(), records);
+                    continue;
+                }
             }
+        }
+
+        // Not in cache yet -> download from HuggingFace Datasets Server and cache in ~/.cache/trainaya/benchmarks/public/
+        if let Some(template_recs) = built_in.get(*sub_name) {
+            if let Some(first_rec) = template_recs.first() {
+                println!(
+                    "    {} Caching public benchmark subset '{}' into {:?}...",
+                    "⬇️".cyan(),
+                    sub_name.bold(),
+                    cache_root.join(sub_name)
+                );
+                match fetch_and_cache_public_subset(sub_name, &cache_root, &first_rec.input.questions) {
+                    Ok(fetched) if !fetched.is_empty() => {
+                        result.insert(sub_name.to_string(), fetched);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "    {} Offline or HF fetch failed for '{}' ({}), using built-in reference probes.",
+                            "⚠️".yellow(),
+                            sub_name,
+                            e
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Offline fallback to built-in reference probes
+        if let Some(recs) = built_in.get(*sub_name) {
+            result.insert(sub_name.to_string(), recs.clone());
         }
     }
 
@@ -704,7 +1157,10 @@ pub fn run_benchmark_with_failures(
     if let Some(dir) = data_dir {
         println!("    • Dataset Source   : {:?}", dir);
     } else {
-        println!("    • Dataset Source   : {}", "Built-in 13 Public Benchmark Reference Sets".green());
+        println!(
+            "    • Dataset Cache    : {:?} (13 Public Subsets, 3,880 records)",
+            get_benchmark_cache_dir()
+        );
     }
 
     // Warm-up request to avoid cold load skew

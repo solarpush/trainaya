@@ -16,13 +16,18 @@ FAMILY winnow-v1
 TASK classification
 
 # Optimization hyperparameters
-PARAMETER epochs 2
+PARAMETER epochs 4
 PARAMETER batch_size 8
+PARAMETER grad_accum 2
 PARAMETER lr 5e-5
+PARAMETER lr_scheduler cosine
+PARAMETER warmup_ratio 0.1
+PARAMETER max_grad_norm 1.0
 
-# LoRA hyperparameters
+# LoRA hyperparameters (multi-layer top blocks + post-training T* calibration)
 PARAMETER lora_r 16
 PARAMETER lora_alpha 32
+PARAMETER lora_layers 8
 PARAMETER target_modules attn_output,ffn_down
 
 # Weight merging & quantization
