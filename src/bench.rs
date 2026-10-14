@@ -402,7 +402,7 @@ impl BenchRunner {
         subset_title: &str,
         records: &[BenchRecord],
     ) -> Result<SubsetSummary> {
-        let (summary, _) = self.run_subset_with_failures(model, subset_name, subset_title, records)?;
+        let (summary, _) = self.run_subset_with_failures_progress(model, subset_name, subset_title, records, None)?;
         Ok(summary)
     }
 
@@ -413,6 +413,18 @@ impl BenchRunner {
         subset_name: &str,
         subset_title: &str,
         records: &[BenchRecord],
+    ) -> Result<(SubsetSummary, Vec<FailureExportRecord>)> {
+        self.run_subset_with_failures_progress(model, subset_name, subset_title, records, None)
+    }
+
+    /// Run evaluation with optional live per-probe ProgressBar updates
+    pub fn run_subset_with_failures_progress(
+        &self,
+        model: &str,
+        subset_name: &str,
+        subset_title: &str,
+        records: &[BenchRecord],
+        pb: Option<&ProgressBar>,
     ) -> Result<(SubsetSummary, Vec<FailureExportRecord>)> {
         let count_to_eval = if let Some(limit) = self.limit {
             records.len().min(limit)
@@ -437,14 +449,15 @@ impl BenchRunner {
             ));
         }
 
-        let mut rows = Vec::with_capacity(records.len());
+        let total_sub = records.len();
+        let mut rows = Vec::with_capacity(total_sub);
         let mut failures = Vec::new();
-        let mut latencies = Vec::with_capacity(records.len());
-        let mut ece_pairs = Vec::with_capacity(records.len());
+        let mut latencies = Vec::with_capacity(total_sub);
+        let mut ece_pairs = Vec::with_capacity(total_sub);
         let mut errors = 0;
         let mut correct_count = 0;
 
-        for record in records {
+        for (idx, record) in records.iter().enumerate() {
             let row = self.evaluate_record(model, record)?;
             if row.error.is_some() {
                 errors += 1;
@@ -470,6 +483,16 @@ impl BenchRunner {
                 ece_pairs.push((row.top_probability, row.correct));
             }
             rows.push(row);
+
+            if let Some(bar) = pb {
+                let done = idx + 1;
+                let live_acc = (correct_count as f64 / done as f64) * 100.0;
+                bar.set_message(format!(
+                    "{} [{}/{} | acc: {:.1}%]",
+                    subset_name, done, total_sub, live_acc
+                ));
+                bar.inc(1);
+            }
         }
 
         latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -585,7 +608,7 @@ pub fn get_benchmark_cache_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(".cache/trainaya/benchmarks/public")
 }
 
-/// Fetch raw JSON rows from Hugging Face Datasets Server REST API in chunks of 100
+/// Fetch raw JSON rows from Hugging Face Datasets Server REST API in chunks of 100 with automatic retry on rate limits
 fn fetch_hf_rows(dataset: &str, config: &str, split: &str, target_count: usize) -> Result<Vec<serde_json::Value>> {
     let mut rows = Vec::with_capacity(target_count);
     let mut offset = 0usize;
@@ -597,10 +620,45 @@ fn fetch_hf_rows(dataset: &str, config: &str, split: &str, target_count: usize) 
             dataset, config, split, offset, length
         );
 
-        let resp = ureq::get(&url)
-            .timeout(Duration::from_secs(20))
-            .call()
-            .with_context(|| format!("Fetching HF dataset {} ({}/{})", dataset, config, split))?;
+        let mut last_err = None;
+        let mut resp_opt = None;
+        for attempt in 1..=5 {
+            match ureq::get(&url)
+                .timeout(Duration::from_secs(20))
+                .call()
+            {
+                Ok(r) => {
+                    resp_opt = Some(r);
+                    break;
+                }
+                Err(ureq::Error::Status(429, _))
+                | Err(ureq::Error::Status(502, _))
+                | Err(ureq::Error::Status(503, _))
+                | Err(ureq::Error::Status(504, _)) => {
+                    last_err = Some(format!("HTTP rate-limit/busy on {}", dataset));
+                    std::thread::sleep(Duration::from_millis(1800 * attempt));
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_millis(800 * attempt));
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let resp = match resp_opt {
+            Some(r) => r,
+            None => bail!(
+                "Fetching HF dataset {} ({}/{}): {}",
+                dataset,
+                config,
+                split,
+                last_err.unwrap_or_else(|| "unknown error".to_string())
+            ),
+        };
 
         let body: serde_json::Value = resp.into_json()?;
         let arr = match body.get("rows").and_then(|v| v.as_array()) {
@@ -621,6 +679,7 @@ fn fetch_hf_rows(dataset: &str, config: &str, split: &str, target_count: usize) 
             break;
         }
         offset += arr.len();
+        std::thread::sleep(Duration::from_millis(120));
     }
 
     Ok(rows)
@@ -1135,6 +1194,9 @@ pub fn run_benchmark_with_failures(
     min_accuracy: Option<f64>,
     export_failures_path: Option<&Path>,
 ) -> Result<()> {
+    // Never run the exact same model twice if baseline == model
+    let baseline = baseline.filter(|b| *b != model);
+
     crate::utils::print_banner("Ollaya Public Decision Benchmark");
 
     println!("  {} Benchmark Configuration:", "🔬".cyan().bold());
@@ -1200,33 +1262,81 @@ pub fn run_benchmark_with_failures(
 
     let runner = BenchRunner::new(server_url.to_string(), limit);
 
-    println!("\n  {} Executing Public Benchmark Suites (13 Subsets):", "🚀".cyan().bold());
+    let total_probes_per_pass: usize = PUBLIC_SUBSETS
+        .iter()
+        .filter_map(|(sub_name, _, _)| datasets.get(*sub_name))
+        .map(|recs| limit.map_or(recs.len(), |l| recs.len().min(l)))
+        .sum();
+    let total_probes = if baseline.is_some() {
+        total_probes_per_pass * 2
+    } else {
+        total_probes_per_pass
+    };
+
+    println!(
+        "\n  {} Executing Public Benchmark Suites ({} Subsets, {} Probes):",
+        "🚀".cyan().bold(),
+        datasets.len(),
+        total_probes
+    );
 
     let mut model_summaries = HashMap::new();
     let mut baseline_summaries = HashMap::new();
     let mut all_mined_failures: Vec<FailureExportRecord> = Vec::new();
 
-    let pb = ProgressBar::new(datasets.len() as u64);
+    let pb = ProgressBar::new(total_probes as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("    [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} subsets: {msg}")
+            .template("    [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} probes: {msg}")
             .unwrap()
             .progress_chars("━╾─"),
     );
 
     for (sub_name, sub_title, _) in PUBLIC_SUBSETS {
         if let Some(records) = datasets.get(*sub_name) {
-            pb.set_message(format!("Evaluating {}", sub_name));
+            pb.set_message(format!("{} [starting...]", sub_name));
 
-            let (m_res, subset_failures) = runner.run_subset_with_failures(model, sub_name, sub_title, records)?;
+            let (m_res, subset_failures) = runner.run_subset_with_failures_progress(
+                model,
+                sub_name,
+                sub_title,
+                records,
+                Some(&pb),
+            )?;
             model_summaries.insert(sub_name.to_string(), m_res);
             all_mined_failures.extend(subset_failures);
 
+            // Incrementally flush exported failures after each subset so early Ctrl+C keeps progress
+            if let Some(fail_path) = export_failures_path {
+                if !all_mined_failures.is_empty() {
+                    let mut snapshot = all_mined_failures.clone();
+                    sort_failures_by_severity(&mut snapshot);
+                    if let Some(parent) = fail_path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                    }
+                    if let Ok(mut f_out) = File::create(fail_path) {
+                        use std::io::Write;
+                        for item in &snapshot {
+                            if let Ok(line) = serde_json::to_string(item) {
+                                let _ = writeln!(f_out, "{}", line);
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(base) = baseline {
-                let b_res = runner.run_subset(base, sub_name, sub_title, records)?;
+                let (b_res, _) = runner.run_subset_with_failures_progress(
+                    base,
+                    sub_name,
+                    sub_title,
+                    records,
+                    Some(&pb),
+                )?;
                 baseline_summaries.insert(sub_name.to_string(), b_res);
             }
-            pb.inc(1);
         }
     }
     pb.finish_with_message("All subsets completed.");

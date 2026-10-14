@@ -230,6 +230,26 @@ fn test_cli_bench_export_failures_and_curate_multi_teacher() {
         }
         _ => panic!("Expected Curate command"),
     }
+
+    // Passing --model on CLI without -f should not inherit BASELINE from .Benchfile
+    let single_bench_args = vec![
+        "trainaya",
+        "bench",
+        "--model",
+        "winnow:e4b",
+        "--export-failures",
+        "./data/failures_winnow_e4b.jsonl",
+    ];
+    let cli_single = Cli::try_parse_from(single_bench_args).unwrap();
+    match cli_single.command {
+        Commands::Bench(opts) => {
+            let bf = opts.resolve_benchfile().unwrap();
+            assert_eq!(bf.model, "winnow:e4b");
+            assert_eq!(bf.baseline, None);
+        }
+        _ => panic!("Expected Bench command"),
+    }
 }
+
 
 

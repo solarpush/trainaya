@@ -507,11 +507,12 @@ pub struct BenchOpts {
 
 impl BenchOpts {
     pub fn resolve_benchfile(self) -> anyhow::Result<crate::benchfile::Benchfile> {
+        // Only load implicit Benchfile/.Benchfile when -f is given or --model was not passed on CLI
         let mut bf = if let Some(path) = &self.file {
             crate::benchfile::Benchfile::from_file(path)?
-        } else if std::path::Path::new("Benchfile").exists() {
+        } else if self.model.is_none() && std::path::Path::new("Benchfile").exists() {
             crate::benchfile::Benchfile::from_file(std::path::Path::new("Benchfile"))?
-        } else if std::path::Path::new(".Benchfile").exists() {
+        } else if self.model.is_none() && std::path::Path::new(".Benchfile").exists() {
             crate::benchfile::Benchfile::from_file(std::path::Path::new(".Benchfile"))?
         } else {
             crate::benchfile::Benchfile::default()
@@ -553,6 +554,11 @@ impl BenchOpts {
         }
 
         bf.resolve_placeholders(None);
+
+        // Avoid running the exact same model twice if baseline == model
+        if bf.baseline.as_deref() == Some(bf.model.as_str()) {
+            bf.baseline = None;
+        }
 
         Ok(bf)
     }
@@ -605,9 +611,9 @@ impl CurateOpts {
     pub fn resolve_curate_args(self) -> anyhow::Result<crate::curatefile::Curatefile> {
         let mut cf = if let Some(path) = &self.file {
             crate::curatefile::Curatefile::from_file(path)?
-        } else if std::path::Path::new("Curatefile").exists() {
+        } else if self.input.is_none() && self.mode.is_none() && std::path::Path::new("Curatefile").exists() {
             crate::curatefile::Curatefile::from_file(std::path::Path::new("Curatefile"))?
-        } else if std::path::Path::new(".Curatefile").exists() {
+        } else if self.input.is_none() && self.mode.is_none() && std::path::Path::new(".Curatefile").exists() {
             crate::curatefile::Curatefile::from_file(std::path::Path::new(".Curatefile"))?
         } else {
             crate::curatefile::Curatefile::default()
