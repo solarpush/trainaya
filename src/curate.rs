@@ -33,6 +33,10 @@ pub struct RawInputItem {
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
+    pub state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub questions: Option<serde_json::Value>,
+    #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
     pub utterance: Option<String>,
@@ -62,7 +66,25 @@ impl RawInputItem {
                 (Some(p), None) => Some(p.clone()),
                 _ => None,
             })
+            .or_else(|| self.state.as_ref().map(|s| s.to_string()))
             .unwrap_or_default()
+    }
+
+    /// Resolve per-item question and valid labels if embedded (e.g. from bench --export-failures), or fall back to global schema
+    pub fn resolve_item_schema(
+        &self,
+        default_question: &str,
+        default_labels: &[String],
+    ) -> (String, Vec<String>) {
+        if let Some(ref q_val) = self.questions {
+            if let Ok(q_str) = serde_json::to_string(q_val) {
+                let (q, labels) = extract_schema_metadata(&q_str);
+                if labels.len() >= 2 {
+                    return (q, labels);
+                }
+            }
+        }
+        (default_question.to_string(), default_labels.to_vec())
     }
 }
 
@@ -466,6 +488,8 @@ pub fn load_raw_inputs(path: &Path) -> Result<Vec<RawInputItem>> {
         items.push(RawInputItem {
             id: Some(idx),
             text: Some(trimmed.to_string()),
+            state: None,
+            questions: None,
             prompt: None,
             utterance: None,
             premise: None,
@@ -584,18 +608,19 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
             let system_prompt = if is_augment {
                 format!(
                     "You are a SOTA Decision Model Counterfactual Architect.\n\
-                     Based on these policy criteria:\n\
+                     Default policy criteria (unless overridden by per-item 'valid_labels' / 'question'):\n\
                      {}\n\n\
-                     For each input item (which may include a gold_label and a model misprediction predicted_label),\n\
-                     verify the true 'label' and generate a minimally perturbed Counterfactual Twin ('hard_negative') where\n\
-                     changing ONLY ONE causal fact in the text genuinely flips the decision to the opposite class ('hard_negative_label').\n\
+                     For each input item (which may include 'gold_label', 'predicted_label', 'question', and 'valid_labels'),\n\
+                     verify the true 'label' (MUST be one of the item's 'valid_labels' if provided, and should match 'gold_label' if present)\n\
+                     and generate a minimally perturbed Counterfactual Twin ('hard_negative') where\n\
+                     changing ONLY ONE causal fact in the text genuinely flips the decision to a different class ('hard_negative_label') from 'valid_labels'.\n\
                      Output a JSON array of objects with keys:\n\
                      - 'id': integer matching input id\n\
-                     - 'label': verified true label matching criteria keys\n\
+                     - 'label': verified true label matching the item's valid_labels\n\
                      - 'confidence': float between 0.0 and 1.0\n\
                      - 'reasoning': short causal explanation\n\
                      - 'hard_negative': minimally modified text that flips the decision\n\
-                     - 'hard_negative_label': the flipped target label (must be a valid criteria key different from 'label')",
+                     - 'hard_negative_label': the flipped target label (must be a valid label different from 'label')",
                     schema_content
                 )
             } else {
@@ -605,7 +630,7 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                      {}\n\n\
                      For each input, output a JSON array of objects with keys:\n\
                      - 'id': integer matching input id\n\
-                     - 'label': string matching one of the criteria keys\n\
+                     - 'label': string matching one of the criteria keys (or the item's 'valid_labels' if present)\n\
                      - 'confidence': float between 0.0 and 1.0\n\
                      - 'reasoning': short rationale\n\
                      - 'hard_negative': optional minimally perturbed counterfactual text that flips the label\n\
@@ -622,9 +647,13 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                     .map(|(i, it)| {
                         let id = it.id.unwrap_or(i);
                         batch_ids.push(id);
+                        let (item_q, item_labels) =
+                            it.resolve_item_schema(&schema_question, &valid_labels);
                         let mut obj = serde_json::json!({
                             "id": id,
-                            "text": it.get_text()
+                            "text": it.get_text(),
+                            "question": item_q,
+                            "valid_labels": item_labels,
                         });
                         if let Some(ref gl) = it.gold_label {
                             obj["gold_label"] = serde_json::json!(gl);
@@ -646,17 +675,35 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                 for anno in annotations {
                     let source_item = chunk.iter().find(|c| c.id == Some(anno.id));
                     let text = source_item.map(|c| c.get_text()).unwrap_or_default();
+                    let (item_question, item_valid_labels) = source_item
+                        .map(|c| c.resolve_item_schema(&schema_question, &valid_labels))
+                        .unwrap_or_else(|| (schema_question.clone(), valid_labels.clone()));
+
+                    // If augmenting benchmark failures that already carry a verified gold_label, ensure primary_label belongs to item_valid_labels
+                    let primary_label = if let Some(gl) = source_item.and_then(|c| c.gold_label.as_deref()) {
+                        if !item_valid_labels.is_empty()
+                            && !item_valid_labels
+                                .iter()
+                                .any(|v| v.eq_ignore_ascii_case(anno.label.trim()))
+                        {
+                            gl.to_string()
+                        } else {
+                            anno.label.clone()
+                        }
+                    } else {
+                        anno.label.clone()
+                    };
 
                     if anno.confidence >= cf.min_confidence {
                         write_formatted_row_with_schema(
                             &mut out_file,
                             cf.format,
                             &text,
-                            &anno.label,
-                            &schema_question,
-                            &valid_labels,
+                            &primary_label,
+                            &item_question,
+                            &item_valid_labels,
                         )?;
-                        *class_distribution.entry(anno.label.clone()).or_insert(0) += 1;
+                        *class_distribution.entry(primary_label.clone()).or_insert(0) += 1;
                         total_accepted += 1;
 
                         // Emit verified Counterfactual Twin if enabled or in Augment mode
@@ -664,17 +711,17 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                             if let Some(hn_text) = anno.hard_negative.as_deref() {
                                 if !hn_text.trim().is_empty() {
                                     if let Some(flipped_label) = resolve_counterfactual_label(
-                                        &anno.label,
+                                        &primary_label,
                                         anno.hard_negative_label.as_deref(),
-                                        &valid_labels,
+                                        &item_valid_labels,
                                     ) {
                                         write_formatted_row_with_schema(
                                             &mut out_file,
                                             cf.format,
                                             hn_text.trim(),
                                             &flipped_label,
-                                            &schema_question,
-                                            &valid_labels,
+                                            &item_question,
+                                            &item_valid_labels,
                                         )?;
                                         *class_distribution
                                             .entry(flipped_label)
@@ -841,6 +888,7 @@ fn write_formatted_row_with_schema(
                     .position(|v| v.eq_ignore_ascii_case(label.trim()))
                     .unwrap_or(0);
                 let row = serde_json::json!({
+                    "state": text,
                     "text": text,
                     "label": label,
                     "question": schema_question,
@@ -850,6 +898,7 @@ fn write_formatted_row_with_schema(
                 writeln!(writer, "{}", serde_json::to_string(&row)?)?;
             } else {
                 let row = serde_json::json!({
+                    "state": text,
                     "text": text,
                     "label": label,
                 });

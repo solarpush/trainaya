@@ -14,6 +14,7 @@ pub enum BackendType {
 /// Standardized decision sample across all model families
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionSample {
+    #[serde(alias = "text")]
     pub state: serde_json::Value,
     pub question: String,
     pub options: Vec<String>,
