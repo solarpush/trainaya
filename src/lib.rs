@@ -15,3 +15,4 @@ pub mod bench;
 pub mod benchfile;
 pub mod curate;
 pub mod curatefile;
+pub mod updater;

@@ -10,6 +10,7 @@ use trainaya::utils::print_banner;
 
 fn main() {
     let cli = Cli::parse();
+    let is_update_cmd = matches!(cli.command, Commands::Update(_));
 
     let res = match cli.command {
         Commands::Train(opts) => (|| -> Result<()> {
@@ -27,7 +28,10 @@ fn main() {
                     models_dir,
                 };
                 if let Err(e) = run_register(reg_args) {
-                    eprintln!("  Warning: Automatic registration failed: {}. You can run 'trainaya register' manually.", e);
+                    eprintln!(
+                        "  Warning: Automatic registration failed: {}. You can run 'trainaya register' manually.",
+                        e
+                    );
                 }
             }
             Ok(())
@@ -54,10 +58,21 @@ fn main() {
             let cf = opts.resolve_curate_args()?;
             trainaya::curate::run_curate(cf)
         })(),
+        Commands::Update(opts) => {
+            trainaya::updater::run_update(opts.check, opts.force, opts.version.as_deref())
+        }
     };
 
+    if !is_update_cmd {
+        trainaya::updater::check_and_notify_passive();
+    }
+
     if let Err(err) = res {
-        eprintln!("\n{} {}", "❌ [TRAINAYA ERROR]:".bold().red(), format!("{:#}", err).red());
+        eprintln!(
+            "\n{} {}",
+            "❌ [TRAINAYA ERROR]:".bold().red(),
+            format!("{:#}", err).red()
+        );
         std::process::exit(1);
     }
 }
@@ -67,30 +82,85 @@ use trainaya::hardware::SystemHardware;
 fn run_doctor() -> Result<()> {
     print_banner("System & Hardware Diagnostics");
 
+    println!(
+        "  {:<24} : {}",
+        "Trainaya Version".dimmed(),
+        format!("v{}", trainaya::updater::CURRENT_VERSION).green().bold()
+    );
+    if let Some(cache) = trainaya::updater::read_update_cache() {
+        if trainaya::updater::is_newer_version(
+            trainaya::updater::CURRENT_VERSION,
+            &cache.latest_version,
+        ) {
+            println!(
+                "  {:<24} : {} (Run 'trainaya update')",
+                "Release Status".dimmed(),
+                format!("Update available: v{}", cache.latest_version).yellow().bold()
+            );
+        } else {
+            println!(
+                "  {:<24} : {}",
+                "Release Status".dimmed(),
+                "Up to date".green()
+            );
+        }
+    }
+
     let hw = SystemHardware::detect();
     hw.print_diagnostics();
 
     #[cfg(feature = "cuda")]
     {
-        println!("    • Candle GPU backend    : {}", "COMPILED (CUDA)".green().bold());
+        println!(
+            "    • Candle GPU backend    : {}",
+            "COMPILED (CUDA)".green().bold()
+        );
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     {
-        println!("    • Candle GPU backend    : {}", "CPU Native AVX2/FMA Mode".yellow());
+        println!(
+            "    • Candle GPU backend    : {}",
+            "COMPILED (Apple Metal)".green().bold()
+        );
+    }
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
+    {
+        println!(
+            "    • Candle GPU backend    : {}",
+            "CPU Native AVX2/FMA Mode".yellow()
+        );
     }
 
     // Pure Rust SIMD Kernels status
     println!("\n  {} Native Pure Rust SIMD Kernels:", "⚙️".cyan().bold());
-    println!("    • Fast LoRA Accumulate Kernel : {}", "COMPILED (Pure Rust SIMD)".green().bold());
-    println!("    • 4-Bit NF4 Quantize / Dequant: {}", "COMPILED (Pure Rust SIMD)".green().bold());
-    println!("    • 8-Bit Int8 Quantize / Dequant: {}", "COMPILED (Pure Rust SIMD)".green().bold());
+    println!(
+        "    • Fast LoRA Accumulate Kernel : {}",
+        "COMPILED (Pure Rust SIMD)".green().bold()
+    );
+    println!(
+        "    • 4-Bit NF4 Quantize / Dequant: {}",
+        "COMPILED (Pure Rust SIMD)".green().bold()
+    );
+    println!(
+        "    • 8-Bit Int8 Quantize / Dequant: {}",
+        "COMPILED (Pure Rust SIMD)".green().bold()
+    );
 
     // Target runtime
     println!("\n  {} Ollaya Runtime Compatibility:", "🎯".purple().bold());
-    println!("    • Format: SafeTensors  - {}", "Supported (zero-copy memory map)".green());
-    println!("    • Format: GGUF (v3)    - {}", "Supported (llama.cpp integration)".green());
+    println!(
+        "    • Format: SafeTensors  - {}",
+        "Supported (zero-copy memory map)".green()
+    );
+    println!(
+        "    • Format: GGUF (v3)    - {}",
+        "Supported (llama.cpp integration)".green()
+    );
     println!("    • Format: ONNX package - {}", "Supported".green());
 
-    println!("\n{} System is healthy and ready for local training & export.\n", "✓".green().bold());
+    println!(
+        "\n{} System is healthy and ready for local training & export.\n",
+        "✓".green().bold()
+    );
     Ok(())
 }

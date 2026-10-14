@@ -186,10 +186,23 @@ trainaya bench -f .Benchfile
 ## CLI Reference
 
 ### `trainaya doctor`
-Audits the host environment: CPU SIMD feature sets (AVX2, AVX-512, NEON, FMA), GPU accelerators, and local Ollaya daemon connectivity.
+Audits the host environment: CPU SIMD feature sets (AVX2, AVX-512, NEON, FMA), GPU accelerators, release update status, and local Ollaya daemon connectivity.
 
 ```bash
 trainaya doctor
+```
+
+---
+
+### `trainaya update`
+Checks GitHub Releases for newer versions and atomically upgrades the local `trainaya` binary in place.
+
+```bash
+# Check and install the latest release
+trainaya update
+
+# Only check for updates without installing
+trainaya update --check
 ```
 
 ---

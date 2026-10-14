@@ -40,6 +40,10 @@ pub enum Commands {
 
     /// Curate, auto-label, and synthesize training datasets using teacher LLMs or local CLIs
     Curate(CurateOpts),
+
+    /// Check for updates and upgrade Trainaya to the latest GitHub release
+    #[command(alias = "self-update", alias = "upgrade")]
+    Update(UpdateOpts),
 }
 
 #[derive(Args, Debug)]
@@ -662,5 +666,20 @@ impl CurateOpts {
 
         Ok(cf)
     }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpdateOpts {
+    /// Only check if a newer release is available without installing
+    #[arg(short, long)]
+    pub check: bool,
+
+    /// Force reinstalling the release binary even if already up to date
+    #[arg(short, long)]
+    pub force: bool,
+
+    /// Optional specific release tag to install (e.g. 'v0.1.0', defaults to 'latest')
+    #[arg(long)]
+    pub version: Option<String>,
 }
 

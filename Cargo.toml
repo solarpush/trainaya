@@ -1,6 +1,6 @@
 [package]
 name = "trainaya"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Fast modular CLI in Rust for fine-tuning, merging, and exporting decision and classification models for Ollaya"
 authors = ["Trainaya Contributors"]
