@@ -1,88 +1,40 @@
 //! Trainfile parsing and configuration: defines model training recipes mirroring Ollaya's Modelfile.
-//!
-//! ```text
-//! # Example .Trainfile
-//! FROM winnow:e4b
-//! DATA ./data/train_specific_decision.jsonl
-//! SCHEMA ./data/questions_schema.json
-//!
-//! PARAMETER epochs 3
-//! PARAMETER batch_size 8
-//! PARAMETER lr 5e-5
-//! PARAMETER lora_r 16
-//! PARAMETER lora_alpha 32
-//!
-//! MERGE true
-//! QUANT Q8_0
-//! REGISTER winnow:custom
-//! OUTPUT ./output_trained
-//! ```
-//!
-//! Directives are case-insensitive. Values can be file paths (relative to the Trainfile)
-//! or `"""`-quoted multi-line blocks. Lines starting with `#` are comments.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::config::{LoraConfig, MergeMode, TaskType, TrainingArgs};
 
 #[derive(Debug, Clone)]
 pub struct Trainfile {
-    /// Base model tag, huggingface repo id, or local path (FROM)
     pub from: String,
-    /// Path to dataset file (DATA)
     pub data: PathBuf,
-    /// Optional path to questions schema JSON (SCHEMA)
     pub schema: Option<PathBuf>,
-    /// Optional path to dedicated evaluation dataset (EVAL)
     pub eval: Option<PathBuf>,
-    /// Fraction of training data for evaluation (EVAL_SPLIT)
     pub eval_split: f32,
-    /// Task type (TASK: classification or nli)
     pub task: TaskType,
-    /// Optional model family override (FAMILY)
     pub family: Option<String>,
-    /// Directory where the output will be stored (OUTPUT)
     pub output_dir: PathBuf,
-    /// Number of training epochs (PARAMETER epochs)
     pub epochs: usize,
-    /// Training batch size (PARAMETER batch_size)
     pub batch_size: usize,
-    /// Gradient accumulation steps (PARAMETER grad_accum)
     pub grad_accum_steps: usize,
-    /// Learning rate (PARAMETER lr)
     pub lr: f64,
-    /// Warmup ratio for LR scheduler (PARAMETER warmup_ratio)
     pub warmup_ratio: f32,
-    /// Max gradient norm for clipping (PARAMETER max_grad_norm)
     pub max_grad_norm: f32,
-    /// LR scheduler strategy: cosine, linear, constant (PARAMETER lr_scheduler)
     pub lr_scheduler: String,
-    /// Maximum sequence length (PARAMETER max_length)
     pub max_length: usize,
-    /// Optimizer weight decay (PARAMETER weight_decay)
     pub weight_decay: f32,
-    /// Random seed (PARAMETER seed)
     pub seed: u64,
-    /// Target compute device (PARAMETER device)
     pub device: String,
-    /// 4-bit QLoRA enablement (PARAMETER qlora)
     pub qlora: bool,
-    /// Mixed precision BF16 enablement (PARAMETER bf16)
     pub bf16: bool,
-    /// Number of top transformer blocks to inject LoRA into for GGUF (PARAMETER lora_layers)
     pub lora_layers: usize,
-    /// LoRA configuration (PARAMETER lora_r, lora_alpha, lora_dropout, target_modules)
+    pub unfreeze_layers: usize,
     pub lora: LoraConfig,
-    /// Merge strategy: auto, merge, no-merge (MERGE)
     pub merge_mode: MergeMode,
-    /// Quantization format (QUANT)
     pub quant: Option<String>,
-    /// Optional model name to register in Ollaya after training (REGISTER)
     pub register: Option<String>,
-    /// Base template for Ollaya manifest inheritance (TEMPLATE)
     pub template: Option<String>,
-    /// Custom Ollaya models store directory (MODELS_DIR)
     pub models_dir: Option<PathBuf>,
 }
 
@@ -97,10 +49,10 @@ impl Default for Trainfile {
             task: TaskType::Classification,
             family: None,
             output_dir: PathBuf::from("./output_trained"),
-            epochs: 3,
+            epochs: 12,
             batch_size: 8,
             grad_accum_steps: 1,
-            lr: 5e-5,
+            lr: 1.5e-4,
             warmup_ratio: 0.1,
             max_grad_norm: 1.0,
             lr_scheduler: "cosine".to_string(),
@@ -111,6 +63,7 @@ impl Default for Trainfile {
             qlora: false,
             bf16: false,
             lora_layers: 4,
+            unfreeze_layers: 0,
             lora: LoraConfig::default(),
             merge_mode: MergeMode::Auto,
             quant: None,
@@ -122,7 +75,6 @@ impl Default for Trainfile {
 }
 
 impl Trainfile {
-    /// Read and parse a Trainfile from disk
     pub fn read(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read Trainfile at {}", path.display()))?;
@@ -133,7 +85,6 @@ impl Trainfile {
         Self::parse(&content, &base_dir)
     }
 
-    /// Locate default Trainfile in directory (.Trainfile, Trainfile, trainfile, .trainfile)
     pub fn find_default(dir: &Path) -> Option<PathBuf> {
         let candidates = [".Trainfile", "Trainfile", "trainfile", ".trainfile"];
         for candidate in candidates {
@@ -145,7 +96,6 @@ impl Trainfile {
         None
     }
 
-    /// Parse Trainfile text with relative paths resolved against `base_dir`
     pub fn parse(text: &str, base_dir: &Path) -> Result<Self> {
         let mut tf = Self::default();
         let mut lines = text.lines().enumerate();
@@ -159,7 +109,6 @@ impl Trainfile {
             let (directive, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
             let mut value = rest.trim().to_string();
 
-            // Multi-line block: """ ... """
             if let Some(start) = value.strip_prefix("\"\"\"") {
                 let mut block = start.to_string();
                 if let Some(end) = block.find("\"\"\"") {
@@ -198,7 +147,6 @@ impl Trainfile {
         Ok(tf)
     }
 
-    /// Convert into TrainingArgs for execution
     pub fn to_training_args(&self) -> TrainingArgs {
         TrainingArgs {
             base_model: self.from.clone(),
@@ -221,6 +169,7 @@ impl Trainfile {
             qlora: self.qlora,
             bf16: self.bf16,
             lora_layers: self.lora_layers,
+            unfreeze_layers: self.unfreeze_layers,
             device: self.device.clone(),
             lora: self.lora.clone(),
             merge_mode: self.merge_mode,
@@ -257,8 +206,7 @@ fn apply_directive(
         "FROM" => {
             tf.from = value.to_string();
         }
-        "DATA" => {
-            // If inline JSON, write to temporary file
+        "DATA" | "DATASET" => {
             if value.starts_with('{') || value.starts_with('[') {
                 let tmp_dir = std::env::temp_dir().join("trainaya_trainfiles");
                 let _ = std::fs::create_dir_all(&tmp_dir);
@@ -292,9 +240,13 @@ fn apply_directive(
             "classification" => tf.task = TaskType::Classification,
             "nli" => tf.task = TaskType::Nli,
             "decision" => tf.task = TaskType::Decision,
-            _ => bail!("line {}: unknown TASK '{}'. Expected 'classification', 'nli', or 'decision'", line_num, value),
+            _ => bail!(
+                "line {}: unknown TASK '{}'. Expected 'classification', 'nli', or 'decision'",
+                line_num,
+                value
+            ),
         },
-        "FAMILY" => {
+        "FAMILY" | "LAYOUT" | "ADAPT_LAYOUT" => {
             tf.family = Some(value.to_string());
         }
         "OUTPUT" => {
@@ -311,16 +263,18 @@ fn apply_directive(
                 "true" | "1" | "yes" | "merge" => MergeMode::Merge,
                 "false" | "0" | "no" | "no-merge" | "unmerged" => MergeMode::NoMerge,
                 "auto" | "" => MergeMode::Auto,
-                _ => bail!("line {}: invalid MERGE value '{}'. Use 'true', 'false', or 'auto'", line_num, value),
+                _ => bail!(
+                    "line {}: invalid MERGE value '{}'. Use 'true', 'false', or 'auto'",
+                    line_num,
+                    value
+                ),
             };
         }
         "QUANT" | "QUANTIZE" => {
             tf.quant = Some(value.to_string());
         }
-        "EXPORT" => {
-            // Optional export format directive in Trainfile (gguf, safetensors, onnx)
-        }
-        "TAG" | "REGISTER" => {
+        "EXPORT" => {}
+        "TAG" | "REGISTER" | "TARGET" => {
             tf.register = Some(value.to_string());
         }
         "TEMPLATE" => {
@@ -400,6 +354,11 @@ fn apply_parameter(tf: &mut Trainfile, name: &str, val: &str, line_num: usize) -
             tf.lora_layers = val
                 .parse::<usize>()
                 .with_context(|| format!("line {}: invalid integer for PARAMETER lora_layers", line_num))?;
+        }
+        "unfreeze_layers" | "unfreeze" => {
+            tf.unfreeze_layers = val
+                .parse::<usize>()
+                .with_context(|| format!("line {}: invalid integer for PARAMETER unfreeze_layers", line_num))?;
         }
         "lora_r" | "r" => {
             tf.lora.r = val

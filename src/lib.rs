@@ -1,4 +1,3 @@
-pub mod quant;
 pub mod cli;
 pub mod config;
 pub mod dataset;
@@ -6,7 +5,7 @@ pub mod exporter;
 pub mod families;
 pub mod hardware;
 pub mod merger;
-pub mod models;
+pub mod py_bridge;
 pub mod registry;
 pub mod trainer;
 pub mod trainfile;

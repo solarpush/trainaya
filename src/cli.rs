@@ -1,17 +1,17 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::config::{ExportArgs, ExportFormat, LoraConfig, MergeArgs, TaskType, TrainingArgs};
+use crate::config::{AdaptArgs, ExportArgs, ExportFormat, LoraConfig, MergeArgs, TaskType, TrainingArgs};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "trainaya",
     author = "Trainaya Team",
     version,
-    about = "High-performance Rust CLI for fine-tuning, merging, and exporting models for Ollaya",
-    long_about = "Trainaya is a modular, high-speed CLI written in Rust for local fine-tuning (LoRA), \
-                  lossless weight merging, and zero-overhead export (SafeTensors, GGUF, ONNX) \
-                  targeting the Ollaya local inference runtime."
+    about = "High-performance Rust CLI orchestrating uv + PyTorch for training, adapting, and exporting Ollaya decision models",
+    long_about = "Trainaya is a modular CLI written in Rust backed by an embedded uv + PyTorch engine for \
+                  end-to-end decision model fine-tuning, generic multi-architecture adaptation (e.g. Shieldstral -> Ollaya), \
+                  temperature calibration, and zero-overhead export."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,19 +20,22 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Fine-tune a base encoder/decoder model on a local classification or NLI dataset
+    /// Fine-tune an encoder or decoder decision model end-to-end via uv + PyTorch
     Train(TrainOpts),
 
-    /// Permanently merge LoRA adapter weights with the base model into clean SafeTensors
+    /// Adapt a non-decision model (e.g. Shieldstral, Mistral, Qwen, ModernBERT) into an Ollaya decision model
+    Adapt(AdaptOpts),
+
+    /// Permanently merge LoRA adapter weights with the base model into clean SafeTensors or GGUF
     Merge(MergeOpts),
 
     /// Export and package the model for ultra-fast serving in the Ollaya runtime
     Export(ExportOpts),
 
-    /// Register a fine-tuned or merged model directly into the local Ollaya model store
+    /// Register a fine-tuned, adapted, or merged model directly into the local Ollaya model store
     Register(RegisterOpts),
 
-    /// Inspect system hardware, SIMD acceleration, and runtime capabilities
+    /// Inspect system hardware, uv + PyTorch engine status, and runtime capabilities
     Doctor,
 
     /// Benchmark models on the 13 public decision benchmarks against the Ollaya runtime
@@ -47,12 +50,78 @@ pub enum Commands {
 }
 
 #[derive(Args, Debug)]
+pub struct AdaptOpts {
+    /// Source model path (.gguf file, local directory, or HuggingFace repo ID like 'shieldstral' / 'mistralai/...')
+    #[arg(long)]
+    pub from: String,
+
+    /// Target Ollaya tag to register (e.g. 'shieldstral:v1', 'mistral-decision:v1')
+    #[arg(short = 't', long = "target", alias = "tag")]
+    pub target: String,
+
+    /// Target Ollaya layout: 'auto', 'llm-logits-v1', 'laya-markers-v1', or 'kev-pointer-v1'
+    #[arg(long, default_value = "auto")]
+    pub layout: String,
+
+    /// Optional decision dataset (.jsonl) for Decision Alignment fine-tuning & temperature calibration
+    #[arg(short, long)]
+    pub data: Option<PathBuf>,
+
+    /// Output directory for adapted bundle (decision.json, calibration.json, weights)
+    #[arg(short, long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Number of alignment epochs if --data is provided
+    #[arg(long, default_value_t = 5)]
+    pub epochs: usize,
+
+    /// Learning rate for alignment fine-tuning
+    #[arg(long, default_value_t = 2e-4)]
+    pub lr: f64,
+
+    /// Batch size for alignment fine-tuning
+    #[arg(long, default_value_t = 4)]
+    pub batch_size: usize,
+
+    /// Compute device: 'auto', 'cpu', 'cuda', 'rocm', or 'metal'
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Custom Ollaya models store directory
+    #[arg(long)]
+    pub models_dir: Option<PathBuf>,
+}
+
+impl AdaptOpts {
+    pub fn into_adapt_args(self) -> (AdaptArgs, Option<PathBuf>) {
+        let out_dir = self.output_dir.unwrap_or_else(|| {
+            let safe = self.target.replace(':', "_");
+            PathBuf::from(format!("./output_adapted_{}", safe))
+        });
+        (
+            AdaptArgs {
+                from: self.from,
+                target: self.target,
+                layout: self.layout,
+                data_path: self.data,
+                output_dir: out_dir,
+                epochs: self.epochs,
+                lr: self.lr,
+                batch_size: self.batch_size,
+                device: self.device,
+            },
+            self.models_dir,
+        )
+    }
+}
+
+#[derive(Args, Debug)]
 pub struct TrainOpts {
     /// Path to Trainfile configuration (e.g. 'Trainfile', '.Trainfile')
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
-    /// Hugging Face model repository identifier or local directory
+    /// Hugging Face model repository identifier, Ollaya tag, or local directory
     #[arg(long, default_value = "answerdotai/ModernBERT-base")]
     pub base: String,
 
@@ -60,7 +129,7 @@ pub struct TrainOpts {
     #[arg(short, long)]
     pub data: Option<PathBuf>,
 
-    /// Task type: 'classification' or 'nli'
+    /// Task type: 'classification', 'nli', or 'decision'
     #[arg(long, default_value = "classification")]
     pub task: TaskType,
 
@@ -104,7 +173,11 @@ pub struct TrainOpts {
     #[arg(long)]
     pub lora_layers: Option<usize>,
 
-    /// Directory where the trained LoRA adapter and tokenizer will be saved
+    /// Number of top encoder backbone layers to unfreeze during PyTorch end-to-end training
+    #[arg(long)]
+    pub unfreeze_layers: Option<usize>,
+
+    /// Directory where the trained model/adapter and tokenizer will be saved
     #[arg(short, long)]
     pub output_dir: Option<PathBuf>,
 
@@ -156,7 +229,7 @@ pub struct TrainOpts {
     #[arg(long, conflicts_with = "no_merge")]
     pub merge: bool,
 
-    /// Force keeping adapter unmerged as a standalone sidecar (e.g. adapter.gguf or adapter safetensors)
+    /// Force keeping adapter unmerged as a standalone sidecar
     #[arg(long, conflicts_with = "merge")]
     pub no_merge: bool,
 
@@ -174,11 +247,12 @@ pub struct TrainOpts {
 }
 
 impl TrainOpts {
-    pub fn resolve_training_args(self) -> anyhow::Result<(TrainingArgs, Option<String>, Option<PathBuf>)> {
+    pub fn resolve_training_args(
+        self,
+    ) -> anyhow::Result<(TrainingArgs, Option<String>, Option<PathBuf>)> {
         use crate::trainfile::Trainfile;
         use std::path::Path;
 
-        // 1. Try explicit file or locate default Trainfile
         let trainfile_path = if let Some(ref f) = self.file {
             Some(f.clone())
         } else if self.data.is_none() {
@@ -193,7 +267,6 @@ impl TrainOpts {
             let mut args = tf.to_training_args();
             let mut register_name = tf.register;
 
-            // Apply CLI overrides if user specified them
             if let Some(data) = self.data {
                 args.data_path = data;
             }
@@ -229,6 +302,9 @@ impl TrainOpts {
             }
             if let Some(ll) = self.lora_layers {
                 args.lora_layers = ll;
+            }
+            if let Some(ul) = self.unfreeze_layers {
+                args.unfreeze_layers = ul;
             }
             if let Some(dev) = self.device {
                 args.device = dev;
@@ -282,7 +358,6 @@ impl TrainOpts {
             return Ok((args, register_name, models_dir));
         }
 
-        // 2. Otherwise require --data
         let data_path = match self.data {
             Some(d) => d,
             None => {
@@ -321,12 +396,14 @@ impl TrainOpts {
             data_path,
             eval_path: self.eval_data,
             eval_split: self.eval_split.unwrap_or(0.1),
-            output_dir: self.output_dir.unwrap_or_else(|| PathBuf::from("./output_adapter")),
+            output_dir: self
+                .output_dir
+                .unwrap_or_else(|| PathBuf::from("./output_adapter")),
             task: self.task,
-            epochs: self.epochs.unwrap_or(3),
+            epochs: self.epochs.unwrap_or(12),
             batch_size: self.batch_size.unwrap_or(8),
             grad_accum_steps: self.grad_accum.unwrap_or(1).max(1),
-            lr: self.lr.unwrap_or(5e-5),
+            lr: self.lr.unwrap_or(1.5e-4),
             warmup_ratio: self.warmup_ratio.unwrap_or(0.1),
             max_grad_norm: self.max_grad_norm.unwrap_or(1.0),
             lr_scheduler: self.lr_scheduler.unwrap_or_else(|| "cosine".to_string()),
@@ -336,6 +413,7 @@ impl TrainOpts {
             qlora: self.qlora,
             bf16: self.bf16,
             lora_layers: self.lora_layers.unwrap_or(4),
+            unfreeze_layers: self.unfreeze_layers.unwrap_or(0),
             device: self.device.unwrap_or_else(|| "auto".to_string()),
             lora,
             merge_mode,
@@ -369,19 +447,15 @@ impl From<TrainOpts> for TrainingArgs {
 
 #[derive(Args, Debug)]
 pub struct MergeOpts {
-    /// Hugging Face model repository identifier or local directory
     #[arg(long)]
     pub base: String,
 
-    /// Path to LoRA adapter directory containing 'adapter_model.safetensors'
     #[arg(long)]
     pub lora: PathBuf,
 
-    /// Directory where the full merged model will be saved
     #[arg(short, long, default_value = "./output_merged")]
     pub output_dir: PathBuf,
 
-    /// Compute device: 'cpu' (recommended for merge) or 'cuda'
     #[arg(long, default_value = "cpu")]
     pub device: String,
 }
@@ -399,19 +473,15 @@ impl From<MergeOpts> for MergeArgs {
 
 #[derive(Args, Debug)]
 pub struct ExportOpts {
-    /// Path to merged model directory containing 'model.safetensors'
     #[arg(short, long)]
     pub model: PathBuf,
 
-    /// Target export format: 'safetensors', 'gguf', or 'onnx'
     #[arg(short, long, default_value = "safetensors")]
     pub format: ExportFormat,
 
-    /// Optional quantization format (e.g. 'int8', 'q8_0', 'q4_k_m')
     #[arg(short, long)]
     pub quantize: Option<String>,
 
-    /// Destination output directory
     #[arg(short, long, default_value = "./output_export")]
     pub output_dir: PathBuf,
 }
@@ -429,23 +499,18 @@ impl From<ExportOpts> for ExportArgs {
 
 #[derive(Args, Debug)]
 pub struct RegisterOpts {
-    /// Path to model file (model.safetensors or model.gguf) or directory
     #[arg(short, long)]
     pub model: PathBuf,
 
-    /// Target Ollaya model name (e.g. 'laya:custom', 'winnow:custom', 'my-classifier')
     #[arg(short, long)]
     pub name: String,
 
-    /// Base template to inherit layers from (e.g. 'laya:en', 'winnow:e4b')
     #[arg(long)]
     pub template: Option<String>,
 
-    /// Path to custom tokenizer.json (if registering SafeTensors)
     #[arg(long)]
     pub tokenizer: Option<PathBuf>,
 
-    /// Custom path to Ollaya models store directory (defaults to ~/.ollaya/models)
     #[arg(long)]
     pub models_dir: Option<PathBuf>,
 }
@@ -464,50 +529,39 @@ impl From<RegisterOpts> for crate::registry::RegisterArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct BenchOpts {
-    /// Path to Benchfile configuration (e.g. 'Benchfile', '.Benchfile')
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
-    /// Model name or tag registered in Ollaya to benchmark (e.g. 'winnow:custom', 'winnow:v1')
     #[arg(short, long)]
     pub model: Option<String>,
 
-    /// Optional baseline model name for side-by-side A/B comparison (e.g. 'winnow:e4b')
     #[arg(short, long)]
     pub baseline: Option<String>,
 
-    /// Path to benchmark data directory (containing <subset>/all.jsonl) or a single .jsonl file
     #[arg(short, long)]
     pub data: Option<PathBuf>,
 
-    /// Subsets to evaluate (comma-separated, e.g. 'boolq,multinli,paws'). Defaults to all 13 subsets.
     #[arg(long, value_delimiter = ',')]
     pub subsets: Option<Vec<String>>,
 
-    /// Limit the number of records to evaluate per subset (useful for fast smoke-testing)
     #[arg(long)]
     pub limit: Option<usize>,
 
-    /// Ollaya server URL hosting the /v1/systemone endpoint
     #[arg(long)]
     pub url: Option<String>,
 
-    /// Output JSON report file path
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
-    /// Minimum macro accuracy threshold required (e.g. 0.75)
     #[arg(long)]
     pub min_accuracy: Option<f64>,
 
-    /// Export misclassified and overconfident failure records to a JSONL file for active learning with 'trainaya curate'
     #[arg(long)]
     pub export_failures: Option<PathBuf>,
 }
 
 impl BenchOpts {
     pub fn resolve_benchfile(self) -> anyhow::Result<crate::benchfile::Benchfile> {
-        // Only load implicit Benchfile/.Benchfile when -f is given or --model was not passed on CLI
         let mut bf = if let Some(path) = &self.file {
             crate::benchfile::Benchfile::from_file(path)?
         } else if self.model.is_none() && std::path::Path::new("Benchfile").exists() {
@@ -518,7 +572,6 @@ impl BenchOpts {
             crate::benchfile::Benchfile::default()
         };
 
-        // Command-line overrides take precedence
         if let Some(m) = self.model {
             bf.model = m;
         }
@@ -555,7 +608,6 @@ impl BenchOpts {
 
         bf.resolve_placeholders(None);
 
-        // Avoid running the exact same model twice if baseline == model
         if bf.baseline.as_deref() == Some(bf.model.as_str()) {
             bf.baseline = None;
         }
@@ -566,43 +618,33 @@ impl BenchOpts {
 
 #[derive(Args, Debug, Clone)]
 pub struct CurateOpts {
-    /// Path to Curatefile configuration (e.g. 'Curatefile', '.Curatefile')
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
-    /// Teacher engine: 'agy' (default), 'claude', 'ollama:<model>'
     #[arg(long)]
     pub teacher: Option<String>,
 
-    /// Curation mode: 'label' (default), 'synth', 'augment'
     #[arg(short, long)]
     pub mode: Option<String>,
 
-    /// Target dataset format: 'decision' (default), 'classification', 'nli'
     #[arg(long)]
     pub format: Option<String>,
 
-    /// Path to raw input data file (JSONL or plain text)
     #[arg(short, long)]
     pub input: Option<PathBuf>,
 
-    /// Path to policy criteria or question schema JSON
     #[arg(short, long)]
     pub schema: Option<PathBuf>,
 
-    /// Path to write curated dataset
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
-    /// Number of samples to generate in synth mode
     #[arg(long)]
     pub count: Option<usize>,
 
-    /// Batch size for teacher queries
     #[arg(long)]
     pub batch_size: Option<usize>,
 
-    /// Minimum confidence threshold (0.0 to 1.0)
     #[arg(long)]
     pub min_confidence: Option<f64>,
 }
@@ -611,9 +653,15 @@ impl CurateOpts {
     pub fn resolve_curate_args(self) -> anyhow::Result<crate::curatefile::Curatefile> {
         let mut cf = if let Some(path) = &self.file {
             crate::curatefile::Curatefile::from_file(path)?
-        } else if self.input.is_none() && self.mode.is_none() && std::path::Path::new("Curatefile").exists() {
+        } else if self.input.is_none()
+            && self.mode.is_none()
+            && std::path::Path::new("Curatefile").exists()
+        {
             crate::curatefile::Curatefile::from_file(std::path::Path::new("Curatefile"))?
-        } else if self.input.is_none() && self.mode.is_none() && std::path::Path::new(".Curatefile").exists() {
+        } else if self.input.is_none()
+            && self.mode.is_none()
+            && std::path::Path::new(".Curatefile").exists()
+        {
             crate::curatefile::Curatefile::from_file(std::path::Path::new(".Curatefile"))?
         } else {
             crate::curatefile::Curatefile::default()
@@ -635,7 +683,10 @@ impl CurateOpts {
                 "decision" => crate::curatefile::TargetDatasetFormat::Decision,
                 "classification" => crate::curatefile::TargetDatasetFormat::Classification,
                 "nli" => crate::curatefile::TargetDatasetFormat::Nli,
-                other => anyhow::bail!("Unknown format '{}'. Expected: decision, classification, nli", other),
+                other => anyhow::bail!(
+                    "Unknown format '{}'. Expected: decision, classification, nli",
+                    other
+                ),
             };
         }
         if let Some(i) = self.input {
@@ -663,16 +714,12 @@ impl CurateOpts {
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateOpts {
-    /// Only check if a newer release is available without installing
     #[arg(short, long)]
     pub check: bool,
 
-    /// Force reinstalling the release binary even if already up to date
     #[arg(short, long)]
     pub force: bool,
 
-    /// Optional specific release tag to install (e.g. 'v0.1.0', defaults to 'latest')
     #[arg(long)]
     pub version: Option<String>,
 }
-

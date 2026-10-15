@@ -1,13 +1,11 @@
-use anyhow::{bail, Context, Result};
-use candle_core::{Device, Tensor};
-use rand::seq::SliceRandom;
+use anyhow::{Context, Result, bail};
 use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use tokenizers::Tokenizer;
 
 use crate::families::traits::DecisionSample;
 
@@ -19,27 +17,7 @@ pub struct RawSample {
 }
 
 #[derive(Debug, Clone)]
-pub struct ProcessedSample {
-    pub input_ids: Vec<u32>,
-    pub attention_mask: Vec<u32>,
-    pub label: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct Dataset {
-    pub samples: Vec<ProcessedSample>,
-    pub num_labels: usize,
-    pub id2label: HashMap<usize, String>,
-    pub label2id: HashMap<String, usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Batch {
-    pub input_ids: Tensor,
-    pub attention_mask: Tensor,
-    pub labels: Tensor,
-    pub size: usize,
-}
+pub struct Dataset;
 
 #[derive(Debug, Clone)]
 pub struct DecisionDataset;
@@ -50,7 +28,6 @@ impl DecisionDataset {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read dataset from {}", path.display()))?;
 
-        // 1. Try parsing lines
         let mut raw_lines = Vec::new();
         for line in content.lines() {
             let trimmed = line.trim();
@@ -63,7 +40,6 @@ impl DecisionDataset {
             bail!("Dataset file {} is empty", path.display());
         }
 
-        // Check if first line is already a structured DecisionSample or FailureExportRecord
         if let Ok(first_val) = serde_json::from_str::<Value>(raw_lines[0]) {
             if first_val.get("options").is_some() && first_val.get("target_index").is_some() {
                 let mut samples = Vec::new();
@@ -117,7 +93,6 @@ impl DecisionDataset {
             }
         }
 
-        // Check for adjacent schema file if none provided
         let candidate_schema = schema_path
             .map(|p| p.to_path_buf())
             .or_else(|| {
@@ -130,7 +105,6 @@ impl DecisionDataset {
                 }
             });
 
-        // 2. If a schema exists, generate rich decision samples
         if let Some(schema_file) = candidate_schema {
             if schema_file.exists() {
                 if let Ok(schema_str) = std::fs::read_to_string(&schema_file) {
@@ -141,14 +115,11 @@ impl DecisionDataset {
             }
         }
 
-        // 3. Fallback: Parse standard classification records {"text": ..., "label": ...}
         Self::synthesize_generic_classification(&raw_lines)
     }
 
     fn synthesize_from_schema(lines: &[&str], schema_val: &Value) -> Result<Vec<DecisionSample>> {
         let mut samples = Vec::new();
-
-        // Extract questions from schema
         let questions_obj = schema_val
             .as_object()
             .context("Schema must be a JSON object mapping question keys to definitions")?;
@@ -203,8 +174,8 @@ impl DecisionDataset {
                         .and_then(|s| s.as_str())
                         .unwrap_or(q_name.as_str());
 
-                    // Binary noul: [false, true]
-                    let is_true = label == "page_sre_immediate" || label == "true" || label == "yes";
+                    let is_true =
+                        label == "page_sre_immediate" || label == "true" || label == "yes";
                     let target_idx = if is_true { 1 } else { 0 };
 
                     samples.push(DecisionSample {
@@ -269,46 +240,6 @@ impl DecisionDataset {
 }
 
 impl Dataset {
-    /// Load raw samples, automatically applying the family's PromptBuilder if the dataset is a DecisionDataset
-    /// or if the family requires structured prompt formatting (e.g. Kev pointer, Laya markers)
-    pub fn load_raw_samples_with_family(
-        path: &Path,
-        family: &dyn crate::families::traits::ModelFamily,
-    ) -> Result<Vec<RawSample>> {
-        let fam_id = family.identifier();
-        let needs_family_builder = fam_id.contains("kev") || fam_id.contains("laya");
-
-        if !needs_family_builder {
-            if let Ok(raw) = Self::load_raw_samples(path) {
-                return Ok(raw);
-            }
-        }
-
-        // Otherwise load via DecisionDataset and format with the family's PromptBuilder
-        if let Ok(decision_samples) = DecisionDataset::load_samples(path, None) {
-            let builder = family.create_prompt_builder();
-            let mut out = Vec::with_capacity(decision_samples.len());
-            for ds in &decision_samples {
-                let formatted = builder.format_sample(ds)?;
-                let label = ds
-                    .options
-                    .get(ds.target_index)
-                    .cloned()
-                    .unwrap_or_else(|| ds.target_index.to_string());
-                out.push(RawSample {
-                    text_a: formatted.text,
-                    text_b: None,
-                    label,
-                });
-            }
-            if !out.is_empty() {
-                return Ok(out);
-            }
-        }
-
-        Self::load_raw_samples(path)
-    }
-
     /// Load raw samples from JSONL or CSV file
     pub fn load_raw_samples(path: &Path) -> Result<Vec<RawSample>> {
         let ext = path
@@ -320,10 +251,7 @@ impl Dataset {
         match ext.as_str() {
             "jsonl" | "json" => Self::load_jsonl(path),
             "csv" | "tsv" => Self::load_csv(path),
-            _ => {
-                // Try JSONL first, fallback to CSV
-                Self::load_jsonl(path).or_else(|_| Self::load_csv(path))
-            }
+            _ => Self::load_jsonl(path).or_else(|_| Self::load_csv(path)),
         }
     }
 
@@ -368,7 +296,6 @@ impl Dataset {
         let headers = rdr.headers()?.clone();
         let mut samples = Vec::new();
 
-        // Identify column indices
         let mut text_a_col = None;
         let mut text_b_col = None;
         let mut label_col = None;
@@ -419,12 +346,11 @@ impl Dataset {
     }
 
     fn extract_text_fields(val: &Value) -> Result<(String, Option<String>)> {
-        let obj = val
-            .as_object()
-            .context("Expected JSON object for sample")?;
+        let obj = val.as_object().context("Expected JSON object for sample")?;
 
-        // Single text keys
-        let candidate_keys_a = ["text", "sentence", "sentence1", "premise", "input", "prompt", "content"];
+        let candidate_keys_a = [
+            "text", "sentence", "sentence1", "premise", "input", "prompt", "content",
+        ];
         let candidate_keys_b = ["text2", "sentence2", "hypothesis"];
 
         let mut text_a = None;
@@ -452,7 +378,7 @@ impl Dataset {
 
     fn extract_label_field(val: &Value) -> Result<String> {
         let obj = val.as_object().context("Expected JSON object")?;
-        let candidate_label_keys = ["label", "target", "category", "class", "sentiment"];
+        let candidate_label_keys = ["label", "target", "category", "class", "sentiment", "gold_label"];
 
         for key in candidate_label_keys {
             if let Some(v) = obj.get(key) {
@@ -460,84 +386,13 @@ impl Dataset {
                     return Ok(s.to_string());
                 } else if let Some(i) = v.as_i64() {
                     return Ok(i.to_string());
+                } else if let Some(b) = v.as_bool() {
+                    return Ok(b.to_string());
                 }
             }
         }
 
         bail!("Could not find label column. Tried keys: {:?}", candidate_label_keys);
-    }
-
-    /// Build dataset with automatic label mapping and tokenization (unpadded for fast dynamic batching)
-    pub fn build(
-        raw_samples: &[RawSample],
-        tokenizer: &Tokenizer,
-        max_length: usize,
-        existing_label_map: Option<(HashMap<String, usize>, HashMap<usize, String>)>,
-    ) -> Result<Self> {
-        let (label2id, id2label) = if let Some((l2i, i2l)) = existing_label_map {
-            (l2i, i2l)
-        } else {
-            let mut unique_labels: Vec<String> = raw_samples
-                .iter()
-                .map(|s| s.label.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            // Sort labels for deterministic mapping
-            unique_labels.sort();
-
-            let mut l2i = HashMap::new();
-            let mut i2l = HashMap::new();
-            for (idx, label_name) in unique_labels.into_iter().enumerate() {
-                l2i.insert(label_name.clone(), idx);
-                i2l.insert(idx, label_name);
-            }
-            (l2i, i2l)
-        };
-
-        let num_labels = label2id.len();
-        let mut processed = Vec::with_capacity(raw_samples.len());
-
-        for sample in raw_samples {
-            let label_id = *label2id
-                .get(&sample.label)
-                .with_context(|| format!("Unknown label '{}' encountered", sample.label))?;
-
-            let encoding = match &sample.text_b {
-                Some(text_b) => tokenizer
-                    .encode((sample.text_a.as_str(), text_b.as_str()), true)
-                    .map_err(|e| anyhow::anyhow!("Tokenization error: {}", e))?,
-                None => tokenizer
-                    .encode(sample.text_a.as_str(), true)
-                    .map_err(|e| anyhow::anyhow!("Tokenization error: {}", e))?,
-            };
-
-            let mut input_ids = encoding.get_ids().to_vec();
-            let mut attention_mask = encoding.get_attention_mask().to_vec();
-
-            // Truncate to max_length (dynamic padding is applied per-batch in create_batches)
-            if input_ids.len() > max_length {
-                input_ids.truncate(max_length);
-                attention_mask.truncate(max_length);
-            }
-            if input_ids.is_empty() {
-                input_ids.push(0);
-                attention_mask.push(1);
-            }
-
-            processed.push(ProcessedSample {
-                input_ids,
-                attention_mask,
-                label: label_id,
-            });
-        }
-
-        Ok(Self {
-            samples: processed,
-            num_labels,
-            id2label,
-            label2id,
-        })
     }
 
     /// Split raw samples into train and eval subsets
@@ -558,76 +413,5 @@ impl Dataset {
 
         let eval_samples = samples.split_off(samples.len() - eval_count);
         (samples, eval_samples)
-    }
-
-    /// Create dynamically padded batches with length-grouped bucketing for 5x-15x faster attention
-    pub fn create_batches(
-        &self,
-        batch_size: usize,
-        shuffle: bool,
-        device: &Device,
-    ) -> Result<Vec<Batch>> {
-        let mut indices: Vec<usize> = (0..self.samples.len()).collect();
-        let mut rng = rand::thread_rng();
-
-        if shuffle {
-            // Shuffle first, then group within mega-batches by sequence length to minimize padding waste
-            indices.shuffle(&mut rng);
-            let mega_batch_size = (batch_size * 16).max(64);
-            for mega_chunk in indices.chunks_mut(mega_batch_size) {
-                mega_chunk.sort_by_key(|&idx| self.samples[idx].input_ids.len());
-            }
-        }
-
-        let mut raw_chunks: Vec<Vec<usize>> = indices
-            .chunks(batch_size.max(1))
-            .map(|c| c.to_vec())
-            .collect();
-
-        if shuffle {
-            raw_chunks.shuffle(&mut rng);
-        }
-
-        let mut batches = Vec::with_capacity(raw_chunks.len());
-        for chunk in raw_chunks {
-            let chunk_size = chunk.len();
-            let raw_max_len = chunk
-                .iter()
-                .map(|&idx| self.samples[idx].input_ids.len())
-                .max()
-                .unwrap_or(1);
-
-            // Align sequence length to multiple of 8 for SIMD / TensorCore efficiency
-            let seq_len = ((raw_max_len + 7) / 8 * 8).max(8);
-
-            let mut flat_input_ids = Vec::with_capacity(chunk_size * seq_len);
-            let mut flat_attn_mask = Vec::with_capacity(chunk_size * seq_len);
-            let mut flat_labels = Vec::with_capacity(chunk_size);
-
-            for &idx in &chunk {
-                let sample = &self.samples[idx];
-                let s_len = sample.input_ids.len();
-                flat_input_ids.extend_from_slice(&sample.input_ids);
-                flat_attn_mask.extend_from_slice(&sample.attention_mask);
-                if s_len < seq_len {
-                    flat_input_ids.resize(flat_input_ids.len() + (seq_len - s_len), 0);
-                    flat_attn_mask.resize(flat_attn_mask.len() + (seq_len - s_len), 0);
-                }
-                flat_labels.push(sample.label as u32);
-            }
-
-            let input_ids = Tensor::from_vec(flat_input_ids, (chunk_size, seq_len), device)?;
-            let attention_mask = Tensor::from_vec(flat_attn_mask, (chunk_size, seq_len), device)?;
-            let labels = Tensor::from_vec(flat_labels, chunk_size, device)?;
-
-            batches.push(Batch {
-                input_ids,
-                attention_mask,
-                labels,
-                size: chunk_size,
-            });
-        }
-
-        Ok(batches)
     }
 }

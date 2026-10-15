@@ -109,10 +109,24 @@ pub struct TrainingArgs {
     pub qlora: bool,
     pub bf16: bool,
     pub lora_layers: usize,
+    pub unfreeze_layers: usize,
     pub device: String,
     pub lora: LoraConfig,
     pub merge_mode: MergeMode,
     pub quant: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptArgs {
+    pub from: String,
+    pub target: String,
+    pub layout: String,
+    pub data_path: Option<PathBuf>,
+    pub output_dir: PathBuf,
+    pub epochs: usize,
+    pub lr: f64,
+    pub batch_size: usize,
+    pub device: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

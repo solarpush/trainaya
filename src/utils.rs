@@ -1,123 +1,22 @@
 use anyhow::Result;
-use candle_core::{DType, Device};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Choose the best compute device available or specified by user
-pub fn select_device(device_str: &str) -> Result<Device> {
+/// Normalize compute device string and apply hardware environment variables
+pub fn resolve_device_name(device_str: &str) -> Result<String> {
     let hw = crate::hardware::SystemHardware::detect();
     hw.apply_environment(device_str);
 
-    match device_str.to_lowercase().as_str() {
-        "cpu" => Ok(Device::Cpu),
-        "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                use anyhow::Context;
-                Device::new_cuda(0).context("Failed to initialize CUDA device 0")
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                tracing::warn!("CUDA feature is not enabled during build, falling back to CPU.");
-                println!(
-                    "{} CUDA feature not enabled in build. Using CPU SIMD instead.",
-                    "⚠️ [WARNING]".yellow().bold()
-                );
-                Ok(Device::Cpu)
-            }
-        }
-        "metal" | "mps" => {
-            #[cfg(feature = "metal")]
-            {
-                use anyhow::Context;
-                Device::new_metal(0).context("Failed to initialize Apple Metal device 0")
-            }
-            #[cfg(not(feature = "metal"))]
-            {
-                tracing::warn!("Metal feature is not enabled during build, falling back to CPU.");
-                println!(
-                    "{} Metal feature not enabled in build (compile with --features metal). Using CPU SIMD instead.",
-                    "⚠️ [WARNING]".yellow().bold()
-                );
-                Ok(Device::Cpu)
-            }
-        }
-        "auto" | "" => {
-            #[cfg(feature = "cuda")]
-            {
-                if let Ok(dev) = Device::new_cuda(0) {
-                    return Ok(dev);
-                }
-            }
-            #[cfg(feature = "metal")]
-            {
-                if let Ok(dev) = Device::new_metal(0) {
-                    return Ok(dev);
-                }
-            }
-            Ok(Device::Cpu)
-        }
-        "rocm" | "hip" | "vulkan" => {
-            #[cfg(feature = "cuda")]
-            {
-                if let Ok(dev) = Device::new_cuda(0) {
-                    return Ok(dev);
-                }
-            }
-            if let crate::hardware::GpuKind::Rocm { name, arch } = &hw.gpu {
-                println!(
-                    "  {} Active AMD GPU: {} (HSA_OVERRIDE_GFX_VERSION={})",
-                    "⚡ [ROCm/Vulkan]".cyan().bold(),
-                    name.bright_white().bold(),
-                    arch.green()
-                );
-            }
-            Ok(Device::Cpu)
-        }
-        other => {
-            if let Some(stripped) = other.strip_prefix("cuda:") {
-                #[cfg(feature = "cuda")]
-                {
-                    let id: usize = stripped.parse().map_err(|e| anyhow::anyhow!("Invalid CUDA device ID: {}", e))?;
-                    return Device::new_cuda(id).map_err(|e| anyhow::anyhow!("Failed to initialize CUDA device: {}", e));
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let _ = stripped;
-                    println!(
-                        "{} CUDA/GPU not compiled in this binary, fallback to CPU.",
-                        "⚠️ [WARNING]".yellow().bold()
-                    );
-                    return Ok(Device::Cpu);
-                }
-            }
-            if let Some(stripped) = other.strip_prefix("metal:") {
-                #[cfg(feature = "metal")]
-                {
-                    let id: usize = stripped.parse().map_err(|e| anyhow::anyhow!("Invalid Metal device ID: {}", e))?;
-                    return Device::new_metal(id).map_err(|e| anyhow::anyhow!("Failed to initialize Metal device: {}", e));
-                }
-                #[cfg(not(feature = "metal"))]
-                {
-                    let _ = stripped;
-                    return Ok(Device::Cpu);
-                }
-            }
-            anyhow::bail!("Unsupported device: '{}'. Use 'cpu', 'cuda', 'metal', 'rocm', 'vulkan', or 'auto'.", device_str);
-        }
-    }
-}
-
-/// Select optimal tensor precision (BF16 on supported GPUs or when explicitly requested, F32 otherwise)
-pub fn select_dtype(device: &Device, bf16_requested: bool) -> DType {
-    if bf16_requested {
-        match device {
-            Device::Cuda(_) | Device::Metal(_) => DType::BF16,
-            Device::Cpu => DType::F32, // Keep F32 on CPU as Candle CPU matmul does not natively support BF16 backward
-        }
-    } else {
-        DType::F32
+    let lower = device_str.trim().to_lowercase();
+    match lower.as_str() {
+        "" | "auto" => Ok("auto".to_string()),
+        "cpu" | "cuda" | "metal" | "mps" | "rocm" | "hip" | "vulkan" => Ok(lower),
+        other if other.starts_with("cuda:") || other.starts_with("metal:") => Ok(other.to_string()),
+        other => anyhow::bail!(
+            "Unsupported device: '{}'. Use 'cpu', 'cuda', 'metal', 'rocm', 'vulkan', or 'auto'.",
+            other
+        ),
     }
 }
 
@@ -128,7 +27,7 @@ pub fn create_progress_bar(len: u64, message: &'static str) -> ProgressBar {
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
             .unwrap()
-            .progress_chars("#>-")
+            .progress_chars("#>-"),
     );
     pb.set_message(message);
     pb
@@ -177,11 +76,8 @@ pub fn ensure_file_exists(path: &Path, desc: &str) -> Result<()> {
     Ok(())
 }
 
-use std::path::PathBuf;
-
 /// Locate a llama.cpp binary (e.g. llama-export-lora, llama-quantize)
 pub fn find_llama_tool(bin_name: &str) -> Option<PathBuf> {
-    // 1. Explicit env var override (e.g. LLAMA_EXPORT_LORA, LLAMA_QUANTIZE)
     let env_var_name = bin_name.to_uppercase().replace('-', "_");
     if let Ok(path_str) = std::env::var(&env_var_name) {
         let p = PathBuf::from(path_str);
@@ -200,7 +96,6 @@ pub fn find_llama_tool(bin_name: &str) -> Option<PathBuf> {
         }
     }
 
-    // 2. Relative to current project or executable
     let candidates = [
         PathBuf::from("vendor/llama.cpp/build/bin").join(bin_name),
         PathBuf::from("../vendor/llama.cpp/build/bin").join(bin_name),
@@ -214,7 +109,6 @@ pub fn find_llama_tool(bin_name: &str) -> Option<PathBuf> {
         }
     }
 
-    // 3. Search in system PATH via `which`
     if let Ok(output) = std::process::Command::new("which").arg(bin_name).output() {
         if output.status.success() {
             let p_str = String::from_utf8_lossy(&output.stdout).trim().to_string();

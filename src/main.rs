@@ -3,9 +3,10 @@ use clap::Parser;
 use colored::Colorize;
 use trainaya::cli::{Cli, Commands};
 use trainaya::exporter::run_export;
+use trainaya::hardware::SystemHardware;
 use trainaya::merger::run_merge;
 use trainaya::registry::run_register;
-use trainaya::trainer::run_training;
+use trainaya::trainer::{run_adapt, run_training};
 use trainaya::utils::print_banner;
 
 fn main() {
@@ -33,6 +34,27 @@ fn main() {
                         e
                     );
                 }
+            }
+            Ok(())
+        })(),
+        Commands::Adapt(opts) => (|| -> Result<()> {
+            let (adapt_args, models_dir) = opts.into_adapt_args();
+            let out_dir = adapt_args.output_dir.clone();
+            let target_name = adapt_args.target.clone();
+            run_adapt(adapt_args)?;
+
+            let reg_args = trainaya::registry::RegisterArgs {
+                model_path: out_dir,
+                name: target_name,
+                base_template: None,
+                tokenizer_path: None,
+                models_dir,
+            };
+            if let Err(e) = run_register(reg_args) {
+                eprintln!(
+                    "  Warning: Automatic registration failed: {}. You can run 'trainaya register' manually.",
+                    e
+                );
             }
             Ok(())
         })(),
@@ -77,76 +99,66 @@ fn main() {
     }
 }
 
-use trainaya::hardware::SystemHardware;
-
 fn run_doctor() -> Result<()> {
-    print_banner("System & Hardware Diagnostics");
+    print_banner("System, Hardware & uv/PyTorch Engine Diagnostics");
 
     println!(
         "  {:<24} : {}",
         "Trainaya Version".dimmed(),
         format!("v{}", trainaya::updater::CURRENT_VERSION).green().bold()
     );
-    if let Some(cache) = trainaya::updater::read_update_cache() {
-        if trainaya::updater::is_newer_version(
-            trainaya::updater::CURRENT_VERSION,
-            &cache.latest_version,
-        ) {
-            println!(
-                "  {:<24} : {} (Run 'trainaya update')",
-                "Release Status".dimmed(),
-                format!("Update available: v{}", cache.latest_version).yellow().bold()
-            );
-        } else {
-            println!(
-                "  {:<24} : {}",
-                "Release Status".dimmed(),
-                "Up to date".green()
-            );
-        }
-    }
 
     let hw = SystemHardware::detect();
     hw.print_diagnostics();
 
-    #[cfg(feature = "cuda")]
-    {
-        println!(
-            "    • Candle GPU backend    : {}",
-            "COMPILED (CUDA)".green().bold()
-        );
-    }
-    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
-    {
-        println!(
-            "    • Candle GPU backend    : {}",
-            "COMPILED (Apple Metal)".green().bold()
-        );
-    }
-    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
-    {
-        println!(
-            "    • Candle GPU backend    : {}",
-            "CPU Native AVX2/FMA Mode".yellow()
-        );
+    println!("\n  {} Embedded uv + PyTorch Engine:", "🐍".cyan().bold());
+    match trainaya::py_bridge::run_py_doctor() {
+        Ok(info) => {
+            let py_v = info.get("python_version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let torch_v = info.get("torch_version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let tf_v = info
+                .get("transformers_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let onnx_v = info.get("onnx_version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let has_laya = info
+                .get("laya_available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let cuda = info
+                .get("cuda_available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            println!("    • Python Runtime        : {}", py_v.green().bold());
+            println!("    • PyTorch Engine        : {}", torch_v.green().bold());
+            println!("    • Transformers / ONNX   : {} / {}", tf_v.cyan(), onnx_v.cyan());
+            println!(
+                "    • Laya Reference SDK    : {}",
+                if has_laya {
+                    "Active (laya 0.3.7)".green().bold()
+                } else {
+                    "Not installed".yellow()
+                }
+            );
+            println!(
+                "    • Torch Accelerator     : {}",
+                if cuda {
+                    info.get("cuda_device")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("CUDA GPU")
+                        .green()
+                        .bold()
+                } else {
+                    "CPU / SIMD Multi-Thread".yellow()
+                }
+            );
+        }
+        Err(e) => {
+            println!("    • Engine Status         : {} ({})", "ERROR".red().bold(), e);
+        }
     }
 
-    // Pure Rust SIMD Kernels status
-    println!("\n  {} Native Pure Rust SIMD Kernels:", "⚙️".cyan().bold());
-    println!(
-        "    • Fast LoRA Accumulate Kernel : {}",
-        "COMPILED (Pure Rust SIMD)".green().bold()
-    );
-    println!(
-        "    • 4-Bit NF4 Quantize / Dequant: {}",
-        "COMPILED (Pure Rust SIMD)".green().bold()
-    );
-    println!(
-        "    • 8-Bit Int8 Quantize / Dequant: {}",
-        "COMPILED (Pure Rust SIMD)".green().bold()
-    );
-
-    // Target runtime
     println!("\n  {} Ollaya Runtime Compatibility:", "🎯".purple().bold());
     println!(
         "    • Format: SafeTensors  - {}",
@@ -154,12 +166,15 @@ fn run_doctor() -> Result<()> {
     );
     println!(
         "    • Format: GGUF (v3)    - {}",
-        "Supported (llama.cpp integration)".green()
+        "Supported (llama.cpp + llm-logits-v1)".green()
     );
-    println!("    • Format: ONNX package - {}", "Supported".green());
+    println!(
+        "    • Format: ONNX package - {}",
+        "Supported (weightless external-data + inline patcher)".green()
+    );
 
     println!(
-        "\n{} System is healthy and ready for local training & export.\n",
+        "\n{} System is healthy and ready for PyTorch training, adaptation & export.\n",
         "✓".green().bold()
     );
     Ok(())

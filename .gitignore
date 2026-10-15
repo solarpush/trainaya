@@ -11,4 +11,5 @@ vendor/
 *.log
 results/bench_test.json
 results/bench_*.json
-
+data
+laya_multimodal
