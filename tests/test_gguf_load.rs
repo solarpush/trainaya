@@ -5,26 +5,37 @@ use std::time::Instant;
 
 #[test]
 fn test_dequantize_gguf_layer() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pierre".to_string());
-    let path = PathBuf::from(home).join(".ollaya/models/blobs/sha256-840e3f50e5a9c218727f44e121d1b37cc9e2c3b318c8eb422ba6ef2e27b618a2");
-    if !path.exists() {
-        println!("File not found: {:?}", path);
-        return;
-    }
+    let path = match trainaya::models::gguf_lora::resolve_gguf_path("winnow:e4b") {
+        Ok(p) => p,
+        Err(_) => {
+            println!("winnow:e4b not found, skipping");
+            return;
+        }
+    };
     let mut file = File::open(&path).expect("Failed to open GGUF");
     let content = candle_core::quantized::gguf_file::Content::read(&mut file).expect("Failed to read GGUF");
 
     let device = Device::Cpu;
-    let t_name = "blk.41.attn_q.weight";
-    
-    let _start = Instant::now();
-    let qtensor = content.tensor(&mut file, t_name, &device).expect("Failed to read tensor");
-    let dequant_start = Instant::now();
-    let tensor_f32 = qtensor.dequantize(&device).expect("Failed to dequantize");
-    let elapsed = dequant_start.elapsed();
-    
-    println!("Dequantized {} in {:?}", t_name, elapsed);
-    println!("  Shape: {:?}", tensor_f32.shape());
-    println!("  DType: {:?}", tensor_f32.dtype());
-    assert_eq!(tensor_f32.dtype(), DType::F32);
+    for t_name in [
+        "blk.40.attn_output.weight",
+        "blk.41.attn_output.weight",
+        "blk.41.attn_v.weight",
+        "blk.41.post_attention_norm.weight",
+        "blk.41.layer_output_scale.weight",
+        "output_norm.weight",
+    ] {
+        let qtensor = content.tensor(&mut file, t_name, &device).expect("Failed to read tensor");
+        let dequant_start = Instant::now();
+        let tensor_f32 = qtensor.dequantize(&device).expect("Failed to dequantize");
+        let elapsed = dequant_start.elapsed();
+        let norm = tensor_f32.sqr().unwrap().sum_all().unwrap().to_vec0::<f32>().unwrap().sqrt();
+        println!(
+            "Dequantized {:35} in {:8?}: shape={:?}, frob_norm={:.4}",
+            t_name,
+            elapsed,
+            tensor_f32.shape(),
+            norm
+        );
+        assert_eq!(tensor_f32.dtype(), DType::F32);
+    }
 }

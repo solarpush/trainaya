@@ -223,6 +223,29 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
         }
     }
 
+    // 4b. Optionally hash and store calibration.json blob
+    let calibration_file = if args.model_path.is_dir() {
+        Some(args.model_path.join("calibration.json")).filter(|p| p.exists())
+    } else {
+        weight_file
+            .parent()
+            .map(|p| p.join("calibration.json"))
+            .filter(|p| p.exists())
+    };
+    let mut cal_info: Option<(String, u64)> = None;
+    if let Some(cal_path) = &calibration_file {
+        let (cal_hash, cal_size) = hash_file(cal_path)?;
+        let cal_blob_name = format!("sha256-{}", cal_hash);
+        let cal_target = blobs_dir.join(&cal_blob_name);
+        if !cal_target.exists() {
+            if fs::hard_link(cal_path, &cal_target).is_err() {
+                fs::copy(cal_path, &cal_target)?;
+            }
+        }
+        cal_info = Some((cal_hash, cal_size));
+        print_status("Calibration Blob", format!("sha256:{}", cal_info.as_ref().unwrap().0));
+    }
+
     // 5. Determine base template manifest to inherit structure from
     let default_template = if is_gguf { "winnow:e4b" } else { "laya:en" };
     let template_name = args.base_template.as_deref().unwrap_or(default_template);
@@ -339,6 +362,39 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
                 }
                 break;
             }
+        }
+    }
+
+    // Update or insert calibration layer if calibration.json was generated during training
+    if let Some((cal_hash, cal_size)) = cal_info {
+        let mut cal_layer_found = false;
+        for layer in layers.iter_mut() {
+            let mtype = layer.get("mediaType").and_then(|m| m.as_str()).unwrap_or("");
+            if mtype == "application/vnd.ollaya.calibration" {
+                layer["digest"] = serde_json::Value::String(format!("sha256:{}", cal_hash));
+                layer["size"] = serde_json::Value::Number(cal_size.into());
+                if let Some(obj) = layer.as_object_mut() {
+                    obj.remove("urls");
+                    let mut annotations = serde_json::Map::new();
+                    annotations.insert(
+                        "org.ollaya.creator".to_string(),
+                        serde_json::Value::String("trainaya".to_string()),
+                    );
+                    obj.insert("annotations".to_string(), serde_json::Value::Object(annotations));
+                }
+                cal_layer_found = true;
+                break;
+            }
+        }
+        if !cal_layer_found {
+            layers.push(serde_json::json!({
+                "mediaType": "application/vnd.ollaya.calibration",
+                "digest": format!("sha256:{}", cal_hash),
+                "size": cal_size,
+                "annotations": {
+                    "org.ollaya.creator": "trainaya"
+                }
+            }));
         }
     }
 

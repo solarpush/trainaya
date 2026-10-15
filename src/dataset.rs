@@ -63,7 +63,7 @@ impl DecisionDataset {
             bail!("Dataset file {} is empty", path.display());
         }
 
-        // Check if first line is already a structured DecisionSample
+        // Check if first line is already a structured DecisionSample or FailureExportRecord
         if let Ok(first_val) = serde_json::from_str::<Value>(raw_lines[0]) {
             if first_val.get("options").is_some() && first_val.get("target_index").is_some() {
                 let mut samples = Vec::new();
@@ -78,6 +78,40 @@ impl DecisionDataset {
                     let s: DecisionSample = serde_json::from_value(val)
                         .with_context(|| format!("Failed to parse DecisionSample on line {}", idx + 1))?;
                     samples.push(s);
+                }
+                return Ok(samples);
+            } else if first_val.get("questions").is_some() && first_val.get("gold_label").is_some() {
+                let mut samples = Vec::new();
+                for (idx, line) in raw_lines.iter().enumerate() {
+                    let val: Value = serde_json::from_str(line)
+                        .with_context(|| format!("Failed to parse JSON on line {}", idx + 1))?;
+                    let state = val
+                        .get("state")
+                        .cloned()
+                        .or_else(|| val.get("text").cloned())
+                        .unwrap_or(Value::String(String::new()));
+                    let gold = val
+                        .get("gold_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("false");
+                    let q_str = val
+                        .get("questions")
+                        .map(|q| q.to_string())
+                        .unwrap_or_default();
+                    let (question, mut options) = crate::curate::extract_schema_metadata(&q_str);
+                    if options.is_empty() {
+                        options = vec!["false".to_string(), "true".to_string()];
+                    }
+                    let target_index = options
+                        .iter()
+                        .position(|o| o.trim().eq_ignore_ascii_case(gold.trim()))
+                        .unwrap_or(0);
+                    samples.push(DecisionSample {
+                        state,
+                        question,
+                        options,
+                        target_index,
+                    });
                 }
                 return Ok(samples);
             }

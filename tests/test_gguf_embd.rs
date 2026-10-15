@@ -4,32 +4,30 @@ use std::path::PathBuf;
 
 #[test]
 fn test_inspect_token_embd() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pierre".to_string());
-    let path = PathBuf::from(home).join(".ollaya/models/blobs/sha256-840e3f50e5a9c218727f44e121d1b37cc9e2c3b318c8eb422ba6ef2e27b618a2");
-    if !path.exists() {
-        println!("File not found: {:?}", path);
-        return;
-    }
+    let path = match trainaya::models::gguf_lora::resolve_gguf_path("winnow:e4b") {
+        Ok(p) => p,
+        Err(_) => {
+            println!("winnow:e4b not found, skipping");
+            return;
+        }
+    };
     let mut file = File::open(&path).expect("Failed to open GGUF");
     let content = candle_core::quantized::gguf_file::Content::read(&mut file).expect("Failed to read GGUF");
 
     let device = Device::Cpu;
-    let t_name = "token_embd.weight";
-    let qtensor = content.tensor(&mut file, t_name, &device).expect("Failed to load tensor");
-    
-    // Winnow label IDs:
-    // A: 236776, B: 236799, C: 236780
-    // Let's dequantize full embedding or test
+    let qtensor = content.tensor(&mut file, "token_embd.weight", &device).expect("Failed to load tensor");
+    let out_norm = content.tensor(&mut file, "output_norm.weight", &device).unwrap().dequantize(&device).unwrap();
+    let post_attn_norm = content.tensor(&mut file, "blk.41.post_attention_norm.weight", &device).unwrap().dequantize(&device).unwrap();
+
     let dequant_start = std::time::Instant::now();
     let embd_f32 = qtensor.dequantize(&device).expect("Failed to dequantize");
     println!("Dequantized full 262k x 2560 embedding table in {:?}", dequant_start.elapsed());
-    println!("Shape: {:?}", embd_f32.shape());
-    
-    // Slice tokens A, B, C
-    let emb_a = embd_f32.get(236776).unwrap();
-    let emb_b = embd_f32.get(236799).unwrap();
-    let emb_c = embd_f32.get(236780).unwrap();
-    println!("Embedding vector A shape: {:?}", emb_a.shape());
-    println!("Embedding vector B shape: {:?}", emb_b.shape());
-    println!("Embedding vector C shape: {:?}", emb_c.shape());
+
+    for (label, id) in [("A", 236776usize), ("B", 236799), ("C", 236780), ("D", 236796), ("E", 236788)] {
+        let emb = embd_f32.get(id).unwrap();
+        let raw_norm = emb.sqr().unwrap().sum_all().unwrap().to_vec0::<f32>().unwrap().sqrt();
+        let eff_emb = (&(&emb * &out_norm).unwrap() * &post_attn_norm).unwrap();
+        let eff_norm = eff_emb.sqr().unwrap().sum_all().unwrap().to_vec0::<f32>().unwrap().sqrt();
+        println!("Option {} (id={}): raw_norm={:.4}, effective_norm(with output_norm*post_attn_norm)={:.4}", label, id, raw_norm, eff_norm);
+    }
 }

@@ -50,6 +50,9 @@ pub struct RawInputItem {
     /// Optional model misprediction (from 'trainaya bench --export-failures')
     #[serde(default)]
     pub predicted_label: Option<String>,
+    /// Optional model confidence on misprediction (from 'trainaya bench --export-failures')
+    #[serde(default)]
+    pub confidence: Option<f64>,
     /// Optional failure severity tag (from 'trainaya bench --export-failures')
     #[serde(default)]
     pub failure_type: Option<String>,
@@ -496,6 +499,7 @@ pub fn load_raw_inputs(path: &Path) -> Result<Vec<RawInputItem>> {
             hypothesis: None,
             gold_label: None,
             predicted_label: None,
+            confidence: None,
             failure_type: None,
         });
     }
@@ -695,6 +699,8 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                     };
 
                     if anno.confidence >= cf.min_confidence {
+                        let src_pred = source_item.and_then(|c| c.predicted_label.as_deref());
+                        let src_conf = source_item.and_then(|c| c.confidence);
                         write_formatted_row_with_schema(
                             &mut out_file,
                             cf.format,
@@ -702,11 +708,14 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                             &primary_label,
                             &item_question,
                             &item_valid_labels,
+                            src_pred,
+                            src_conf,
                         )?;
                         *class_distribution.entry(primary_label.clone()).or_insert(0) += 1;
                         total_accepted += 1;
 
-                        // Emit verified Counterfactual Twin if enabled or in Augment mode
+                        // Emit verified Counterfactual Twin if enabled or in Augment mode,
+                        // unless it would cancel out a mined failure correction by pairing high-overlap text with the model's over-predicted wrong label
                         if cf.add_hard_negatives || is_augment {
                             if let Some(hn_text) = anno.hard_negative.as_deref() {
                                 if !hn_text.trim().is_empty() {
@@ -715,19 +724,27 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                                         anno.hard_negative_label.as_deref(),
                                         &item_valid_labels,
                                     ) {
-                                        write_formatted_row_with_schema(
-                                            &mut out_file,
-                                            cf.format,
-                                            hn_text.trim(),
-                                            &flipped_label,
-                                            &item_question,
-                                            &item_valid_labels,
-                                        )?;
-                                        *class_distribution
-                                            .entry(flipped_label)
-                                            .or_insert(0) += 1;
-                                        total_accepted += 1;
-                                        total_counterfactuals += 1;
+                                        let cancels_failure = src_pred
+                                            .map(|pl| pl.eq_ignore_ascii_case(&flipped_label))
+                                            .unwrap_or(false)
+                                            && token_overlap_ratio(&text, hn_text) > 0.45;
+                                        if !cancels_failure {
+                                            write_formatted_row_with_schema(
+                                                &mut out_file,
+                                                cf.format,
+                                                hn_text.trim(),
+                                                &flipped_label,
+                                                &item_question,
+                                                &item_valid_labels,
+                                                None,
+                                                None,
+                                            )?;
+                                            *class_distribution
+                                                .entry(flipped_label)
+                                                .or_insert(0) += 1;
+                                            total_accepted += 1;
+                                            total_counterfactuals += 1;
+                                        }
                                     }
                                 }
                             }
@@ -803,6 +820,8 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                         &s.label,
                         &schema_question,
                         &valid_labels,
+                        None,
+                        None,
                     )?;
                     *class_distribution.entry(s.label.clone()).or_insert(0) += 1;
                     total_accepted += 1;
@@ -822,6 +841,8 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                                         &flipped_label,
                                         &schema_question,
                                         &valid_labels,
+                                        None,
+                                        None,
                                     )?;
                                     *class_distribution.entry(flipped_label).or_insert(0) += 1;
                                     total_accepted += 1;
@@ -872,6 +893,24 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
     Ok(())
 }
 
+fn token_overlap_ratio(a: &str, b: &str) -> f64 {
+    let set_a: std::collections::HashSet<&str> = a
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .collect();
+    let set_b: std::collections::HashSet<&str> = b
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .collect();
+    if set_a.is_empty() || set_b.is_empty() {
+        return 0.0;
+    }
+    let inter = set_a.intersection(&set_b).count();
+    let min_len = set_a.len().min(set_b.len());
+    (inter as f64) / (min_len as f64)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_formatted_row_with_schema(
     writer: &mut File,
     format: TargetDatasetFormat,
@@ -879,6 +918,8 @@ fn write_formatted_row_with_schema(
     label: &str,
     schema_question: &str,
     valid_labels: &[String],
+    predicted_label: Option<&str>,
+    confidence: Option<f64>,
 ) -> Result<()> {
     match format {
         TargetDatasetFormat::Decision => {
@@ -887,13 +928,19 @@ fn write_formatted_row_with_schema(
                     .iter()
                     .position(|v| v.eq_ignore_ascii_case(label.trim()))
                     .unwrap_or(0);
-                let row = serde_json::json!({
+                let mut row = serde_json::json!({
                     "state": text,
                     "label": label,
                     "question": schema_question,
                     "options": valid_labels,
                     "target_index": target_idx,
                 });
+                if let Some(pl) = predicted_label {
+                    row["predicted_label"] = serde_json::json!(pl);
+                }
+                if let Some(conf) = confidence {
+                    row["confidence"] = serde_json::json!(conf);
+                }
                 writeln!(writer, "{}", serde_json::to_string(&row)?)?;
             } else {
                 let row = serde_json::json!({
