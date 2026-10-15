@@ -27,6 +27,12 @@ def cmd_doctor() -> int:
 
     cuda_avail = torch.cuda.is_available()
     cuda_dev = torch.cuda.get_device_name(0) if cuda_avail else None
+    vram_mb = (
+        int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
+        if cuda_avail
+        else 0
+    )
+    hip_ver = getattr(torch.version, "hip", None)
     mps_avail = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 
     emit_event(
@@ -40,6 +46,8 @@ def cmd_doctor() -> int:
             "laya_available": has_laya,
             "cuda_available": cuda_avail,
             "cuda_device": cuda_dev,
+            "vram_mb": vram_mb,
+            "hip_version": hip_ver,
             "mps_available": mps_avail,
         }
     )

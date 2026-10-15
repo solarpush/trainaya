@@ -178,8 +178,10 @@ def load_decision_records(
                 )
             )
 
+        has_existing_anchors = any(obj.get("is_anchor") is True for obj in raw_objs)
+
         # Anchor replay: mix in passed records from the same subsets in ~/.cache/trainaya/benchmarks/public
-        if include_anchor_replay and subsets_seen:
+        if include_anchor_replay and subsets_seen and not has_existing_anchors:
             cache_dir = os.path.expanduser("~/.cache/trainaya/benchmarks/public")
             if os.path.isdir(cache_dir):
                 for subset in sorted(subsets_seen):

@@ -141,18 +141,28 @@ fn run_doctor() -> Result<()> {
                     "Not installed".yellow()
                 }
             );
-            println!(
-                "    • Torch Accelerator     : {}",
-                if cuda {
-                    info.get("cuda_device")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("CUDA GPU")
+            let hip_ver = info.get("hip_version").and_then(|v| v.as_str());
+            let vram_mb = info.get("vram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+            let accel_str = if cuda {
+                let dev_name = info
+                    .get("cuda_device")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("GPU");
+                if let Some(hip) = hip_ver {
+                    format!("ROCm / HIP {} ({} — {} MiB VRAM)", hip, dev_name, vram_mb)
                         .green()
                         .bold()
+                        .to_string()
                 } else {
-                    "CPU / SIMD Multi-Thread".yellow()
+                    format!("NVIDIA CUDA ({} — {} MiB VRAM)", dev_name, vram_mb)
+                        .green()
+                        .bold()
+                        .to_string()
                 }
-            );
+            } else {
+                "CPU / SIMD Multi-Thread".yellow().to_string()
+            };
+            println!("    • Torch Accelerator     : {}", accel_str);
         }
         Err(e) => {
             println!("    • Engine Status         : {} ({})", "ERROR".red().bold(), e);

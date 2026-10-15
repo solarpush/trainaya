@@ -58,6 +58,10 @@ pub fn ensure_py_engine_dir() -> Result<PathBuf> {
 
 /// Resolve the Python command (`./.venv/bin/python` if present, otherwise `uv run --project <dir> python`).
 fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>) -> Result<Command> {
+    let hw = crate::hardware::SystemHardware::detect();
+    hw.apply_environment("auto");
+    let torch_backend = hw.uv_torch_backend();
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cwd_venv = cwd.join(".venv/bin/python");
     let engine_venv = engine_dir.join(".venv/bin/python");
@@ -79,6 +83,9 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
     if let Some(py_bin) = direct_python {
         let mut cmd = Command::new(py_bin);
         cmd.env("PYTHONPATH", engine_dir);
+        for (k, v) in hw.get_environment_for_device("auto") {
+            cmd.env(k, v);
+        }
         cmd.arg("-m").arg("trainaya_py").arg(subcmd);
         if let Some(cfg) = cfg_arg {
             cmd.arg("--config").arg(cfg);
@@ -90,6 +97,8 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
     cmd.arg("run")
         .arg("--project")
         .arg(engine_dir)
+        .arg("--torch-backend")
+        .arg(&torch_backend)
         .arg("python")
         .arg("-m")
         .arg("trainaya_py")
@@ -98,6 +107,10 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
         cmd.arg("--config").arg(cfg);
     }
     cmd.env("PYTHONPATH", engine_dir);
+    cmd.env("UV_TORCH_BACKEND", &torch_backend);
+    for (k, v) in hw.get_environment_for_device("auto") {
+        cmd.env(k, v);
+    }
     Ok(cmd)
 }
 

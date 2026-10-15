@@ -262,7 +262,7 @@ def train_laya_module(
     # If encoder is frozen (unfreeze_layers == 0), precompute encoder hidden states once!
     cached_h_enc: List[torch.Tensor] = []
     if unfreeze_layers == 0:
-        cache_path = f"{data_path}.b{batch_size}.enc_cache.pt"
+        cache_path = f"{data_path}.n{len(items)}.b{batch_size}.enc_cache.pt"
         loaded_from_cache = False
         if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(data_path):
             try:
@@ -352,7 +352,7 @@ def train_laya_module(
 
     best_acc = base_acc
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    l2_sp_coeff = 0.05
+    l2_sp_coeff = 0.0005
 
     step_idx = 0
     for ep in range(1, epochs + 1):
@@ -371,7 +371,6 @@ def train_laya_module(
             mmask = b["marker_mask"].to(dev)
             qt = b["qtype"].to(dev)
             labels = b["label"].to(dev)
-            targets = b["target"].to(dev)
             weights = b["weights"].to(dev)
 
             if unfreeze_layers == 0:
@@ -381,16 +380,11 @@ def train_laya_module(
                 ids = b["input_ids"].to(dev)
                 logits, _ = model(ids, att, mpos, mmask, qt)
 
-            # 1. Weighted Cross-Entropy Loss with label smoothing
-            ce_per_item = F.cross_entropy(logits, labels, reduction="none", label_smoothing=0.03)
+            # 1. Weighted Cross-Entropy Loss (no label_smoothing on -1e4 masked padding columns!)
+            ce_per_item = F.cross_entropy(logits, labels, reduction="none")
             ce_loss = (ce_per_item * weights).mean()
 
-            # 2. Laya Strictly Proper Scoring Rule Reward (log + spherical + RPS)
-            probs = torch.softmax(logits, dim=-1)
-            prop_r = proper_reward(probs, targets, qt, mmask.float())
-            prop_loss = -(prop_r * weights).mean()
-
-            # 3. Pairwise Margin Loss (pushes gold option >= hardest negative + 1.0)
+            # 2. Pairwise Margin Loss (pushes gold option >= hardest negative + 1.0)
             row_idx = torch.arange(logits.size(0), device=dev)
             gold_scores = logits[row_idx, labels]
             neg_logits = logits.clone()
@@ -398,13 +392,13 @@ def train_laya_module(
             hardest_neg = neg_logits.max(dim=-1).values
             margin_loss = (F.relu(1.0 - (gold_scores - hardest_neg)) * weights).mean()
 
-            # 4. L2-SP Anchor Penalty towards pretrained weights
+            # 3. Gentle L2-SP Anchor Penalty towards pretrained weights
             l2_sp = torch.tensor(0.0, device=dev)
             for name, param in model.named_parameters():
                 if param.requires_grad and name in init_snapshot:
                     l2_sp = l2_sp + torch.sum((param - init_snapshot[name].to(dev)) ** 2)
 
-            loss = 0.65 * ce_loss + 0.20 * prop_loss + 0.15 * margin_loss + l2_sp_coeff * l2_sp
+            loss = 0.85 * ce_loss + 0.15 * margin_loss + l2_sp_coeff * l2_sp
 
             optimizer.zero_grad()
             loss.backward()
@@ -510,14 +504,24 @@ def run_laya_training_job(job: Dict[str, Any], emit: Callable[[Dict[str, Any]], 
     req_device = str(job.get("device", "auto")).lower()
     models_dir = job.get("models_dir")
 
-    dev = "cuda" if (req_device in ("auto", "cuda") and torch.cuda.is_available()) else "cpu"
+    dev = (
+        "cuda"
+        if (req_device in ("auto", "cuda", "rocm", "hip") and torch.cuda.is_available())
+        else "cpu"
+    )
+    if dev == "cuda":
+        gpu_label = torch.cuda.get_device_name(0)
+        hip_v = getattr(torch.version, "hip", None)
+        dev_desc = f"ROCm/HIP {hip_v} ({gpu_label})" if hip_v else f"CUDA ({gpu_label})"
+    else:
+        dev_desc = "CPU"
     os.makedirs(output_dir, exist_ok=True)
 
     manifest_info = resolve_ollaya_laya_manifest(base_model, models_dir=models_dir)
     emit(
         {
             "event": "status",
-            "message": f"Loading '{base_model}' into PyTorch DecisionModel on {dev.upper()}...",
+            "message": f"Loading '{base_model}' into PyTorch DecisionModel on {dev_desc}...",
         }
     )
     model, tok, decision, orig_dtypes = load_laya_from_ollaya_blobs(manifest_info, device=dev)
@@ -553,13 +557,17 @@ def run_laya_training_job(job: Dict[str, Any], emit: Callable[[Dict[str, Any]], 
         if hasattr(model, "temperature"):
             model.temperature.copy_(torch.tensor(temps, dtype=model.temperature.dtype, device=model.temperature.device))
 
-    # Save model.safetensors preserving original tensor dtypes (FP16)
+    # Save model.safetensors preserving original tensor dtypes (FP16) and ensure 0644 permissions for ollaya service
     out_safetensors = os.path.join(output_dir, "model.safetensors")
     out_sd: Dict[str, torch.Tensor] = {}
     for k, v in model.state_dict().items():
         target_dt = orig_dtypes.get(k, torch.float16)
         out_sd[k] = v.detach().cpu().to(dtype=target_dt).contiguous()
     save_file(out_sd, out_safetensors)
+    try:
+        os.chmod(out_safetensors, 0o644)
+    except OSError:
+        pass
 
     new_weights_sha = sha256_file(out_safetensors)
     new_weights_blob_name = f"sha256-{new_weights_sha}"
@@ -578,6 +586,10 @@ def run_laya_training_job(job: Dict[str, Any], emit: Callable[[Dict[str, Any]], 
             old_scorer3_weight_t=old_scorer3_weight_t,
             new_scorer3_weight_t=new_scorer3_weight_t,
         )
+        try:
+            os.chmod(dst_onnx, 0o644)
+        except OSError:
+            pass
         patched_onnx.append({"precision": prec, "path": dst_onnx})
         emit(
             {

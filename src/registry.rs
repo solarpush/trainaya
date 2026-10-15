@@ -57,6 +57,11 @@ fn store_blob(file_path: &Path, blobs_dir: &Path) -> Result<(String, u64)> {
                 .with_context(|| format!("Failed to copy blob to {}", target.display()))?;
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o644));
+    }
     Ok((hash, size))
 }
 

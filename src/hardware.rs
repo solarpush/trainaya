@@ -150,6 +150,38 @@ impl SystemHardware {
         }
     }
 
+    /// Resolve the optimal `UV_TORCH_BACKEND` string (`rocm7.1`, `rocm6.3`, `auto`, etc.) for `uv`
+    pub fn uv_torch_backend(&self) -> String {
+        if let Ok(explicit) = std::env::var("UV_TORCH_BACKEND") {
+            if !explicit.trim().is_empty() {
+                return explicit;
+            }
+        }
+        match &self.gpu {
+            GpuKind::Rocm { .. } => {
+                if let Ok(out) = std::process::Command::new("hipconfig").arg("--version").output() {
+                    let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let parts: Vec<&str> = ver.split('.').collect();
+                    if parts.len() >= 2 {
+                        let major_minor = format!("{}.{}", parts[0], parts[1]);
+                        return match major_minor.as_str() {
+                            "7.2" => "rocm7.2".to_string(),
+                            "7.1" => "rocm7.1".to_string(),
+                            "7.0" => "rocm7.0".to_string(),
+                            "6.4" => "rocm6.4".to_string(),
+                            "6.3" => "rocm6.3".to_string(),
+                            "6.2" => "rocm6.2.4".to_string(),
+                            _ => "rocm7.1".to_string(),
+                        };
+                    }
+                }
+                "rocm7.1".to_string()
+            }
+            GpuKind::Cuda { .. } => "auto".to_string(),
+            GpuKind::Metal { .. } | GpuKind::None => "auto".to_string(),
+        }
+    }
+
     /// Print formatted diagnostics
     pub fn print_diagnostics(&self) {
         println!("  {:<24} : {}", "Target OS".dimmed(), self.os.cyan());
