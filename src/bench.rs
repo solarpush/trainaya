@@ -225,7 +225,7 @@ impl BenchRunner {
             match ureq::post(&api_url)
                 .set("Authorization", "Bearer local")
                 .set("Content-Type", "application/json")
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(120))
                 .send_json(&payload)
             {
                 Ok(resp) => {
@@ -1242,16 +1242,25 @@ pub fn run_benchmark_with_failures(
         }),
     };
     let warm_url = format!("{}/v1/systemone", server_url.trim_end_matches('/'));
-    if let Err(e) = ureq::post(&warm_url)
+    match ureq::post(&warm_url)
         .set("Authorization", "Bearer local")
         .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(45))
+        .timeout(Duration::from_secs(120))
         .send_json(&warm_req)
     {
-        eprintln!("    {} Failed to reach Ollaya server at {}: {}", "⚠️".yellow(), warm_url, e);
-        eprintln!("    Please verify that Ollaya daemon is running ('systemctl status ollaya').");
-    } else {
-        println!("    {} Ollaya runtime is ready.", "✓".green());
+        Ok(_) => {
+            println!("    {} Ollaya runtime is ready.", "✓".green());
+        }
+        Err(ureq::Error::Transport(e)) => {
+            bail!(
+                "Failed to reach Ollaya server at {}: {}. Verify that Ollaya daemon is running ('systemctl status ollaya').",
+                warm_url,
+                e
+            );
+        }
+        Err(e) => {
+            eprintln!("    {} Warmup notice from {}: {}", "⚠️".yellow(), warm_url, e);
+        }
     }
 
     // Resolve datasets
@@ -1292,9 +1301,10 @@ pub fn run_benchmark_with_failures(
             .progress_chars("━╾─"),
     );
 
+    // Pass 1: Evaluate all subsets for target model while keeping it hot in Ollaya memory
     for (sub_name, sub_title, _) in PUBLIC_SUBSETS {
         if let Some(records) = datasets.get(*sub_name) {
-            pb.set_message(format!("{} [starting...]", sub_name));
+            pb.set_message(format!("{} ({}) [starting...]", sub_name, model));
 
             let (m_res, subset_failures) = runner.run_subset_with_failures_progress(
                 model,
@@ -1326,8 +1336,14 @@ pub fn run_benchmark_with_failures(
                     }
                 }
             }
+        }
+    }
 
-            if let Some(base) = baseline {
+    // Pass 2: Evaluate all subsets for baseline model (single model swap)
+    if let Some(base) = baseline {
+        for (sub_name, sub_title, _) in PUBLIC_SUBSETS {
+            if let Some(records) = datasets.get(*sub_name) {
+                pb.set_message(format!("{} ({}) [starting...]", sub_name, base));
                 let (b_res, _) = runner.run_subset_with_failures_progress(
                     base,
                     sub_name,

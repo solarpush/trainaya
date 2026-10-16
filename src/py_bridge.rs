@@ -15,6 +15,7 @@ const EMBED_ONNX_PATCH: &str = include_str!("../py_engine/trainaya_py/onnx_patch
 const EMBED_DATASET_LOADER: &str = include_str!("../py_engine/trainaya_py/dataset_loader.py");
 const EMBED_LAYA_TRAINER: &str = include_str!("../py_engine/trainaya_py/laya_trainer.py");
 const EMBED_ADAPT_ENGINE: &str = include_str!("../py_engine/trainaya_py/adapt_engine.py");
+const EMBED_GGUF_HEAD_TRAINER: &str = include_str!("../py_engine/trainaya_py/gguf_head_trainer.py");
 const EMBED_HF_TRAINER: &str = include_str!("../py_engine/trainaya_py/hf_trainer.py");
 
 /// Ensure the embedded Python package is materialized either in `./py_engine` (dev workspace)
@@ -40,6 +41,7 @@ pub fn ensure_py_engine_dir() -> Result<PathBuf> {
         (pkg_dir.join("dataset_loader.py"), EMBED_DATASET_LOADER),
         (pkg_dir.join("laya_trainer.py"), EMBED_LAYA_TRAINER),
         (pkg_dir.join("adapt_engine.py"), EMBED_ADAPT_ENGINE),
+        (pkg_dir.join("gguf_head_trainer.py"), EMBED_GGUF_HEAD_TRAINER),
         (pkg_dir.join("hf_trainer.py"), EMBED_HF_TRAINER),
     ];
 

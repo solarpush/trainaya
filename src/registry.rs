@@ -292,13 +292,39 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
         }
     }
 
-    let mut manifest_val: serde_json::Value = if template_manifest_path.exists() {
+    let cfg_path = src_dir.join("ollaya_config.json");
+    let is_standalone_adapt = args.base_template.is_none() && cfg_path.exists() && dec_info.is_some();
+
+    let mut manifest_val: serde_json::Value = if is_standalone_adapt {
+        let (cfg_hash, cfg_size) = store_blob(&cfg_path, &blobs_dir)?;
+        print_status("Config Blob", format!("sha256:{}", cfg_hash));
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.ollaya.config.v1+json",
+                "digest": format!("sha256:{}", cfg_hash),
+                "size": cfg_size,
+            },
+            "layers": [
+                {
+                    "mediaType": if is_gguf { "application/vnd.ollaya.weights.gguf" } else { "application/vnd.ollaya.weights" },
+                    "digest": format!("sha256:{}", weight_hash),
+                    "size": weight_size
+                },
+                {
+                    "mediaType": "application/vnd.ollaya.decision",
+                    "digest": format!("sha256:{}", dec_info.as_ref().unwrap().0),
+                    "size": dec_info.as_ref().unwrap().1
+                }
+            ]
+        })
+    } else if template_manifest_path.exists() {
         print_status("Base Template", template_name);
         let template_str = fs::read_to_string(&template_manifest_path)?;
         serde_json::from_str(&template_str)?
     } else if dec_info.is_some() {
-        // Standalone adapted model (e.g. from `trainaya adapt`)
-        let cfg_path = src_dir.join("ollaya_config.json");
+        // Standalone adapted model fallback when ollaya_config.json wasn't pre-written
         let (cfg_hash, cfg_size) = if cfg_path.exists() {
             store_blob(&cfg_path, &blobs_dir)?
         } else {
