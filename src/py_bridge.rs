@@ -110,6 +110,8 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
     }
     cmd.env("PYTHONPATH", engine_dir);
     cmd.env("UV_TORCH_BACKEND", &torch_backend);
+    cmd.env("GGML_CUDA_DISABLE_GRAPHS", "1");
+    cmd.env("GGML_CUDA_DISABLE_FUSION", "1");
     for (k, v) in hw.get_environment_for_device("auto") {
         cmd.env(k, v);
     }

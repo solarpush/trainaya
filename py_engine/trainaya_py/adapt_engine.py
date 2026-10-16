@@ -29,9 +29,8 @@ import struct
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+os.environ.setdefault("GGML_CUDA_DISABLE_GRAPHS", "1")
 
 from pathlib import Path
 from .calibration import fit_per_qtype_temperatures
@@ -631,6 +630,8 @@ def _adapt_hf_causal_to_llm_logits(
     device: str,
     emit: Callable[[Dict[str, Any]], None],
 ) -> Dict[str, Any]:
+    import torch
+    import torch.nn.functional as F
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     dev = "cuda" if (device in ("auto", "cuda") and torch.cuda.is_available()) else "cpu"
@@ -785,6 +786,7 @@ def _adapt_hf_encoder_to_laya(
     emit: Callable[[Dict[str, Any]], None],
 ) -> Dict[str, Any]:
     """Graft a Laya DecisionModel head onto a HuggingFace encoder and train it end-to-end."""
+    import torch
     from laya.common import DecisionModel
     from safetensors.torch import save_file
     from transformers import AutoModel, AutoTokenizer

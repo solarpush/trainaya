@@ -52,7 +52,7 @@ pub enum Commands {
 #[derive(Args, Debug)]
 pub struct AdaptOpts {
     /// Source model path (.gguf file, local directory, or HuggingFace repo ID like 'shieldstral' / 'mistralai/...')
-    #[arg(long)]
+    #[arg(long, alias = "model")]
     pub from: String,
 
     /// Target Ollaya tag to register (e.g. 'shieldstral:v1', 'mistral-decision:v1')

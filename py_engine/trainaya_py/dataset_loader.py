@@ -746,10 +746,10 @@ def _cached_hf_download(repo_id: str, filename: str, repo_type: str = "dataset")
 
 
 def load_hf_jev_adaptation_corpus(
-    max_samples: int = 3000,
+    max_samples: int = 3600,
     emit: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[NormalizedDecisionRecord]:
-    """Download and stratify official generalist Jev / Open-Jev datasets from HuggingFace + Ollaya preset anchors (zero test-set leakage)."""
+    """Download and stratify official generalist Jev / Open-Jev datasets from HuggingFace + Cyclic 3x3 ABC Permutations (zero test-set leakage)."""
     records: List[NormalizedDecisionRecord] = []
     preset_anchors = build_ollaya_preset_anchors()
     records.extend(preset_anchors)
@@ -777,6 +777,9 @@ def load_hf_jev_adaptation_corpus(
                     continue
                 rec = _parse_jev_distill_row(json.loads(line), idx)
                 if rec is not None and (len(str(rec.state)) + len(str(rec.instructions))) <= 2400:
+                    # Keep score training strictly 5-level (0..4) so 6-level (0..5) rubrics never bias token '3' over '4'
+                    if rec.qtype == "score" and len(rec.option_keys) != 5:
+                        continue
                     bkey = (rec.subset, rec.qtype, rec.gold_index)
                     if bucket_counts.get(bkey, 0) < 35:
                         bucket_counts[bkey] = bucket_counts.get(bkey, 0) + 1
@@ -785,13 +788,14 @@ def load_hf_jev_adaptation_corpus(
         if emit:
             emit({"event": "status", "message": f"Warning: could not fetch SargeDev/jev-distill-corpus-v3: {e}"})
 
-    # 2. Load ZefanCai/Open-Jev-v1.1 (26,675 rows including WANLI and community-diversity-v2)
+    # 2. Load ZefanCai/Open-Jev-v1.1 and build Cyclic 3x3 ABC Permutation Matrix samples on WANLI
+    wanli_by_sem: Dict[int, List[Tuple[str, str, List[float]]]] = {0: [], 1: [], 2: []}
     try:
         if emit:
             emit(
                 {
                     "event": "status",
-                    "message": "Loading official Open-Jev v1.1 corpus ('ZefanCai/Open-Jev-v1.1')...",
+                    "message": "Loading official Open-Jev v1.1 corpus ('ZefanCai/Open-Jev-v1.1') + Cyclic 3x3 ABC Matrix...",
                 }
             )
         ojev_path = _cached_hf_download(
@@ -805,23 +809,162 @@ def load_hf_jev_adaptation_corpus(
                 if not line:
                     continue
                 obj = json.loads(line)
+                if obj.get("source") == "wanli-decisions-v1":
+                    st = obj.get("state", {})
+                    t = obj.get("target", [])
+                    if isinstance(st, dict) and "premise" in st and "claim" in st and len(t) == 3:
+                        g_sem = int(max(range(3), key=lambda k: float(t[k])))
+                        if float(max(t)) >= 0.70:
+                            wanli_by_sem[g_sem].append((str(st["premise"]), str(st["claim"]), [float(x) for x in t]))
+                    continue
                 rec = _parse_jev_distill_row(obj, 20000 + idx)
                 if rec is not None and (len(str(rec.state)) + len(str(rec.instructions))) <= 2400:
+                    if rec.qtype == "score" and len(rec.option_keys) != 5:
+                        continue
+                    # Cap synthetic 16-option ID puzzles from community-diversity-v2
+                    if rec.qtype == "choice" and len(rec.option_keys) >= 6:
+                        cap = 4
+                    else:
+                        cap = 35
                     bkey = (rec.subset, rec.qtype, rec.gold_index)
-                    cap = 160 if rec.subset == "wanli-decisions-v1" else 40
                     if bucket_counts.get(bkey, 0) < cap:
                         bucket_counts[bkey] = bucket_counts.get(bkey, 0) + 1
                         by_kind[rec.qtype].append(rec)
     except Exception:
         pass
 
+    # Build Cyclic 3x3 ABC Permutation Matrix samples (P0_nli, P1_fv, P1_qa3, P2_cyc) + paws_gen & squad_gen from WANLI
+    n_cyc_per_sem = min(45, min((len(wanli_by_sem[g]) for g in range(3)), default=0))
+    for g_sem in range(3):
+        for i in range(n_cyc_per_sem):
+            prem, clm, p_raw = wanli_by_sem[g_sem][i]
+            # p_raw is [p_Neu, p_Neg, p_Pos]
+            # P0 (NLI order: A=contradiction(Neg), B=entailment(Pos), C=neutral(Neu))
+            t0 = [p_raw[1], p_raw[2], p_raw[0]]
+            records.append(
+                NormalizedDecisionRecord(
+                    record_id=f"cyc-p0-{g_sem}-{i}",
+                    state={"hypothesis": clm, "premise": prem},
+                    qtype="choice",
+                    instructions="Classify the relationship between premise and hypothesis.",
+                    criteria={
+                        "contradiction": "Hypothesis contradicts premise.",
+                        "entailment": "Hypothesis definitely follows from premise.",
+                        "neutral": "Hypothesis might or might not follow.",
+                    },
+                    option_keys=["contradiction", "entailment", "neutral"],
+                    gold_index=int(max(range(3), key=lambda k: t0[k])),
+                    sample_weight=1.0,
+                    subset="P0_nli",
+                    target_probs=t0,
+                )
+            )
+            # P1a (FV order: A=NOT ENOUGH INFO(Neu), B=REFUTES(Neg), C=SUPPORTS(Pos))
+            t1 = [p_raw[0], p_raw[1], p_raw[2]]
+            records.append(
+                NormalizedDecisionRecord(
+                    record_id=f"cyc-p1fv-{g_sem}-{i}",
+                    state={"claim": clm, "evidence": prem},
+                    qtype="choice",
+                    instructions="Determine if the evidence supports, refutes, or gives not enough info for the claim.",
+                    criteria={
+                        "NOT ENOUGH INFO": "The evidence is insufficient to verify or refute.",
+                        "REFUTES": "The evidence directly refutes the claim.",
+                        "SUPPORTS": "The evidence confirms the claim is true.",
+                    },
+                    option_keys=["NOT ENOUGH INFO", "REFUTES", "SUPPORTS"],
+                    gold_index=int(max(range(3), key=lambda k: t1[k])),
+                    sample_weight=0.5,
+                    subset="P1_fv",
+                    target_probs=t1,
+                )
+            )
+            # P1b (QA3 order: A=maybe(Neu), B=no(Neg), C=yes(Pos))
+            records.append(
+                NormalizedDecisionRecord(
+                    record_id=f"cyc-p1qa3-{g_sem}-{i}",
+                    state={"context": prem, "question": clm},
+                    qtype="choice",
+                    instructions="Based on the biomedical abstract, does the study answer yes, no, or maybe to the question?",
+                    criteria={
+                        "maybe": "The findings are inconclusive or neutral.",
+                        "no": "The study conclusively negates the question.",
+                        "yes": "The study conclusively affirms the question.",
+                    },
+                    option_keys=["maybe", "no", "yes"],
+                    gold_index=int(max(range(3), key=lambda k: t1[k])),
+                    sample_weight=0.5,
+                    subset="P1_qa3",
+                    target_probs=t1,
+                )
+            )
+            # P2 (3rd cyclic order: A=entailment(Pos), B=neutral(Neu), C=contradiction(Neg))
+            t2 = [p_raw[2], p_raw[0], p_raw[1]]
+            records.append(
+                NormalizedDecisionRecord(
+                    record_id=f"cyc-p2-{g_sem}-{i}",
+                    state={"hypothesis": clm, "premise": prem},
+                    qtype="choice",
+                    instructions="Classify the relationship between premise and hypothesis.",
+                    criteria={
+                        "entailment": "Hypothesis definitely follows from premise.",
+                        "neutral": "Hypothesis might or might not follow.",
+                        "contradiction": "Hypothesis contradicts premise.",
+                    },
+                    option_keys=["entailment", "neutral", "contradiction"],
+                    gold_index=int(max(range(3), key=lambda k: t2[k])),
+                    sample_weight=1.0,
+                    subset="P2_cyc",
+                    target_probs=t2,
+                )
+            )
+
+        # Also add generalist Paraphrase (paws_gen) & Answerability (squad_gen) noul templates from WANLI
+        for i in range(n_cyc_per_sem, min(n_cyc_per_sem + 30, len(wanli_by_sem[g_sem]))):
+            prem, clm, p_raw = wanli_by_sem[g_sem][i]
+            is_pos = g_sem == 2
+            # NormalizedDecisionRecord noul uses option_keys=["false", "true"], target_probs=[P(false), P(true)]
+            p_true = float(p_raw[2]) if is_pos else float(p_raw[0] + p_raw[1]) * 0.1
+            t_noul = [1.0 - p_true, p_true]
+            g_noul = 1 if is_pos else 0
+            if i < n_cyc_per_sem + 15:
+                records.append(
+                    NormalizedDecisionRecord(
+                        record_id=f"wanli-paws-{g_sem}-{i}",
+                        state={"sentence1": prem, "sentence2": clm},
+                        qtype="noul",
+                        instructions="Do the two sentences have the same meaning (paraphrase)?",
+                        criteria={"true": "Yes, they are paraphrases", "false": "No, they have different meanings"},
+                        option_keys=["false", "true"],
+                        gold_index=g_noul,
+                        sample_weight=1.0,
+                        subset="paws_gen",
+                        target_probs=t_noul,
+                    )
+                )
+            else:
+                records.append(
+                    NormalizedDecisionRecord(
+                        record_id=f"wanli-squad-{g_sem}-{i}",
+                        state={"context": prem, "question": clm},
+                        qtype="noul",
+                        instructions="Can the question/claim be directly answered or verified from the context alone?",
+                        criteria={"true": "Answerable from the context", "false": "Cannot be answered from the context"},
+                        option_keys=["false", "true"],
+                        gold_index=g_noul,
+                        sample_weight=1.0,
+                        subset="squad_gen",
+                        target_probs=t_noul,
+                    )
+                )
+
     # Stratify round-robin across gold_index buckets within each qtype so every option/score level is balanced
     rng = random.Random(42)
     remaining = max(36, max_samples - len(records))
     quotas = {
         "choice": int(remaining * 0.40),
-        "score": int(remaining * 0.32),
-        "noul": remaining - int(remaining * 0.40) - int(remaining * 0.32),
+        "score": int(remaining * 0.30),
+        "noul": remaining - int(remaining * 0.40) - int(remaining * 0.30),
     }
     for k in ("choice", "score", "noul"):
         pool = by_kind[k]
@@ -852,7 +995,7 @@ def load_hf_jev_adaptation_corpus(
         emit(
             {
                 "event": "status",
-                "message": f"Loaded {len(records)} purely generalist Jev/Open-Jev decision records (choice={counts['choice']}, score={counts['score']}, noul={counts['noul']}).",
+                "message": f"Loaded {len(records)} purely generalist Jev/Open-Jev + Cyclic-ABC decision records (choice={counts['choice']}, score={counts['score']}, noul={counts['noul']}).",
             }
         )
     return records

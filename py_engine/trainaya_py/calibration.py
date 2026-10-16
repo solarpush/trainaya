@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 
 def compute_ece(probs_list: List[np.ndarray], labels: List[int], n_bins: int = 10) -> float:

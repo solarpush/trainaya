@@ -8,6 +8,9 @@ import sys
 import traceback
 from typing import Any, Dict
 
+os.environ["GGML_CUDA_DISABLE_GRAPHS"] = "1"
+os.environ["GGML_CUDA_DISABLE_FUSION"] = "1"
+
 
 def emit_event(payload: Dict[str, Any]) -> None:
     print("TRAINAYA_EVENT:" + json.dumps(payload, ensure_ascii=False), flush=True)
