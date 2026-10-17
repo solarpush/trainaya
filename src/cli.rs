@@ -499,7 +499,7 @@ impl From<ExportOpts> for ExportArgs {
 
 #[derive(Args, Debug)]
 pub struct RegisterOpts {
-    #[arg(short, long)]
+    #[arg(short, long, alias = "model-path")]
     pub model: PathBuf,
 
     #[arg(short, long)]

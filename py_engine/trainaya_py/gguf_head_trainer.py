@@ -894,19 +894,14 @@ def train_gguf_decision_head(
     Matrix, quantize the updated rows back into `output.weight`, and return calibrated temperatures.
     """
     quantizer = GgmlRowQuantizer()
-    # Read untouched pretrained embeddings from token_embd.weight when available so repeated runs are idempotent
-    try:
-        _, all_tensors, _ = parse_gguf_layout(gguf_path)
-        src_tinfo = all_tensors.get("token_embd.weight", tensor_info)
-        if src_tinfo.get("n_cols") != tensor_info.get("n_cols"):
-            src_tinfo = tensor_info
-    except Exception:
-        src_tinfo = tensor_info
-
-    w_choice_np = quantizer.read_tensor_rows(gguf_path, src_tinfo, choice_token_ids)
-    w_score_np = quantizer.read_tensor_rows(gguf_path, src_tinfo, score_token_ids)
+    # `ensure_untied_output_weight` has already initialized/reset `output.weight` (`tensor_info`)
+    # for both architectures:
+    # - Tied GGUF (e.g. Ministral-3B): cloned/reset from `token_embd.weight`
+    # - Untied GGUF (e.g. Ministral-8B): copied/reset from source `output.weight`
+    w_choice_np = quantizer.read_tensor_rows(gguf_path, tensor_info, choice_token_ids)
+    w_score_np = quantizer.read_tensor_rows(gguf_path, tensor_info, score_token_ids)
     space_choice_ids = _find_space_prefixed_choice_ids(gguf_path, choice_token_ids)
-    w_choice_space_np = quantizer.read_tensor_rows(gguf_path, src_tinfo, space_choice_ids)
+    w_choice_space_np = quantizer.read_tensor_rows(gguf_path, tensor_info, space_choice_ids)
 
     # Prepare and sort samples by `state_key` to maximize LCP KV-cache hits
     prepared: List[PreparedAdaptationSample] = []
@@ -1030,11 +1025,11 @@ def train_gguf_decision_head(
     mu_rub_hat = mu_rub / mu_rub_norm
 
     q_vec = (w_score_np[3] - w_score_np[1]).astype(np.float32)
-    # Normalize thresholds relative to the model's quality-axis scale on synth_rubric5
-    q_rub_vals = hidden_mat[s5_idxs] @ q_vec if s5_idxs else np.array([2.5], dtype=np.float32)
-    q_scale = float(max(0.5, np.percentile(q_rub_vals, 75) / 7.45)) if len(q_rub_vals) >= 5 else 1.0
+    # Normalize thresholds relative to the model's quality-axis scale on synth_rubric5 (5.33 on Ministral-3B, ~4.45 on Ministral-8B)
+    q_rub_vals = hidden_mat[s5_idxs] @ q_vec if s5_idxs else np.array([5.33], dtype=np.float32)
+    q_scale = float(np.clip(np.percentile(q_rub_vals, 75) / 5.33, 0.75, 1.25)) if len(q_rub_vals) >= 5 else 1.0
     alphas = np.array([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=np.float32)
-    ts = [1.2 * q_scale, 2.5 * q_scale, 2.7 * q_scale, 3.5 * q_scale]
+    ts = [1.15 * q_scale, 2.35 * q_scale, 2.60 * q_scale, 3.10 * q_scale]
     betas = np.zeros(5, dtype=np.float32)
     for k in range(1, 5):
         betas[k] = betas[k - 1] - (alphas[k] - alphas[k - 1]) * ts[k - 1]
@@ -1093,14 +1088,28 @@ def train_gguf_decision_head(
             v_noul = hidden_mat[noul_idxs].mean(axis=0)
             prot_vecs.append(v_noul / max(1e-6, float(np.linalg.norm(v_noul))))
 
+        vt_prot = None
         if prot_vecs:
             _, _, vt_prot = np.linalg.svd(np.stack(prot_vecs, axis=0), full_matrices=False)
             dW = dW - (dW @ vt_prot.T) @ vt_prot
 
-        # Scale dW relative to pretrained choice row norm so alpha=1.5 generalizes across 3B and 8B models
-        c_norm_ratio = float(np.linalg.norm(w_choice_np[:3], axis=1).mean()) / max(1e-6, float(np.linalg.norm(dW, axis=1).mean()) * 2.2)
-        alpha = min(2.0, max(1.0, 1.5 * c_norm_ratio)) if c_norm_ratio < 0.5 else 1.5
+        # Scale dW relative to pretrained choice row norm (3.31 ratio on Ministral-3B -> alpha=1.50)
+        c_norm_ratio = float(np.linalg.norm(w_choice_np[:3], axis=1).mean()) / max(1e-6, float(np.linalg.norm(dW, axis=1).mean()) * 3.31)
+        alpha = float(np.clip(1.5 * c_norm_ratio, 1.2, 2.2))
         w_choice_trained[:3] += alpha * dW
+
+        # If P0_nli has an extreme prior template bias (e.g. >4.8 logit spread on Ministral-8B),
+        # remove the excess along the component of mu_nli strictly orthogonal to vt_prot.
+        nli_idxs = [i for i, s in enumerate(valid_samples) if s.subset == "P0_nli"]
+        if nli_idxs and vt_prot is not None:
+            mu_nli = hidden_mat[nli_idxs].mean(axis=0)
+            bias_nli = w_choice_trained[:3] @ mu_nli
+            if float(np.ptp(bias_nli)) > 4.8:
+                u_nli = mu_nli - (mu_nli @ vt_prot.T) @ vt_prot
+                u_nli_norm_sq = float(np.dot(u_nli, u_nli))
+                if u_nli_norm_sq > 1e-4:
+                    bias_centered = bias_nli - bias_nli.mean()
+                    w_choice_trained[:3] -= 0.80 * np.outer(bias_centered, u_nli / u_nli_norm_sq)
 
     debiased_acc = _eval_acc_np(w_choice_trained, w_score_trained)
 
