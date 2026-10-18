@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Trainaya & Ollaya Calibration Metadata",
+  "description": "Per-primitive temperature scaling parameters for Ollaya decision models",
+  "type": "object",
+  "required": ["schema", "temperatures"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "enum": ["ollaya.calibration.v1"],
+      "description": "Calibration schema identifier"
+    },
+    "method": {
+      "type": "string",
+      "description": "Calibration optimization method (e.g. temperature_scaling_nll)"
+    },
+    "temperatures": {
+      "type": "object",
+      "required": ["choice", "noul", "score"],
+      "properties": {
+        "choice": {
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 10.0,
+          "description": "Softmax temperature for categorical choice decisions"
+        },
+        "noul": {
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 10.0,
+          "description": "Softmax temperature for boolean noul decisions"
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 10.0,
+          "description": "Softmax temperature for ordinal score decisions"
+        }
+      }
+    }
+  }
+}

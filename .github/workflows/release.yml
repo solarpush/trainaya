@@ -62,3 +62,25 @@ jobs:
           files: ${{ matrix.artifact_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  package-ide-extension:
+    name: Package IDE Extension Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync IDE Extension version with Git tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 -c 'import json, pathlib, sys; p = pathlib.Path("ide/vscode-trainaya/package.json"); data = json.loads(p.read_text()); data["version"] = sys.argv[1]; p.write_text(json.dumps(data, indent=2) + "\n")' "$VERSION"
+
+      - name: Package IDE Extension Archive
+        run: |
+          tar -czf trainaya-vscode-extension.tar.gz -C ide/vscode-trainaya .
+
+      - name: Upload IDE Extension Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: trainaya-vscode-extension.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

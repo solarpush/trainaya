@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Trainaya & Ollaya Decision Schema / Metadata",
+  "description": "Schema for decision.json model metadata and *.schema.json / questions_schema.json policy definitions",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "enum": ["ollaya.decision.v1", "ollaya.decision.v2"],
+      "description": "Ollaya decision contract version"
+    },
+    "layout": {
+      "type": "string",
+      "enum": ["llm-logits-v1", "laya-markers-v1", "kev-pointer-v1"],
+      "description": "Token/marker layout used by the decision model"
+    },
+    "family": {
+      "type": "string",
+      "description": "Model family identifier"
+    },
+    "choice_token_ids": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "description": "Vocabulary token IDs corresponding to <A>..<Z>"
+    },
+    "score_token_ids": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "description": "Vocabulary token IDs corresponding to score levels 0..9"
+    },
+    "decision": {
+      "$ref": "#/definitions/questionDef"
+    },
+    "questions": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/questionDef"
+      }
+    }
+  },
+  "definitions": {
+    "questionDef": {
+      "type": "object",
+      "required": ["type", "instructions"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["choice", "noul", "score"],
+          "description": "Decision primitive type"
+        },
+        "instructions": {
+          "type": "string",
+          "description": "Question prompt or decision instruction"
+        },
+        "criteria": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": {
+                "type": ["string", "null"]
+              },
+              "description": "Mapping of choice option keys to boundary descriptions"
+            },
+            {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Ordered rubric descriptions for score levels 0..4"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

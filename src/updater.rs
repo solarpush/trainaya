@@ -379,7 +379,86 @@ pub fn run_update(check_only: bool, force: bool, target_tag: Option<&str>) -> Re
         CURRENT_VERSION, release.version
     ));
 
+    update_installed_ide_extensions(&agent, &release.tag_name);
+
     Ok(())
+}
+
+/// If the Trainaya IDE extension (`solarpush.trainaya`) is already installed in VS Code / Cursor / Antigravity,
+/// automatically update it from the release's `trainaya-vscode-extension.tar.gz` asset.
+fn update_installed_ide_extensions(agent: &ureq::Agent, tag_name: &str) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => return,
+    };
+
+    let ide_dirs = [
+        home.join(".vscode/extensions"),
+        home.join(".cursor/extensions"),
+        home.join(".antigravity/extensions"),
+        home.join(".vscode-oss/extensions"),
+    ];
+
+    let mut installed_targets = Vec::new();
+    for ext_root in &ide_dirs {
+        if let Ok(entries) = std::fs::read_dir(ext_root) {
+            let has_ext = entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("solarpush.trainaya"));
+            if has_ext {
+                installed_targets.push(ext_root.clone());
+            }
+        }
+    }
+
+    if installed_targets.is_empty() {
+        return;
+    }
+
+    let ext_url = format!(
+        "https://github.com/{}/releases/download/{}/trainaya-vscode-extension.tar.gz",
+        GITHUB_REPO, tag_name
+    );
+
+    let resp = match agent.get(&ext_url).call() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let mut archive_bytes = Vec::new();
+    if resp.into_reader().read_to_end(&mut archive_bytes).is_err() {
+        return;
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("trainaya_ide_ext_{}", std::process::id()));
+    if std::fs::create_dir_all(&tmp_dir).is_err() {
+        return;
+    }
+    let archive_path = tmp_dir.join("trainaya-vscode-extension.tar.gz");
+    if std::fs::write(&archive_path, &archive_bytes).is_err() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return;
+    }
+
+    for ext_root in installed_targets {
+        let target_dir = ext_root.join("solarpush.trainaya");
+        let _ = std::fs::remove_dir_all(&target_dir);
+        if std::fs::create_dir_all(&target_dir).is_ok() {
+            let _ = Command::new("tar")
+                .arg("-xzf")
+                .arg(&archive_path)
+                .arg("-C")
+                .arg(&target_dir)
+                .status();
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    println!(
+        "  {} Updated Trainaya IDE extension bundle ({})",
+        "✓".green().bold(),
+        tag_name
+    );
 }
 
 #[cfg(test)]

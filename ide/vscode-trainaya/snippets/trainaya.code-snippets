@@ -1,0 +1,95 @@
+{
+  "Curatefile Synth Recipe": {
+    "prefix": ["curate-synth", "CURATE_SYNTH"],
+    "body": [
+      "# .Curatefile — Use-Case Synthesis & Teacher Distillation",
+      "USE_CASE \"${1:Describe your target Use-Case, domain policy, and decision objective}\"",
+      "TEACHER ${2|agy,claude,codex,gemini,agy\\, claude,ollama:llama3.3:70b|}",
+      "MODE synth",
+      "FORMAT decision",
+      "KIND ${3|choice,noul,score|}",
+      "OUTPUT ${4:./data/curated_train.jsonl}",
+      "COUNT ${5:50}",
+      "",
+      "PARAMETER batch_size ${6:10}",
+      "PARAMETER min_confidence ${7:0.85}",
+      "PARAMETER add_hard_negatives ${8|true,false|}"
+    ],
+    "description": "Complete .Curatefile recipe for synthesizing a dataset from a Use-Case"
+  },
+  "Curatefile Reformat Recipe": {
+    "prefix": ["curate-reformat", "CURATE_REFORMAT"],
+    "body": [
+      "# .Curatefile — Raw Dataset Reformatting & Teacher Distillation",
+      "USE_CASE \"${1:Describe how raw records should be classified or verified for your Use-Case}\"",
+      "TEACHER ${2|agy,claude,codex,gemini,agy\\, claude,ollama:llama3.3:70b|}",
+      "MODE ${3|reformat,augment|}",
+      "FORMAT decision",
+      "KIND ${4|choice,noul,score|}",
+      "INPUT ${5:./data/raw_dataset.csv}",
+      "OUTPUT ${6:./data/curated_train.jsonl}",
+      "",
+      "PARAMETER batch_size ${7:10}",
+      "PARAMETER min_confidence ${8:0.85}",
+      "PARAMETER add_hard_negatives ${9|true,false|}"
+    ],
+    "description": "Complete .Curatefile recipe for reformatting an existing CSV/JSONL/JSON dataset"
+  },
+  "Trainfile Recipe": {
+    "prefix": ["trainfile", "TRAINFILE"],
+    "body": [
+      "# .Trainfile — End-to-End Fine-Tuning Recipe",
+      "FROM ${1:answerdotai/ModernBERT-base}",
+      "TASK ${2|decision,classification,nli|}",
+      "DATA ${3:./data/curated_train.jsonl}",
+      "",
+      "PARAMETER epochs ${4:8}",
+      "PARAMETER batch_size ${5:8}",
+      "PARAMETER lr ${6:1.5e-4}",
+      "PARAMETER max_length ${7:512}",
+      "PARAMETER lr_scheduler ${8|cosine,linear,constant|}",
+      "PARAMETER device ${9|auto,rocm,cuda,metal,cpu|}",
+      "",
+      "OUTPUT ./output/{tag}",
+      "REGISTER ${10:custom-decider}:v{ patch + 1 }"
+    ],
+    "description": "Complete .Trainfile recipe for fine-tuning a decision model"
+  },
+  "Benchfile Recipe": {
+    "prefix": ["benchfile", "BENCHFILE"],
+    "body": [
+      "# .Benchfile — 13-Subset Nimble Benchmark Configuration",
+      "MODEL ${1:push_ministral:8b}",
+      "BASELINE ${2:winnow:e4b}",
+      "URL ${3:http://127.0.0.1:11435}",
+      "LIMIT ${4:50}",
+      "OUTPUT ./results/bench_{model}.json"
+    ],
+    "description": "Complete .Benchfile recipe for benchmarking against the 13 Nimble subsets"
+  },
+  "USE_CASE Directive": {
+    "prefix": "USE_CASE",
+    "body": "USE_CASE \"${1:Describe what the final model must decide and the domain rules}\"",
+    "description": "Free-text description of the final Use-Case for Teacher distillation"
+  },
+  "TEACHER Directive": {
+    "prefix": "TEACHER",
+    "body": "TEACHER ${1|agy,claude,codex,gemini,agy\\, claude,ollama:qwen2.5:72b,ollaya:winnow:e4b|}",
+    "description": "Teacher Agent(s) used for dataset distillation"
+  },
+  "MODE Directive": {
+    "prefix": "MODE",
+    "body": "MODE ${1|synth,reformat,augment|}",
+    "description": "Curation workflow mode: synth, reformat, or augment"
+  },
+  "KIND Directive": {
+    "prefix": "KIND",
+    "body": "KIND ${1|choice,noul,score|}",
+    "description": "Decision primitive type: choice, noul, or score"
+  },
+  "PARAMETER Directive": {
+    "prefix": "PARAMETER",
+    "body": "PARAMETER ${1|epochs,batch_size,lr,max_length,warmup_ratio,lr_scheduler,lora_r,lora_alpha,device,min_confidence,add_hard_negatives|} ${2:value}",
+    "description": "Typed hyperparameter for .Trainfile or .Curatefile"
+  }
+}

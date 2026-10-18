@@ -1,0 +1,73 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Trainaya Recipe",
+  "scopeName": "source.trainaya",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#parameter_directive" },
+    { "include": "#directives" },
+    { "include": "#placeholders" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#enums" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.trainaya",
+          "match": "^\\s*(#|//).*$"
+        }
+      ]
+    },
+    "parameter_directive": {
+      "match": "^\\s*(?i:(PARAMETER))\\s+(?i:(epochs|batch_size|batch|grad_accum|grad_accum_steps|lr|learning_rate|warmup_ratio|warmup|max_grad_norm|grad_clip|lr_scheduler|scheduler|max_length|context_length|weight_decay|seed|qlora|bf16|lora_layers|unfreeze_layers|lora_r|rank|lora_alpha|alpha|lora_dropout|dropout|target_modules|device|eval_split|min_confidence|confidence|add_hard_negatives|hard_negatives))\\b",
+      "captures": {
+        "1": { "name": "keyword.control.directive.trainaya" },
+        "2": { "name": "variable.parameter.trainaya" }
+      }
+    },
+    "directives": {
+      "match": "^\\s*(?i:(FROM|BASE|TASK|FORMAT|KIND|DECISION_TYPE|TYPE|DATA|INPUT|EVAL_DATA|SCHEMA|POLICY|ADAPTER|QUANTIZE|QUANT|OUTPUT|OUT|MERGE|REGISTER|TAG|SYSTEM|FAMILY|MODELS_DIR|USE_CASE|USECASE|DESCRIPTION|DOMAIN|TEACHER|ENGINE|AGENT|MODE|COUNT|LIMIT|MODEL|BASELINE|URL|SUBSETS|MIN_ACCURACY|EXPORT_FAILURES|NO_CACHE|PARAMETER))\\b",
+      "captures": {
+        "1": { "name": "keyword.control.directive.trainaya" }
+      }
+    },
+    "placeholders": {
+      "match": "\\{\\s*(tag|model|auto|latest|(patch|minor|major)\\s*\\+\\s*1)\\s*\\}",
+      "name": "constant.other.placeholder.trainaya"
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.trainaya",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.trainaya",
+              "match": "\\\\."
+            },
+            { "include": "#placeholders" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.trainaya",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            { "include": "#placeholders" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "match": "\\b-?(0x[0-9a-fA-F]+|[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?)\\b",
+      "name": "constant.numeric.trainaya"
+    },
+    "enums": {
+      "match": "\\b(?i:(decision|classification|nli|choice|noul|score|synth|synthetic|generate|reformat|distill|label|annotate|augment|contrastive|cosine|linear|constant|auto|cpu|cuda|rocm|metal|vulkan|ollaya|ollama|both|true|false|yes|no|agy|claude|codex|gemini))\\b",
+      "name": "support.constant.enum.trainaya"
+    }
+  }
+}

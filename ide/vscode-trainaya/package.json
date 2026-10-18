@@ -1,0 +1,79 @@
+{
+  "name": "trainaya",
+  "displayName": "Trainaya Recipes & Decision Schemas",
+  "description": "Syntax highlighting, typed snippets, and JSON Schema validation for Trainaya (.Trainfile, .Curatefile, .Benchfile, decision.json, calibration.json)",
+  "version": "0.3.0",
+  "publisher": "solarpush",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solarpush/trainaya"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets",
+    "Linters"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "trainaya",
+        "aliases": [
+          "Trainaya Recipe",
+          "Trainfile",
+          "Curatefile",
+          "Benchfile"
+        ],
+        "filenames": [
+          "Trainfile",
+          ".Trainfile",
+          "Curatefile",
+          ".Curatefile",
+          "Benchfile",
+          ".Benchfile"
+        ],
+        "filenamePatterns": [
+          "Trainfile.*",
+          "*.Trainfile",
+          "Curatefile.*",
+          "*.Curatefile",
+          "Benchfile.*",
+          "*.Benchfile"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "trainaya",
+        "scopeName": "source.trainaya",
+        "path": "./syntaxes/trainaya.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "trainaya",
+        "path": "./snippets/trainaya.code-snippets"
+      }
+    ],
+    "jsonValidation": [
+      {
+        "fileMatch": [
+          "decision.json",
+          "*.schema.json",
+          "questions_schema.json"
+        ],
+        "url": "./schemas/decision.schema.json"
+      },
+      {
+        "fileMatch": [
+          "calibration.json"
+        ],
+        "url": "./schemas/calibration.schema.json"
+      }
+    ]
+  }
+}
