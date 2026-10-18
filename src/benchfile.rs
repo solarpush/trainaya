@@ -38,6 +38,8 @@ pub struct Benchfile {
     pub min_accuracy: Option<f64>,
     /// Path to export misclassified and overconfident failure records for active learning (EXPORT_FAILURES)
     pub export_failures: Option<PathBuf>,
+    /// Bypass reading cached SHA-256 benchmark results (NO_CACHE)
+    pub no_cache: bool,
 }
 
 impl Default for Benchfile {
@@ -52,6 +54,7 @@ impl Default for Benchfile {
             output: None,
             min_accuracy: None,
             export_failures: None,
+            no_cache: false,
         }
     }
 }
@@ -118,6 +121,12 @@ impl Benchfile {
                     if !value.is_empty() {
                         bf.export_failures = Some(resolve_path(base_dir, value));
                     }
+                }
+                "NO_CACHE" | "NOCACHE" => {
+                    bf.no_cache = value.is_empty()
+                        || value.eq_ignore_ascii_case("true")
+                        || value == "1"
+                        || value.eq_ignore_ascii_case("yes");
                 }
                 "THRESHOLD" => {
                     let (metric, val_str) = value
@@ -291,6 +300,7 @@ THRESHOLD min_accuracy 0.75
             output: Some(PathBuf::from("./results/{model}_vs_{baseline}.json")),
             min_accuracy: None,
             export_failures: Some(PathBuf::from("./data/failures_{model}.jsonl")),
+            no_cache: false,
         };
 
         bf.resolve_placeholders(None);

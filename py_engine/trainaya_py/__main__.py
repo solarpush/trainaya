@@ -97,6 +97,7 @@ def cmd_adapt(cfg_arg: str) -> int:
         output_dir=job["output_dir"],
         target_tag=job.get("target_tag", "adapted:v1"),
         layout=job.get("layout", "auto"),
+        mode=job.get("mode", "full"),
         data_path=job.get("data_path"),
         epochs=int(job.get("epochs", 5)),
         lr=float(job.get("lr", 2e-4)),

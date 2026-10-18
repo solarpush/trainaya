@@ -20,8 +20,6 @@ import struct
 from typing import Dict, Tuple
 
 import numpy as np
-import onnx
-from onnx import TensorProto, numpy_helper
 
 
 def sha256_file(path: str) -> str:
@@ -62,6 +60,9 @@ def patch_laya_onnx_graph(
     new_scorer3_weight_t: np.ndarray,
 ) -> Dict[str, int]:
     """Patch an Ollaya weightless ONNX graph (fp32 or fp16) to reference updated safetensors and inline scorer.3.weight."""
+    import onnx
+    from onnx import TensorProto, numpy_helper
+
     index = read_safetensors_index(new_safetensors_path)
     model = onnx.load(src_onnx_path, load_external_data=False)
 

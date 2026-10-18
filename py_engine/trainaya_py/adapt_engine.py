@@ -165,23 +165,22 @@ def _render_jinja_template(chat_template: str, system_msg: str, user_msg: str) -
     if not chat_template or not chat_template.strip():
         return f"[SYSTEM_PROMPT]{system_msg}[/SYSTEM_PROMPT][INST]{user_msg}[/INST]"
 
-    import jinja2
-
-    env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
-    env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg},
-    ]
     try:
-        tmpl = env.from_string(chat_template)
-        return tmpl.render(messages=messages, add_generation_prompt=True, enable_thinking=False, bos_token="")
-    except Exception:
-        # Some templates merge system into user
-        messages_merged = [
-            {"role": "user", "content": f"{system_msg}\n\n{user_msg}"},
+        import jinja2
+
+        env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+        env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
         ]
         try:
+            tmpl = env.from_string(chat_template)
+            return tmpl.render(messages=messages, add_generation_prompt=True, enable_thinking=False, bos_token="")
+        except Exception:
+            messages_merged = [
+                {"role": "user", "content": f"{system_msg}\n\n{user_msg}"},
+            ]
             tmpl = env.from_string(chat_template)
             return tmpl.render(
                 messages=messages_merged,
@@ -189,8 +188,16 @@ def _render_jinja_template(chat_template: str, system_msg: str, user_msg: str) -
                 enable_thinking=False,
                 bos_token="",
             )
-        except Exception:
+    except Exception:
+        if "[SYSTEM_PROMPT]" in chat_template:
             return f"[SYSTEM_PROMPT]{system_msg}[/SYSTEM_PROMPT][INST]{user_msg}[/INST]"
+        if "[INST]" in chat_template:
+            return f"[INST]{system_msg}\n\n{user_msg}[/INST]"
+        if "<|system|>" in chat_template and "<|end|>" in chat_template:
+            return f"<|system|>{system_msg}<|end|><|user|>{user_msg}<|end|><|assistant|>"
+        if "<|im_start|>" in chat_template:
+            return f"<|im_start|>system\n{system_msg}<|im_end|>\n<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n"
+        return f"[SYSTEM_PROMPT]{system_msg}[/SYSTEM_PROMPT][INST]{user_msg}[/INST]"
 
 
 def _split_sentinel_template(rendered: str, assistant_prefix: str = "") -> Tuple[str, str, str]:
@@ -292,14 +299,18 @@ def _resolve_hf_label_table(tokenizer) -> Dict[str, Any]:
     }
 
 
-def _try_resolve_gguf_from_hf(source: str, emit: Callable[[Dict[str, Any]], None]) -> Optional[str]:
+def _try_resolve_gguf_from_hf(
+    source: str,
+    emit: Callable[[Dict[str, Any]], None],
+    output_dir: Optional[str] = None,
+) -> Optional[str]:
     """If `source` is a shorthand like `shieldstral` or `ministral` or a HF repo with GGUF weights, download and return path."""
-    from huggingface_hub import HfApi, hf_hub_download
-
     lower = source.strip().lower()
     if lower in KNOWN_GGUF_REPOS:
         repo_id, filename = KNOWN_GGUF_REPOS[lower]
         try:
+            from huggingface_hub import hf_hub_download
+
             cached = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
             emit(
                 {
@@ -309,6 +320,17 @@ def _try_resolve_gguf_from_hf(source: str, emit: Callable[[Dict[str, Any]], None
             )
             return cached
         except Exception:
+            if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
+                existing = os.path.join(output_dir, "model.gguf")
+                emit(
+                    {
+                        "event": "status",
+                        "message": f"Resolved '{source}' from existing output GGUF ('{existing}').",
+                    }
+                )
+                return existing
+            from huggingface_hub import hf_hub_download
+
             emit(
                 {
                     "event": "status",
@@ -319,6 +341,8 @@ def _try_resolve_gguf_from_hf(source: str, emit: Callable[[Dict[str, Any]], None
 
     if "/" in source and not os.path.exists(source):
         try:
+            from huggingface_hub import HfApi, hf_hub_download
+
             api = HfApi()
             info = api.model_info(source)
             gguf_files = [
@@ -339,7 +363,8 @@ def _try_resolve_gguf_from_hf(source: str, emit: Callable[[Dict[str, Any]], None
                 )
                 return hf_hub_download(repo_id=source, filename=preferred)
         except Exception:
-            pass
+            if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
+                return os.path.join(output_dir, "model.gguf")
     return None
 
 
@@ -348,6 +373,7 @@ def adapt_model_to_ollaya(
     output_dir: str,
     target_tag: str,
     layout: str = "auto",
+    mode: str = "full",
     data_path: Optional[str] = None,
     epochs: int = 5,
     lr: float = 2e-4,
@@ -374,6 +400,7 @@ def adapt_model_to_ollaya(
             gguf_file=gguf_file,
             output_dir=output_dir,
             target_tag=target_tag,
+            mode=mode,
             data_path=data_path,
             epochs=epochs,
             lr=lr,
@@ -381,12 +408,13 @@ def adapt_model_to_ollaya(
         )
 
     if not data_path or source.strip().lower() in KNOWN_GGUF_REPOS or source.lower().endswith("-gguf"):
-        resolved_gguf = _try_resolve_gguf_from_hf(source, emit)
+        resolved_gguf = _try_resolve_gguf_from_hf(source, emit, output_dir=output_dir)
         if resolved_gguf:
             return _adapt_gguf_llm_logits(
                 gguf_file=resolved_gguf,
                 output_dir=output_dir,
                 target_tag=target_tag,
+                mode=mode,
                 data_path=data_path,
                 epochs=epochs,
                 lr=lr,
@@ -432,6 +460,7 @@ def _adapt_gguf_llm_logits(
     gguf_file: str,
     output_dir: str,
     target_tag: str,
+    mode: str = "full",
     data_path: Optional[str] = None,
     epochs: int = 5,
     lr: float = 2e-4,

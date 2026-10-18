@@ -72,12 +72,18 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
         .map(|p| p.join(".venv/bin/python"))
         .unwrap_or_default();
 
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let uv_share = Path::new(&home).join(".local/share/uv");
+    let sys_python = PathBuf::from("/usr/bin/python3");
+
     let direct_python = if cwd_venv.exists() {
         Some(cwd_venv)
     } else if engine_venv.exists() {
         Some(engine_venv)
     } else if parent_venv.exists() {
         Some(parent_venv)
+    } else if !uv_share.exists() && sys_python.exists() {
+        Some(sys_python)
     } else {
         None
     };
@@ -85,6 +91,8 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
     if let Some(py_bin) = direct_python {
         let mut cmd = Command::new(py_bin);
         cmd.env("PYTHONPATH", engine_dir);
+        cmd.env("GGML_CUDA_DISABLE_GRAPHS", "1");
+        cmd.env("GGML_CUDA_DISABLE_FUSION", "1");
         for (k, v) in hw.get_environment_for_device("auto") {
             cmd.env(k, v);
         }

@@ -63,6 +63,10 @@ pub struct AdaptOpts {
     #[arg(long, default_value = "auto")]
     pub layout: String,
 
+    /// Adaptation mode: 'full' (biorthogonal + Fisher ARD + enriched score head), 'head-only', or 'chained-lora'
+    #[arg(long, default_value = "full")]
+    pub mode: String,
+
     /// Optional decision dataset (.jsonl) for Decision Alignment fine-tuning & temperature calibration
     #[arg(short, long)]
     pub data: Option<PathBuf>,
@@ -103,6 +107,7 @@ impl AdaptOpts {
                 from: self.from,
                 target: self.target,
                 layout: self.layout,
+                mode: self.mode,
                 data_path: self.data,
                 output_dir: out_dir,
                 epochs: self.epochs,
@@ -558,6 +563,10 @@ pub struct BenchOpts {
 
     #[arg(long)]
     pub export_failures: Option<PathBuf>,
+
+    /// Bypass the SHA-256 model binary result cache and force re-evaluating all probes
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 impl BenchOpts {
@@ -598,6 +607,9 @@ impl BenchOpts {
         }
         if let Some(ef) = self.export_failures {
             bf.export_failures = Some(ef);
+        }
+        if self.no_cache {
+            bf.no_cache = true;
         }
 
         if bf.model.is_empty() {

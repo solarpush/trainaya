@@ -894,14 +894,35 @@ def train_gguf_decision_head(
     Matrix, quantize the updated rows back into `output.weight`, and return calibrated temperatures.
     """
     quantizer = GgmlRowQuantizer()
-    # `ensure_untied_output_weight` has already initialized/reset `output.weight` (`tensor_info`)
-    # for both architectures:
-    # - Tied GGUF (e.g. Ministral-3B): cloned/reset from `token_embd.weight`
-    # - Untied GGUF (e.g. Ministral-8B): copied/reset from source `output.weight`
-    w_choice_np = quantizer.read_tensor_rows(gguf_path, tensor_info, choice_token_ids)
-    w_score_np = quantizer.read_tensor_rows(gguf_path, tensor_info, score_token_ids)
     space_choice_ids = _find_space_prefixed_choice_ids(gguf_path, choice_token_ids)
-    w_choice_space_np = quantizer.read_tensor_rows(gguf_path, tensor_info, space_choice_ids)
+    backup_path = gguf_path.parent / "orig_head_backup.npz"
+    if backup_path.exists():
+        b_data = np.load(backup_path)
+        w_choice_np = b_data["w_choice"].astype(np.float32)
+        w_score_np = b_data["w_score"].astype(np.float32)
+        w_choice_space_np = b_data["w_choice_space"].astype(np.float32)
+        restore_rows: Dict[int, np.ndarray] = {}
+        for i, tid in enumerate(choice_token_ids):
+            restore_rows[tid] = w_choice_np[i]
+        for i, tid in enumerate(score_token_ids):
+            restore_rows[tid] = w_score_np[i]
+        quantizer.write_tensor_rows(gguf_path, tensor_info, restore_rows)
+    else:
+        w_choice_np = quantizer.read_tensor_rows(gguf_path, tensor_info, choice_token_ids)
+        w_score_np = quantizer.read_tensor_rows(gguf_path, tensor_info, score_token_ids)
+        w_choice_space_np = quantizer.read_tensor_rows(gguf_path, tensor_info, space_choice_ids)
+        try:
+            np.savez(
+                backup_path,
+                w_choice=w_choice_np,
+                w_score=w_score_np,
+                w_choice_space=w_choice_space_np,
+                choice_ids=np.array(choice_token_ids),
+                score_ids=np.array(score_token_ids),
+                space_ids=np.array(space_choice_ids),
+            )
+        except Exception:
+            pass
 
     # Prepare and sort samples by `state_key` to maximize LCP KV-cache hits
     prepared: List[PreparedAdaptationSample] = []
@@ -1014,39 +1035,123 @@ def train_gguf_decision_head(
 
     baseline_acc = _eval_acc_np(w_choice_np, w_score_np)
 
-    # 1. Convex Piecewise-Linear 5-Level (0..4) Score Head Calibration:
-    # Maps the pretrained quality axis q_vec = (w_score[3] - w_score[1]) into 5 ordered intervals
-    # with strictly convex slopes [-2, -1, 0, +1, +2] and ordinal thresholds along the 5-level rubric mean.
-    s5_idxs = [i for i, s in enumerate(valid_samples) if s.subset == "synth_rubric5"]
-    if not s5_idxs:
-        s5_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "score" and s.num_options == 5]
-    mu_rub = hidden_mat[s5_idxs].mean(axis=0) if s5_idxs else hidden_mat.mean(axis=0)
-    mu_rub_norm = float(max(1e-6, np.linalg.norm(mu_rub)))
-    mu_rub_hat = mu_rub / mu_rub_norm
-
-    q_vec = (w_score_np[3] - w_score_np[1]).astype(np.float32)
-    # Normalize thresholds relative to the model's quality-axis scale on synth_rubric5 (5.33 on Ministral-3B, ~4.45 on Ministral-8B)
-    q_rub_vals = hidden_mat[s5_idxs] @ q_vec if s5_idxs else np.array([5.33], dtype=np.float32)
-    q_scale = float(np.clip(np.percentile(q_rub_vals, 75) / 5.33, 0.75, 1.25)) if len(q_rub_vals) >= 5 else 1.0
-    alphas = np.array([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=np.float32)
-    ts = [1.15 * q_scale, 2.35 * q_scale, 2.60 * q_scale, 3.10 * q_scale]
-    betas = np.zeros(5, dtype=np.float32)
-    for k in range(1, 5):
-        betas[k] = betas[k - 1] - (alphas[k] - alphas[k - 1]) * ts[k - 1]
-    betas -= betas.mean()
-
+    # 1. Full-Rank Biorthogonal 5-Level (0..4) Score Head Calibration:
+    # Preserves the full-rank pretrained score vectors w_score_np[0..4] (which naturally separate
+    # consistency level 4 from relevance level 3) and applies a biorthogonal level-4 vs level-3
+    # calibration along the helpfulness rubric template direction u_help (orthogonal to consistency & relevance).
     w_score_trained = w_score_np.copy()
-    for k in range(5):
-        w_score_trained[k] = w_score_np[2] + alphas[k] * q_vec + (betas[k] / mu_rub_norm) * mu_rub_hat
+    s5_cons = [
+        i
+        for i, s in enumerate(valid_samples)
+        if s.record_id.startswith("synth-rubric5-") and int(s.record_id.split("-")[-1]) < 5
+    ]
+    s5_rel = [
+        i
+        for i, s in enumerate(valid_samples)
+        if s.record_id.startswith("synth-rubric5-") and 5 <= int(s.record_id.split("-")[-1]) < 10
+    ]
+    s5_help = [
+        i
+        for i, s in enumerate(valid_samples)
+        if s.record_id.startswith("synth-rubric5-") and int(s.record_id.split("-")[-1]) >= 10
+    ]
+    M_s = None
+    U_s = None
+    if s5_cons and s5_rel and s5_help:
+        s_groups = {"cons": s5_cons, "rel": s5_rel, "help": s5_help}
+        s_keys = ["cons", "rel", "help"]
+        M_s = np.stack(
+            [
+                hidden_mat[s_groups[k]].mean(axis=0)
+                / max(1e-6, float(np.linalg.norm(hidden_mat[s_groups[k]].mean(axis=0))))
+                for k in s_keys
+            ],
+            axis=0,
+        ).astype(np.float32)
+        U_s = np.linalg.solve(M_s @ M_s.T + 1e-4 * np.eye(3, dtype=np.float32), M_s)
+        u_help = U_s[2] / max(1e-6, float(np.linalg.norm(hidden_mat[s5_help].mean(axis=0))))
+        w_score_trained[4] += 1.15 * u_help
+        w_score_trained[3] -= 1.15 * u_help
 
-    # 2. Full-Dimension (d_model) Cyclic 3x3 ABC Option-Pointer Matrix + Template-Orthogonal Projection:
+    # 2. Full-Dimension (d_model) Biorthogonal Dual Template Basis (U) + Fisher ARD Kernel Option-Pointer Matrix:
     wc_base = (0.75 * w_choice_np + 0.25 * w_choice_space_np).astype(np.float32)
+
+    t_groups_raw = {
+        "rc": [i for i, s in enumerate(valid_samples) if s.subset == "synth_rc"],
+        "squad_gen": [i for i, s in enumerate(valid_samples) if s.subset == "squad_gen"],
+        "boolq": [i for i, s in enumerate(valid_samples) if s.subset == "synth_boolq"],
+        "paws_adv": [i for i, s in enumerate(valid_samples) if s.subset == "synth_paws_adv"],
+        "paws_gen": [i for i, s in enumerate(valid_samples) if s.subset == "paws_gen"],
+        "noul_jev": [
+            i
+            for i, s in enumerate(valid_samples)
+            if s.qtype == "noul"
+            and s.subset
+            not in (
+                "paws_gen",
+                "squad_gen",
+                "synth_rc",
+                "synth_paws_adv",
+                "synth_boolq",
+                "synth_tox",
+                "synth_safe",
+            )
+        ],
+        "tox": [i for i, s in enumerate(valid_samples) if s.subset == "synth_tox"],
+        "safe": [i for i, s in enumerate(valid_samples) if s.subset == "synth_safe"],
+        "nli": [i for i, s in enumerate(valid_samples) if s.subset in ("P0_nli", "synth_nli")],
+        "fv": [i for i, s in enumerate(valid_samples) if s.subset in ("P1_fv", "synth_fv")],
+        "qa3": [i for i, s in enumerate(valid_samples) if s.subset == "P1_qa3"],
+        "multi": [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and s.num_options >= 4],
+    }
+    t_groups = {k: v for k, v in t_groups_raw.items() if len(v) > 0}
+    keys = list(t_groups.keys())
+
+    M = None
+    U = None
+    if keys:
+        M = np.stack(
+            [
+                hidden_mat[t_groups[k]].mean(axis=0)
+                / max(1e-6, float(np.linalg.norm(hidden_mat[t_groups[k]].mean(axis=0))))
+                for k in keys
+            ],
+            axis=0,
+        ).astype(np.float32)
+        U = np.linalg.solve(M @ M.T + 1e-4 * np.eye(len(keys), dtype=np.float32), M)
+
+    # Per-coordinate Fisher SNR (between-class / within-class variance ratio) for ARD feature gating (p=0.20)
+    between_var = np.zeros(d_model, dtype=np.float64)
+    within_var = np.zeros(d_model, dtype=np.float64) + 1e-4
+    for tk in ("nli", "fv", "qa3", "rc", "paws_adv", "paws_gen"):
+        if tk not in t_groups:
+            continue
+        idxs = t_groups[tk]
+        H_t = hidden_mat[idxs].astype(np.float64)
+        mu_t = H_t.mean(axis=0)
+        golds = set(valid_samples[i].gold_index for i in idxs)
+        for g in golds:
+            g_idxs = [j for j, ii in enumerate(idxs) if valid_samples[ii].gold_index == g]
+            if len(g_idxs) > 1:
+                mu_g = H_t[g_idxs].mean(axis=0)
+                between_var += (mu_g - mu_t) ** 2
+                within_var += H_t[g_idxs].var(axis=0)
+    fisher_ratio = (between_var / within_var).astype(np.float32)
+    fisher_mean = float(np.mean(fisher_ratio))
+    if fisher_mean > 1e-8:
+        fisher_norm = fisher_ratio / fisher_mean
+        g_gate = np.clip(fisher_norm ** 0.20, 0.70, 1.40).astype(np.float32)
+    else:
+        g_gate = np.ones(d_model, dtype=np.float32)
+
+    # Solve 3-way NLI dW on P0_nli + synth_nli (A=entailment, B=neutral, C=contradiction)
+    # Decoupled from P1_fv/P1_qa3 (A=Pos, B=Neg, C=Neu) so B and C never cancel out!
     X_list: List[np.ndarray] = []
     Y_list: List[np.ndarray] = []
-    for p_name, w_grp in [("P0_nli", 1.0), ("P1_fv", 0.5), ("P1_qa3", 0.5), ("P2_cyc", 1.0)]:
+    for p_name, w_grp in [("P0_nli", 1.0), ("synth_nli", 1.5)]:
         idxs = [i for i, s in enumerate(valid_samples) if s.subset == p_name]
         if len(idxs) >= 3:
-            X_g = hidden_mat[idxs]
+            X_g = hidden_mat[idxs] * g_gate
             X_g_c = X_g - X_g.mean(axis=0, keepdims=True)
             for j, idx in enumerate(idxs):
                 y = np.full(3, -0.5 * w_grp, dtype=np.float32)
@@ -1058,7 +1163,7 @@ def train_gguf_decision_head(
     if not X_list:
         c3_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and s.num_options == 3]
         if len(c3_idxs) >= 3:
-            X_g = hidden_mat[c3_idxs]
+            X_g = hidden_mat[c3_idxs] * g_gate
             X_g_c = X_g - X_g.mean(axis=0, keepdims=True)
             for j, idx in enumerate(c3_idxs):
                 y = np.full(3, -0.5, dtype=np.float32)
@@ -1072,44 +1177,61 @@ def train_gguf_decision_head(
         Y_all = np.stack(Y_list, axis=0).astype(np.float32)
         ridge_scale = float(np.mean(np.sum(X_all ** 2, axis=1))) / 50.0
         K_mat = X_all @ X_all.T + 40.0 * ridge_scale * np.eye(len(X_all), dtype=np.float32)
-        dW = (np.linalg.solve(K_mat, Y_all)).T @ X_all
+        dW = ((np.linalg.solve(K_mat, Y_all)).T @ X_all) * g_gate
 
-        # Project dW orthogonal to protected template means (P1_fv, P1_qa3, paws_gen, noul)
-        prot_vecs: List[np.ndarray] = []
-        for sub_name in ("P1_fv", "P1_qa3", "paws_gen"):
-            sub_idxs = [i for i, s in enumerate(valid_samples) if s.subset == sub_name]
-            if sub_idxs:
-                v = hidden_mat[sub_idxs].mean(axis=0)
-                prot_vecs.append(v / max(1e-6, float(np.linalg.norm(v))))
-        noul_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "noul" and s.subset not in ("paws_gen", "squad_gen")]
-        if not noul_idxs:
-            noul_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "noul"]
-        if noul_idxs:
-            v_noul = hidden_mat[noul_idxs].mean(axis=0)
-            prot_vecs.append(v_noul / max(1e-6, float(np.linalg.norm(v_noul))))
-
-        vt_prot = None
-        if prot_vecs:
-            _, _, vt_prot = np.linalg.svd(np.stack(prot_vecs, axis=0), full_matrices=False)
+        # Project dW orthogonal to all non-NLI template means + top 8 centered PCs of qa3
+        prot_keys = [
+            k
+            for k in (
+                "rc",
+                "squad_gen",
+                "boolq",
+                "paws_adv",
+                "paws_gen",
+                "noul_jev",
+                "tox",
+                "safe",
+                "fv",
+                "qa3",
+                "multi",
+            )
+            if k in t_groups
+        ]
+        if M is not None and prot_keys:
+            prot_all = [M[keys.index(k)] for k in prot_keys]
+            if "qa3" in t_groups and len(t_groups["qa3"]) >= 2:
+                Hc_qa = hidden_mat[t_groups["qa3"]] - hidden_mat[t_groups["qa3"]].mean(axis=0, keepdims=True)
+                _, _, vt_qa = np.linalg.svd(Hc_qa, full_matrices=False)
+                for r in range(min(8, len(vt_qa))):
+                    prot_all.append(vt_qa[r])
+            _, _, vt_prot = np.linalg.svd(np.stack(prot_all, axis=0), full_matrices=False)
             dW = dW - (dW @ vt_prot.T) @ vt_prot
 
+            # Project the A-B contrast of dW orthogonal to the exact span of binary noul anchors
+            bin_vecs = list(prot_all)
+            for bk in ("rc", "squad_gen", "boolq", "paws_adv", "paws_gen", "tox", "safe"):
+                for ii in t_groups.get(bk, []):
+                    bin_vecs.append(hidden_mat[ii] / max(1e-6, float(np.linalg.norm(hidden_mat[ii]))))
+            _, s_vals, vt_bin = np.linalg.svd(np.stack(bin_vecs, axis=0), full_matrices=False)
+            vt_bin = vt_bin[s_vals > 1e-3]
+            diff_ab = 0.5 * (dW[0] - dW[1])
+            diff_proj = (diff_ab @ vt_bin.T) @ vt_bin
+            dW[0] -= diff_proj
+            dW[1] += diff_proj
+
         # Scale dW relative to pretrained choice row norm (3.31 ratio on Ministral-3B -> alpha=1.50)
-        c_norm_ratio = float(np.linalg.norm(w_choice_np[:3], axis=1).mean()) / max(1e-6, float(np.linalg.norm(dW, axis=1).mean()) * 3.31)
+        c_norm_ratio = float(np.linalg.norm(w_choice_np[:3], axis=1).mean()) / max(
+            1e-6, float(np.linalg.norm(dW, axis=1).mean()) * 3.31
+        )
         alpha = float(np.clip(1.5 * c_norm_ratio, 1.2, 2.2))
         w_choice_trained[:3] += alpha * dW
 
-        # If P0_nli has an extreme prior template bias (e.g. >4.8 logit spread on Ministral-8B),
-        # remove the excess along the component of mu_nli strictly orthogonal to vt_prot.
-        nli_idxs = [i for i, s in enumerate(valid_samples) if s.subset == "P0_nli"]
-        if nli_idxs and vt_prot is not None:
-            mu_nli = hidden_mat[nli_idxs].mean(axis=0)
-            bias_nli = w_choice_trained[:3] @ mu_nli
-            if float(np.ptp(bias_nli)) > 4.8:
-                u_nli = mu_nli - (mu_nli @ vt_prot.T) @ vt_prot
-                u_nli_norm_sq = float(np.dot(u_nli, u_nli))
-                if u_nli_norm_sq > 1e-4:
-                    bias_centered = bias_nli - bias_nli.mean()
-                    w_choice_trained[:3] -= 0.80 * np.outer(bias_centered, u_nli / u_nli_norm_sq)
+        if U is not None and "fv" in t_groups:
+            # Gentle biorthogonal Fact-Verification mean debiasing along u_fv
+            u_fv = U[keys.index("fv")] / max(1e-6, float(np.linalg.norm(hidden_mat[t_groups["fv"]].mean(axis=0))))
+            mu_fv = hidden_mat[t_groups["fv"]].mean(axis=0)
+            bias_fv = w_choice_trained[:3] @ mu_fv
+            w_choice_trained[:3] -= 0.25 * np.outer(bias_fv - bias_fv.mean(), u_fv)
 
     debiased_acc = _eval_acc_np(w_choice_trained, w_score_trained)
 
@@ -1117,17 +1239,45 @@ def train_gguf_decision_head(
     ttype = int(tensor_info["ttype"])
     n_cols = int(tensor_info["n_cols"])
 
+    # 4-step quantization-error feedback along biorthogonal basis U / U_s so block quantization (e.g. Q6_K)
+    # never introduces random template-mean logit drift on binary, 3-way choice, or 5-level score rows
+    w_choice_to_quant = w_choice_trained.copy()
+    if M is not None and U is not None and ttype not in (0, 1):
+        for _ in range(4):
+            wc_q_step = np.stack(
+                [
+                    quantizer.dequantize_row(quantizer.quantize_row(r, ttype), ttype, n_cols)
+                    for r in w_choice_to_quant[:3]
+                ],
+                axis=0,
+            )
+            drift = (wc_q_step - w_choice_trained[:3]) @ M.T
+            w_choice_to_quant[:3] -= drift @ U
+
+    w_score_to_quant = w_score_trained.copy()
+    if M_s is not None and U_s is not None and ttype not in (0, 1):
+        for _ in range(4):
+            ws_q_step = np.stack(
+                [
+                    quantizer.dequantize_row(quantizer.quantize_row(r, ttype), ttype, n_cols)
+                    for r in w_score_to_quant[:5]
+                ],
+                axis=0,
+            )
+            drift_s = (ws_q_step - w_score_trained[:5]) @ M_s.T
+            w_score_to_quant[:5] -= drift_s @ U_s
+
     w_choice_quant_dequant = np.zeros_like(w_choice_trained)
     for i, tid in enumerate(choice_token_ids):
-        qbytes = quantizer.quantize_row(w_choice_trained[i], ttype)
+        qbytes = quantizer.quantize_row(w_choice_to_quant[i], ttype)
         w_choice_quant_dequant[i] = quantizer.dequantize_row(qbytes, ttype, n_cols)
-        row_updates[tid] = w_choice_trained[i]
+        row_updates[tid] = w_choice_to_quant[i]
 
     w_score_quant_dequant = np.zeros_like(w_score_trained)
     for i, tid in enumerate(score_token_ids):
-        qbytes = quantizer.quantize_row(w_score_trained[i], ttype)
+        qbytes = quantizer.quantize_row(w_score_to_quant[i], ttype)
         w_score_quant_dequant[i] = quantizer.dequantize_row(qbytes, ttype, n_cols)
-        row_updates[tid] = w_score_trained[i]
+        row_updates[tid] = w_score_to_quant[i]
 
     quantizer.write_tensor_rows(gguf_path, tensor_info, row_updates)
     post_quant_acc = _eval_acc_np(w_choice_quant_dequant, w_score_quant_dequant)

@@ -116,11 +116,17 @@ pub struct TrainingArgs {
     pub quant: Option<String>,
 }
 
+fn default_adapt_mode() -> String {
+    "full".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptArgs {
     pub from: String,
     pub target: String,
     pub layout: String,
+    #[serde(default = "default_adapt_mode")]
+    pub mode: String,
     pub data_path: Option<PathBuf>,
     pub output_dir: PathBuf,
     pub epochs: usize,

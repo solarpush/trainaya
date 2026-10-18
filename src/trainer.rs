@@ -96,6 +96,7 @@ pub fn run_adapt(args: AdaptArgs) -> Result<()> {
     print_status("Source Model", &args.from);
     print_status("Target Tag", &args.target);
     print_status("Target Layout", &args.layout);
+    print_status("Adaptation Mode", &args.mode);
     if let Some(ref d) = args.data_path {
         print_status("Alignment Data", &d.display().to_string());
     }
@@ -108,6 +109,7 @@ pub fn run_adapt(args: AdaptArgs) -> Result<()> {
         "source": args.from,
         "target_tag": args.target,
         "layout": args.layout,
+        "mode": args.mode,
         "output_dir": args.output_dir,
         "data_path": args.data_path,
         "epochs": args.epochs,

@@ -64,7 +64,7 @@ fn main() {
         Commands::Doctor => run_doctor(),
         Commands::Bench(opts) => (|| -> Result<()> {
             let bf = opts.resolve_benchfile()?;
-            trainaya::bench::run_benchmark_with_failures(
+            trainaya::bench::run_benchmark_with_options(
                 &bf.model,
                 bf.baseline.as_deref(),
                 bf.data.as_deref(),
@@ -74,6 +74,7 @@ fn main() {
                 bf.output.as_deref(),
                 bf.min_accuracy,
                 bf.export_failures.as_deref(),
+                bf.no_cache,
             )
         })(),
         Commands::Curate(opts) => (|| -> Result<()> {
