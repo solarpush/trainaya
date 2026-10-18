@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Build & Test
+    name: Build, Lint & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,11 +19,20 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Validate Embedded Python Engine Syntax
+        run: python3 -m py_compile py_engine/trainaya_py/*.py
+
       - name: Check compilation
         run: cargo check --verbose
 
-      - name: Run test suite
+      - name: Run Rust & CLI test suite
         run: cargo test --verbose
 
-      - name: Build release binary
-        run: cargo build --release --verbose
+      - name: Build release binary & smoke-test CLI commands
+        run: |
+          cargo build --release --verbose
+          ./target/release/trainaya --version
+          ./target/release/trainaya adapt --help
+          ./target/release/trainaya curate --help
+          ./target/release/trainaya register --help
+          ./target/release/trainaya bench --help

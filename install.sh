@@ -19,7 +19,7 @@ NC='\033[0m' # No Color
 
 echo -e "${CYAN}${BOLD}"
 echo "============================================================"
-echo "  🚀 Trainaya: High-Speed Model Fine-Tuning & Distillation"
+echo "  ⚡ Trainaya: Decision Model Adaptation, Curation & Training"
 echo "============================================================"
 echo -e "${NC}"
 
@@ -50,7 +50,9 @@ esac
 echo -e "  • Detected System : ${BOLD}${PLATFORM} (${TARGET_ARCH})${NC}"
 
 # 3. Determine Installation Directory
-if [ "$(id -u)" -eq 0 ]; then
+if [ -n "${TRAINAYA_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$TRAINAYA_INSTALL_DIR"
+elif [ "$(id -u)" -eq 0 ]; then
     INSTALL_DIR="/usr/local/bin"
 else
     INSTALL_DIR="$HOME/.local/bin"
@@ -59,7 +61,19 @@ fi
 mkdir -p "$INSTALL_DIR"
 echo -e "  • Target Directory: ${BOLD}${INSTALL_DIR}${NC}"
 
-# 4. Installation Method: Check if local built binary exists or fetch from GitHub
+# 4. Ensure 'uv' is installed for the embedded PyTorch engine
+if ! command -v uv >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/uv" ] && [ ! -x "$HOME/.cargo/bin/uv" ]; then
+    echo -e "\n  ${BLUE}==>${NC} Installing 'uv' (Python & PyTorch runtime manager)..."
+    if curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh; then
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    else
+        echo -e "  • Note: Could not reach astral.sh (offline/sandboxed); relying on local Python environment."
+    fi
+else
+    echo -e "  • Python Manager  : ${BOLD}uv detected${NC}"
+fi
+
+# 5. Installation Method: Check if local built binary exists or fetch from GitHub
 INSTALLED=false
 
 # Case A: Local repository checkout with pre-existing release binary
@@ -68,6 +82,12 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/target/release/$BINARY_NAME" ]; the
     echo -e "\n  ${BLUE}==>${NC} Installing from local target/release build..."
     cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    if [ -d "$SCRIPT_DIR/.venv" ]; then
+        mkdir -p "$HOME/.cache/trainaya/py_engine"
+        if [ ! -e "$HOME/.cache/trainaya/py_engine/.venv" ]; then
+            ln -s "$SCRIPT_DIR/.venv" "$HOME/.cache/trainaya/py_engine/.venv" 2>/dev/null || true
+        fi
+    fi
     INSTALLED=true
 fi
 
@@ -99,7 +119,7 @@ if [ "$INSTALLED" = false ]; then
     fi
 fi
 
-# 5. Check PATH environment
+# 6. Check PATH environment
 IN_PATH=false
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) IN_PATH=true ;;
@@ -114,11 +134,11 @@ if [ "$IN_PATH" = false ]; then
     export PATH="$INSTALL_DIR:$PATH"
 fi
 
-# 6. Verify Installation with doctor
+# 7. Verify Installation with doctor
 if command -v "$BINARY_NAME" >/dev/null 2>&1; then
     "$BINARY_NAME" doctor
 else
     "$INSTALL_DIR/$BINARY_NAME" doctor
 fi
 
-echo -e "${GREEN}${BOLD}🚀 All set! You can now run 'trainaya --help'${NC}\n"
+echo -e "${GREEN}${BOLD}🚀 All set! Run 'trainaya curate' or 'trainaya --help' to get started.${NC}\n"

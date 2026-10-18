@@ -1,10 +1,10 @@
 <div align="center">
   <h1>⚡ Trainaya</h1>
-  <p><strong>Rust CLI & Embedded PyTorch Engine for Adapting, Curating, Training, and Benchmarking System-1 Decision Models for <a href="https://github.com/SargeDev/ollaya">Ollaya</a> & <a href="https://ollama.com">Ollama</a></strong></p>
+  <p><strong>Rust CLI & Embedded PyTorch Engine for Adapting, Curating, Training, and Benchmarking System-1 Decision Models for <a href="https://github.com/solarpush/ollaya">Ollaya</a> & <a href="https://ollama.com">Ollama</a></strong></p>
 
   <p>
-    <a href="https://github.com/SargeDev/trainaya/releases"><img src="https://img.shields.io/github/v/release/SargeDev/trainaya?style=flat-square&color=blue" alt="Release"></a>
-    <a href="https://github.com/SargeDev/trainaya/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-green?style=flat-square" alt="License"></a>
+    <a href="https://github.com/solarpush/trainaya/releases"><img src="https://img.shields.io/github/v/release/solarpush/trainaya?style=flat-square&color=blue" alt="Release"></a>
+    <a href="https://github.com/solarpush/trainaya/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-green?style=flat-square" alt="License"></a>
     <img src="https://img.shields.io/badge/engine-Rust%20%2B%20uv%2FPyTorch%20%2B%20llama.cpp-orange?style=flat-square" alt="Engine">
     <img src="https://img.shields.io/badge/runtimes-Ollaya%20%26%20Ollama-purple?style=flat-square" alt="Runtimes">
   </p>
@@ -64,13 +64,13 @@ flowchart LR
 ### One-Liner Install (Linux & macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SargeDev/trainaya/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/solarpush/trainaya/main/install.sh | sh
 ```
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/SargeDev/trainaya.git
+git clone https://github.com/solarpush/trainaya.git
 cd trainaya
 cargo build --release
 ./target/release/trainaya doctor

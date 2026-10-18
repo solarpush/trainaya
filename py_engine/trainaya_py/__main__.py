@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -11,16 +12,58 @@ from typing import Any, Dict
 os.environ["GGML_CUDA_DISABLE_GRAPHS"] = "1"
 os.environ["GGML_CUDA_DISABLE_FUSION"] = "1"
 
+# Automatically attach local or cached .venv site-packages if running under system python3
+for venv_root in (
+    os.path.abspath(".venv"),
+    os.path.expanduser("~/.cache/trainaya/py_engine/.venv"),
+):
+    for sp in glob.glob(os.path.join(venv_root, "lib", "python*", "site-packages")):
+        if os.path.isdir(sp) and sp not in sys.path:
+            sys.path.insert(0, sp)
+
 
 def emit_event(payload: Dict[str, Any]) -> None:
     print("TRAINAYA_EVENT:" + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def cmd_doctor() -> int:
-    import onnx
-    import safetensors
-    import torch
-    import transformers
+    try:
+        import torch
+        torch_ver = getattr(torch, "__version__", "installed")
+        cuda_avail = torch.cuda.is_available()
+        cuda_dev = torch.cuda.get_device_name(0) if cuda_avail else None
+        vram_mb = (
+            int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
+            if cuda_avail
+            else 0
+        )
+        hip_ver = getattr(torch.version, "hip", None)
+        mps_avail = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    except Exception:
+        torch_ver = "not installed"
+        cuda_avail = False
+        cuda_dev = None
+        vram_mb = 0
+        hip_ver = None
+        mps_avail = False
+
+    try:
+        import transformers
+        tf_ver = getattr(transformers, "__version__", "installed")
+    except Exception:
+        tf_ver = "not installed"
+
+    try:
+        import onnx
+        onnx_ver = getattr(onnx, "__version__", "installed")
+    except Exception:
+        onnx_ver = "not installed"
+
+    try:
+        import safetensors
+        st_ver = getattr(safetensors, "__version__", "installed")
+    except Exception:
+        st_ver = "not installed"
 
     try:
         import laya  # noqa: F401
@@ -28,24 +71,14 @@ def cmd_doctor() -> int:
     except Exception:
         has_laya = False
 
-    cuda_avail = torch.cuda.is_available()
-    cuda_dev = torch.cuda.get_device_name(0) if cuda_avail else None
-    vram_mb = (
-        int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
-        if cuda_avail
-        else 0
-    )
-    hip_ver = getattr(torch.version, "hip", None)
-    mps_avail = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-
     emit_event(
         {
             "event": "doctor",
             "python_version": sys.version.split()[0],
-            "torch_version": torch.__version__,
-            "transformers_version": transformers.__version__,
-            "onnx_version": onnx.__version__,
-            "safetensors_version": safetensors.__version__,
+            "torch_version": torch_ver,
+            "transformers_version": tf_ver,
+            "onnx_version": onnx_ver,
+            "safetensors_version": st_ver,
             "laya_available": has_laya,
             "cuda_available": cuda_avail,
             "cuda_device": cuda_dev,

@@ -58,7 +58,33 @@ pub fn ensure_py_engine_dir() -> Result<PathBuf> {
     Ok(cache_engine)
 }
 
-/// Resolve the Python command (`./.venv/bin/python` if present, otherwise `uv run --project <dir> python`).
+/// Resolve `uv` binary in PATH, `~/.local/bin/uv`, or `~/.cargo/bin/uv`.
+fn find_installed_uv() -> Option<PathBuf> {
+    if Command::new("uv")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Some(PathBuf::from("uv"));
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    for candidate in [
+        Path::new(&home).join(".local/bin/uv"),
+        Path::new(&home).join(".cargo/bin/uv"),
+    ] {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Resolve the Python command (`./.venv/bin/python` if present, `uv run --project <dir> python`, or `/usr/bin/python3`).
 fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>) -> Result<Command> {
     let hw = crate::hardware::SystemHardware::detect();
     hw.apply_environment("auto");
@@ -82,8 +108,8 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
         Some(engine_venv)
     } else if parent_venv.exists() {
         Some(parent_venv)
-    } else if !uv_share.exists() && sys_python.exists() {
-        Some(sys_python)
+    } else if !uv_share.exists() && sys_python.exists() && find_installed_uv().is_none() {
+        Some(sys_python.clone())
     } else {
         None
     };
@@ -103,25 +129,54 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
         return Ok(cmd);
     }
 
-    let mut cmd = Command::new("uv");
-    cmd.arg("run")
-        .arg("--project")
-        .arg(engine_dir)
-        .arg("--torch-backend")
-        .arg(&torch_backend)
-        .arg("python")
-        .arg("-m")
-        .arg("trainaya_py")
-        .arg(subcmd);
-    if let Some(cfg) = cfg_arg {
-        cmd.arg("--config").arg(cfg);
+    let uv_bin = if let Some(u) = find_installed_uv() {
+        Some(u)
+    } else {
+        println!(
+            "  {} Bootstrapping 'uv' Python/PyTorch manager into ~/.local/bin/uv...",
+            "📦".cyan()
+        );
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg("curl -LsSf https://astral.sh/uv/install.sh | sh")
+            .status();
+        find_installed_uv()
+    };
+
+    if let Some(uv_bin) = uv_bin {
+        let mut cmd = Command::new(uv_bin);
+        cmd.arg("run")
+            .arg("--project")
+            .arg(engine_dir)
+            .arg("--torch-backend")
+            .arg(&torch_backend)
+            .arg("python")
+            .arg("-m")
+            .arg("trainaya_py")
+            .arg(subcmd);
+        if let Some(cfg) = cfg_arg {
+            cmd.arg("--config").arg(cfg);
+        }
+        cmd.env("PYTHONPATH", engine_dir);
+        cmd.env("UV_TORCH_BACKEND", &torch_backend);
+        cmd.env("GGML_CUDA_DISABLE_GRAPHS", "1");
+        cmd.env("GGML_CUDA_DISABLE_FUSION", "1");
+        for (k, v) in hw.get_environment_for_device("auto") {
+            cmd.env(k, v);
+        }
+        return Ok(cmd);
     }
+
+    let mut cmd = Command::new(&sys_python);
     cmd.env("PYTHONPATH", engine_dir);
-    cmd.env("UV_TORCH_BACKEND", &torch_backend);
     cmd.env("GGML_CUDA_DISABLE_GRAPHS", "1");
     cmd.env("GGML_CUDA_DISABLE_FUSION", "1");
     for (k, v) in hw.get_environment_for_device("auto") {
         cmd.env(k, v);
+    }
+    cmd.arg("-m").arg("trainaya_py").arg(subcmd);
+    if let Some(cfg) = cfg_arg {
+        cmd.arg("--config").arg(cfg);
     }
     Ok(cmd)
 }

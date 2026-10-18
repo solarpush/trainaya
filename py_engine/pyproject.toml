@@ -1,29 +1,21 @@
 [project]
 name = "trainaya-py"
 version = "0.3.0"
-description = "PyTorch training, calibration, and multi-architecture Ollaya model adaptation engine for Trainaya"
-requires-python = ">=3.12,<3.13"
+description = "Embedded PyTorch training, calibration, and multi-architecture GGUF/HF model adaptation engine for Trainaya"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
     "laya @ https://files.pythonhosted.org/packages/b5/fd/dd60f49451ef43af50c3fcd5d5d9b12aea590f5bcb9afb3e5ec5171b6fa6/laya-0.3.7.tar.gz",
-    "torch==2.14.*",
-    "transformers==5.17.*",
-    "tokenizers==0.23.*",
-    "safetensors>=0.8",
-    "onnx==1.23.*",
-    "onnxscript==0.7.*",
-    "onnxruntime==1.30.*",
-    "numpy>=2",
-    "pyarrow>=20",
+    "torch>=2.4",
+    "transformers>=4.45",
+    "tokenizers>=0.20",
+    "safetensors>=0.4",
+    "onnx>=1.16",
+    "onnxscript>=0.1",
+    "onnxruntime>=1.18",
+    "numpy>=1.26",
+    "pyarrow>=15.0",
 ]
 
 [tool.uv]
 package = false
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" }
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
