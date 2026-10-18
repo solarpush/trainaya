@@ -910,6 +910,14 @@ def _cached_hf_download(repo_id: str, filename: str, repo_type: str = "dataset")
         if os.path.exists("/tmp/open_jev_calibration.jsonl.gz"):
             return "/tmp/open_jev_calibration.jsonl.gz"
 
+    prefix = "datasets" if repo_type == "dataset" else "models"
+    snap_root = os.path.expanduser(f"~/.cache/huggingface/hub/{prefix}--{repo_id.replace('/', '--')}/snapshots")
+    if os.path.isdir(snap_root):
+        for snap in sorted(os.listdir(snap_root)):
+            cand = os.path.join(snap_root, snap, filename)
+            if os.path.exists(cand):
+                return cand
+
     from huggingface_hub import hf_hub_download
 
     try:

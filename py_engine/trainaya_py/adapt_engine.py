@@ -364,6 +364,19 @@ def _download_hf_file_direct(
     """Download a file from HuggingFace without requiring `huggingface_hub`."""
     import urllib.request
 
+    hf_snap_root = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{repo_id.replace('/', '--')}" / "snapshots"
+    if hf_snap_root.is_dir():
+        for snap in sorted(hf_snap_root.iterdir()):
+            cand = snap / filename
+            if cand.exists() and cand.stat().st_size > 1024 * 1024:
+                emit(
+                    {
+                        "event": "status",
+                        "message": f"Resolved '{filename}' from local HuggingFace cache ('{cand}').",
+                    }
+                )
+                return str(cand)
+
     cache_dir = Path.home() / ".cache" / "trainaya" / "models" / repo_id.replace("/", "--")
     cache_dir.mkdir(parents=True, exist_ok=True)
     dest_path = cache_dir / filename
