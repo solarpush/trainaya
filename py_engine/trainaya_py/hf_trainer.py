@@ -81,12 +81,22 @@ def run_generic_training_job(job: Dict[str, Any], emit: Callable[[Dict[str, Any]
     )
 
 
+def _find_ollaya_models_dir(custom_dir: Optional[str] = None) -> str:
+    if custom_dir and os.path.isdir(custom_dir):
+        return custom_dir
+    for candidate in (
+        "/usr/share/ollaya/.ollaya/models",
+        os.path.expanduser("~/.ollaya/models"),
+    ):
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.expanduser("~/.ollaya/models")
+
+
 def _run_gguf_calibration_and_adapter_job(
     job: Dict[str, Any], emit: Callable[[Dict[str, Any]], None]
 ) -> None:
     """Train/calibrate an Ollaya GGUF model (`winnow:*` or `.gguf`) using PyTorch on the GGUF output projection."""
-    from .laya_trainer import _find_ollaya_models_dir
-
     base_model = job["base_model"]
     output_dir = job["output_dir"]
     data_path = job["data_path"]

@@ -12,8 +12,6 @@ fn test_family_registry_lookup_and_detection() {
     // Direct lookup
     assert!(registry.get("winnow-v1").is_some());
     assert!(registry.get("kev-pointer-v1").is_some());
-    assert!(registry.get("nli-pairs-v1").is_some());
-    assert!(registry.get("laya-markers-v1").is_some());
     assert!(registry.get("llm-logits-v1").is_some());
 
     // Auto-detection by name pattern
@@ -25,11 +23,10 @@ fn test_family_registry_lookup_and_detection() {
     assert_eq!(kev.identifier(), "kev-pointer-v1");
     assert_eq!(kev.default_merge_mode(), MergeMode::NoMerge);
 
-    let nli = registry.detect_or_resolve("nli:deberta-v3", None).unwrap();
-    assert_eq!(nli.identifier(), "nli-pairs-v1");
-
-    let laya = registry.detect_or_resolve("laya:custom", None).unwrap();
-    assert_eq!(laya.identifier(), "laya-markers-v1");
+    let gguf = registry
+        .detect_or_resolve("ministral-8b.gguf", None)
+        .unwrap();
+    assert_eq!(gguf.identifier(), "llm-logits-v1");
 
     // Explicit override takes precedence
     let forced = registry
@@ -70,18 +67,13 @@ fn test_prompt_builders_formatting() {
         .unwrap();
     assert!(kev_prompt.text.contains("<|fim_prefix|>High memory"));
     assert!(kev_prompt.text.contains("<|fim_middle|>How should"));
-    assert!(kev_prompt.text.contains("<|box_start|>page_sre_immediate<|box_end|>"));
-    assert!(kev_prompt.text.contains("<|box_start|>silent_auto_ack<|box_end|>"));
+    assert!(kev_prompt
+        .text
+        .contains("<|box_start|>page_sre_immediate<|box_end|>"));
+    assert!(kev_prompt
+        .text
+        .contains("<|box_start|>silent_auto_ack<|box_end|>"));
     assert!(kev_prompt.text.ends_with("<|fim_suffix|>"));
-
-    // 3. NLI prompt builder (pairwise [SEP])
-    let nli_family = registry.get("nli-pairs-v1").unwrap();
-    let nli_prompt = nli_family
-        .create_prompt_builder()
-        .format_sample(&sample)
-        .unwrap();
-    assert!(nli_prompt.text.contains("[SEP]"));
-    assert!(nli_prompt.text.contains("silent_auto_ack"));
 }
 
 #[test]
@@ -93,11 +85,8 @@ fn test_decision_dataset_schema_loading() {
         let samples = DecisionDataset::load_samples(data_file, Some(schema_file)).unwrap();
         assert!(!samples.is_empty());
 
-        // Each input record creates samples for the schema questions (routing and is_breach)
         let first = &samples[0];
         assert!(!first.question.is_empty());
         assert!(!first.options.is_empty());
-        println!("Sample question: {}", first.question);
-        println!("Sample options: {:?}", first.options);
     }
 }

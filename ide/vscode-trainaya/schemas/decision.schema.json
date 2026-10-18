@@ -11,7 +11,7 @@
     },
     "layout": {
       "type": "string",
-      "enum": ["llm-logits-v1", "laya-markers-v1", "kev-pointer-v1"],
+      "enum": ["llm-logits-v1", "kev-pointer-v1"],
       "description": "Token/marker layout used by the decision model"
     },
     "family": {

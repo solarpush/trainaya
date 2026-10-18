@@ -1,11 +1,10 @@
 [project]
 name = "trainaya-py"
 version = "0.3.0"
-description = "Embedded PyTorch training, calibration, and multi-architecture GGUF/HF model adaptation engine for Trainaya"
+description = "Embedded PyTorch training, calibration, and multi-architecture GGUF/SafeTensors/ONNX model adaptation engine for Trainaya"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
-    "laya @ https://files.pythonhosted.org/packages/b5/fd/dd60f49451ef43af50c3fcd5d5d9b12aea590f5bcb9afb3e5ec5171b6fa6/laya-0.3.7.tar.gz",
     "torch>=2.4",
     "transformers>=4.45",
     "tokenizers>=0.20",

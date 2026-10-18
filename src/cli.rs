@@ -59,7 +59,7 @@ pub struct AdaptOpts {
     #[arg(short = 't', long = "target", alias = "tag")]
     pub target: String,
 
-    /// Target layout: 'auto', 'llm-logits-v1', 'laya-markers-v1', or 'kev-pointer-v1'
+    /// Target layout: 'auto', 'llm-logits-v1', or 'kev-pointer-v1'
     #[arg(long, default_value = "auto")]
     pub layout: String,
 
@@ -131,8 +131,8 @@ pub struct TrainOpts {
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
-    /// Hugging Face model repository identifier, Ollaya tag, or local directory
-    #[arg(long, default_value = "answerdotai/ModernBERT-base")]
+    /// Base model (Ollaya/Ollama tag, GGUF path, or HuggingFace Causal LLM repo)
+    #[arg(long, default_value = "winnow:e4b")]
     pub base: String,
 
     /// Path to dataset file (JSONL or CSV)
@@ -183,7 +183,7 @@ pub struct TrainOpts {
     #[arg(long)]
     pub lora_layers: Option<usize>,
 
-    /// Number of top encoder backbone layers to unfreeze during PyTorch end-to-end training
+    /// Number of top backbone layers to unfreeze during PyTorch end-to-end training
     #[arg(long)]
     pub unfreeze_layers: Option<usize>,
 
@@ -231,7 +231,7 @@ pub struct TrainOpts {
     #[arg(long)]
     pub seed: Option<u64>,
 
-    /// Optional model family identifier override (e.g. 'winnow-v1', 'kev-pointer-v1', 'nli-pairs-v1')
+    /// Optional model family identifier override (e.g. 'llm-logits-v1', 'winnow-v1', 'kev-pointer-v1')
     #[arg(long)]
     pub family: Option<String>,
 
@@ -280,7 +280,7 @@ impl TrainOpts {
             if let Some(data) = self.data {
                 args.data_path = data;
             }
-            if self.base != "answerdotai/ModernBERT-base" {
+            if self.base != "winnow:e4b" {
                 args.base_model = self.base;
             }
             if let Some(family) = self.family {

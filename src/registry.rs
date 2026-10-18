@@ -262,7 +262,7 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
         if is_gguf {
             "GGUF v3 (Decoder / Logits)"
         } else {
-            "SafeTensors / ONNX (Encoder)"
+            "SafeTensors / ONNX"
         },
     );
 
@@ -318,17 +318,7 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
     };
 
     // Resolve template manifest if available
-    let default_template = if is_gguf {
-        "winnow:e4b"
-    } else {
-        "laya:multilingual"
-    };
-    let raw_template = args.base_template.as_deref().unwrap_or(default_template);
-    let template_name = if raw_template.eq_ignore_ascii_case("laya:multimodal") {
-        "laya:multilingual"
-    } else {
-        raw_template
-    };
+    let template_name = args.base_template.as_deref().unwrap_or("winnow:e4b");
     let (tmpl_model, tmpl_tag) = parse_model_name(template_name);
 
     let mut template_manifest_path = manifests_base.join(&tmpl_model).join(&tmpl_tag);
@@ -383,7 +373,7 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
         } else {
             let fallback_cfg = serde_json::json!({
                 "model_format": if is_gguf { "gguf" } else { "onnx" },
-                "family": if is_gguf { "llm-logits" } else { "laya" },
+                "family": "llm-logits",
                 "context_length": 8192,
                 "languages": ["multilingual"],
             });

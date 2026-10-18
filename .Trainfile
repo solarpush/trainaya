@@ -1,8 +1,8 @@
 # .Trainfile — Declarative Training Recipe for Trainaya (uv + PyTorch Engine)
 # Run with: trainaya train
 
-# Base model: HuggingFace repo ID, local directory, or Ollaya/Ollama tag
-FROM answerdotai/ModernBERT-base
+# Base model: Ollaya/Ollama tag, GGUF path, or HuggingFace Causal LLM repo
+FROM winnow:e4b
 
 # Task type: 'decision' (choice / noul / score), 'classification', or 'nli'
 TASK decision

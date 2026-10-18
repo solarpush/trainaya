@@ -551,21 +551,10 @@ def adapt_model_to_ollaya(
     cfg = AutoConfig.from_pretrained(source)
     model_type = getattr(cfg, "model_type", "").lower()
 
-    is_encoder = (
-        model_type in ("modernbert", "bert", "roberta", "xlm-roberta", "deberta-v2", "electra")
-        or layout == "laya-markers-v1"
-    )
-    if is_encoder and layout in ("auto", "laya-markers-v1"):
-        return _adapt_hf_encoder_to_laya(
-            source=source,
-            output_dir=output_dir,
-            target_tag=target_tag,
-            data_path=data_path,
-            epochs=epochs,
-            lr=lr,
-            batch_size=batch_size,
-            device=device,
-            emit=emit,
+    if model_type in ("modernbert", "bert", "roberta", "xlm-roberta", "deberta-v2", "electra"):
+        raise ValueError(
+            f"Direct BERT/encoder architecture '{model_type}' is not supported. "
+            "Trainaya supports GGUF, ONNX, and Causal LLM SafeTensors architectures."
         )
 
     return _adapt_hf_causal_to_llm_logits(
@@ -936,89 +925,3 @@ def _adapt_hf_causal_to_llm_logits(
     )
     return decision
 
-
-def _adapt_hf_encoder_to_laya(
-    source: str,
-    output_dir: str,
-    target_tag: str,
-    data_path: Optional[str],
-    epochs: int,
-    lr: float,
-    batch_size: int,
-    device: str,
-    emit: Callable[[Dict[str, Any]], None],
-) -> Dict[str, Any]:
-    """Graft a Laya DecisionModel head onto a HuggingFace encoder and train it end-to-end."""
-    import torch
-    from laya.common import DecisionModel
-    from safetensors.torch import save_file
-    from transformers import AutoModel, AutoTokenizer
-
-    dev = "cuda" if (device in ("auto", "cuda") and torch.cuda.is_available()) else "cpu"
-    emit({"event": "status", "message": f"Grafting Laya decision head onto encoder '{source}' on {dev}..."})
-
-    tok = AutoTokenizer.from_pretrained(source)
-    enc = AutoModel.from_pretrained(source, attn_implementation="sdpa")
-    model = DecisionModel(enc, head_layers=2, n_act=2).to(dev)
-
-    if data_path and os.path.exists(data_path):
-        from .laya_trainer import train_laya_module
-
-        temps, _, _ = train_laya_module(
-            model=model,
-            tok=tok,
-            data_path=data_path,
-            epochs=epochs,
-            batch_size=batch_size,
-            lr=lr,
-            unfreeze_layers=6,
-            max_len=512,
-            head_max_len=192,
-            dev=dev,
-            emit=emit,
-        )
-    else:
-        temps = [1.0, 1.0, 1.0]
-
-    st_dict = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
-    save_file(st_dict, os.path.join(output_dir, "model.safetensors"))
-    tok.save_pretrained(output_dir)
-
-    decision = {
-        "engine": "onnx",
-        "family": "laya",
-        "layout": "laya-markers-v1",
-        "encoder": source,
-        "max_len": 512,
-        "head_max_len": 192,
-        "special_tokens": {
-            "cls": tok.cls_token_id or 0,
-            "sep": tok.sep_token_id or 1,
-            "mask": tok.mask_token_id or 4,
-            "pad": tok.pad_token_id or 0,
-            "mask_text": tok.mask_token or "<mask>",
-        },
-        "inputs": ["input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"],
-        "outputs": ["logits", "act_logits"],
-        "min_markers": 2,
-        "opset": 23,
-    }
-    calibration = {
-        "temperature": temps,
-        "temperature_by_options": {},
-    }
-    with open(os.path.join(output_dir, "decision.json"), "w", encoding="utf-8") as f:
-        json.dump(decision, f, indent=2)
-    with open(os.path.join(output_dir, "calibration.json"), "w", encoding="utf-8") as f:
-        json.dump(calibration, f, indent=2)
-
-    emit(
-        {
-            "event": "complete",
-            "layout": "laya-markers-v1",
-            "output_dir": output_dir,
-            "target_tag": target_tag,
-            "temperature": temps,
-        }
-    )
-    return decision

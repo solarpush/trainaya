@@ -65,12 +65,6 @@ def cmd_doctor() -> int:
     except Exception:
         st_ver = "not installed"
 
-    try:
-        import laya  # noqa: F401
-        has_laya = True
-    except Exception:
-        has_laya = False
-
     emit_event(
         {
             "event": "doctor",
@@ -79,7 +73,6 @@ def cmd_doctor() -> int:
             "transformers_version": tf_ver,
             "onnx_version": onnx_ver,
             "safetensors_version": st_ver,
-            "laya_available": has_laya,
             "cuda_available": cuda_avail,
             "cuda_device": cuda_dev,
             "vram_mb": vram_mb,
@@ -99,25 +92,9 @@ def _load_job_config(cfg_arg: str) -> Dict[str, Any]:
 
 def cmd_train(cfg_arg: str) -> int:
     job = _load_job_config(cfg_arg)
-    base_model = str(job.get("base_model", ""))
-    family = str(job.get("family") or "")
+    from .hf_trainer import run_generic_training_job
 
-    from .laya_trainer import resolve_ollaya_laya_manifest, run_laya_training_job
-
-    is_laya_manifest = False
-    if base_model.startswith("laya") or family == "laya-markers-v1":
-        try:
-            resolve_ollaya_laya_manifest(base_model, models_dir=job.get("models_dir"))
-            is_laya_manifest = True
-        except Exception:
-            is_laya_manifest = False
-
-    if is_laya_manifest:
-        run_laya_training_job(job, emit_event)
-    else:
-        from .hf_trainer import run_generic_training_job
-
-        run_generic_training_job(job, emit_event)
+    run_generic_training_job(job, emit_event)
     return 0
 
 

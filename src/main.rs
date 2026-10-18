@@ -124,10 +124,6 @@ fn run_doctor() -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let onnx_v = info.get("onnx_version").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let has_laya = info
-                .get("laya_available")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             let cuda = info
                 .get("cuda_available")
                 .and_then(|v| v.as_bool())
@@ -136,14 +132,6 @@ fn run_doctor() -> Result<()> {
             println!("    • Python Runtime        : {}", py_v.green().bold());
             println!("    • PyTorch Engine        : {}", torch_v.green().bold());
             println!("    • Transformers / ONNX   : {} / {}", tf_v.cyan(), onnx_v.cyan());
-            println!(
-                "    • Laya Reference SDK    : {}",
-                if has_laya {
-                    "Active (laya 0.3.7)".green().bold()
-                } else {
-                    "Not installed".yellow()
-                }
-            );
             let hip_ver = info.get("hip_version").and_then(|v| v.as_str());
             let vram_mb = info.get("vram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
             let accel_str = if cuda {

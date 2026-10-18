@@ -9,7 +9,7 @@ fn test_cli_train_command_parsing() {
         "trainaya",
         "train",
         "--base",
-        "answerdotai/ModernBERT-base",
+        "ministral:8b",
         "--data",
         "examples/sample_classification.jsonl",
         "--task",
@@ -31,7 +31,7 @@ fn test_cli_train_command_parsing() {
     let cli = Cli::try_parse_from(args).expect("Failed to parse CLI args");
     match cli.command {
         Commands::Train(opts) => {
-            assert_eq!(opts.base, "answerdotai/ModernBERT-base");
+            assert_eq!(opts.base, "ministral:8b");
             assert_eq!(opts.data, Some(PathBuf::from("examples/sample_classification.jsonl")));
             assert_eq!(opts.task, TaskType::Classification);
             assert_eq!(opts.epochs, Some(5));
@@ -57,7 +57,7 @@ fn test_cli_merge_command_parsing() {
         "trainaya",
         "merge",
         "--base",
-        "answerdotai/ModernBERT-base",
+        "ministral:8b",
         "--lora",
         "./custom_output",
         "--output-dir",
@@ -69,7 +69,7 @@ fn test_cli_merge_command_parsing() {
     let cli = Cli::try_parse_from(args).expect("Failed to parse CLI args");
     match cli.command {
         Commands::Merge(opts) => {
-            assert_eq!(opts.base, "answerdotai/ModernBERT-base");
+            assert_eq!(opts.base, "ministral:8b");
             assert_eq!(opts.lora, PathBuf::from("./custom_output"));
             assert_eq!(opts.output_dir, PathBuf::from("./merged_output"));
             assert_eq!(opts.device, "cpu");

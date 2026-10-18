@@ -19,9 +19,9 @@
 | Capability | Command | Description |
 | :--- | :--- | :--- |
 | **Use-Case Curation & Distillation** | `trainaya curate` | Interactive wizard and declarative `.Curatefile` engine that distills frontier Teacher Agents (`agy`, `claude`, `codex`, `gemini`, `ollama`, `ollaya`) to synthesize domain datasets or reformat raw CSV/JSONL/JSON/TXT files into calibrated training records. |
-| **Zero-Overhead Model Adaptation** | `trainaya adapt` | Converts causal GGUF LLMs (`Ministral`, `Gemma-3`, `Qwen`, `Llama`) or HuggingFace checkpoints (`ModernBERT`, `DeBERTa`, `Gemma-2`) into calibrated decision models (`llm-logits-v1` / `laya-markers-v1`) via untied output-head grafting, biorthogonal template projection, Fisher ARD kernel regression, and per-primitive temperature scaling. |
+| **Zero-Overhead Model Adaptation** | `trainaya adapt` | Converts causal GGUF LLMs (`Ministral`, `Gemma-3`, `Qwen`, `Llama`) or HuggingFace/SafeTensors/ONNX checkpoints into calibrated decision models (`llm-logits-v1` / `kev-pointer-v1`) via untied output-head grafting, biorthogonal template projection, Fisher ARD kernel regression, and per-primitive temperature scaling. |
 | **Dual Runtime Registration** | `trainaya register` | Zero-copy registration into **Ollaya**, **Ollama**, or **both** (`--runtime auto \| ollaya \| ollama \| both`) using hard-linked content-addressable blobs and a deterministic Nimble Go template (`temperature 0`, `num_predict 1`). |
-| **End-to-End Fine-Tuning** | `trainaya train` | Full encoder and LoRA/QLoRA fine-tuning driven by `.Trainfile` recipes with soft-target KL distillation and automatic semantic version tagging (`v{ patch + 1 }`). |
+| **End-to-End Fine-Tuning** | `trainaya train` | Full LoRA/QLoRA and projection fine-tuning driven by `.Trainfile` recipes with soft-target KL distillation and automatic semantic version tagging (`v{ patch + 1 }`). |
 | **Nimble Calibration Benchmark** | `trainaya bench` | Evaluates Macro Accuracy, Public Skill, Macro/Pooled ECE, Brier Score, and p50/p95 latency across the 13 [`bespokelabsai/nimble`](https://huggingface.co/datasets/bespokelabsai/nimble) (`bench.ollaya.dev`) decision subsets. |
 
 ---
@@ -41,7 +41,7 @@ flowchart LR
     end
 
     subgraph Adaptation ["2. Adaptation & Training"]
-        BASE["Base Model\n(GGUF LLM or HF Checkpoint)"]
+        BASE["Base Model\n(GGUF, ONNX, or SafeTensors)"]
         ADAPT["trainaya adapt / train\n(Biorthogonal Head + Fisher ARD + Calibration)"]
         BASE --> ADAPT
         DATA --> ADAPT
@@ -154,7 +154,7 @@ trainaya curate --non-interactive
 
 ## 2. Model Adaptation (`trainaya adapt`)
 
-`trainaya adapt` converts off-the-shelf GGUF causal LLMs (`Ministral`, `Gemma-3`, `Llama`, `Qwen`) or HuggingFace models into calibrated decision models (`llm-logits-v1` or `laya-markers-v1`):
+`trainaya adapt` converts off-the-shelf GGUF causal LLMs (`Ministral`, `Gemma-3`, `Llama`, `Qwen`) or HuggingFace SafeTensors models into calibrated decision models (`llm-logits-v1`):
 
 1. **Untied Output-Head Grafting**: When a GGUF checkpoint uses tied embeddings (`token_embd.weight` without a standalone `output.weight`, such as `Gemma-3` or `Ministral-3B`), Trainaya materializes an independent `F16` `output.weight` tensor so the 31 decision rows (`<A>`..`<Z>` and `0`..`4`) can be updated without altering backbone representations.
 2. **Biorthogonal Dual Template Basis (`U` & `U_s`)**: Projects out prompt-template prior biases across both the 26 categorical letter tokens (`<A>`..`<Z>`) and the 5 ordinal rubric tokens (`0`..`4`).
@@ -190,7 +190,7 @@ trainaya register \
   --runtime both
 ```
 
-- **Ollaya (`/v1/decide`)**: Links the GGUF/SafeTensors weights alongside `decision.json` and `calibration.json` for single-pass calibrated probability extraction over `<A>`..`<Z>` and `0`..`4`.
+- **Ollaya (`/v1/decide`)**: Links the GGUF/SafeTensors/ONNX weights alongside `decision.json` and `calibration.json` for single-pass calibrated probability extraction over `<A>`..`<Z>` and `0`..`4`.
 - **Ollama (`ollama run <tag>`)**: Emits an OCI manifest with a Go template matching the exact Ollaya/Nimble decision prompt format and deterministic single-token decoding parameters (`temperature 0`, `top_k 1`, `num_predict 1`).
 
 ---
@@ -226,11 +226,11 @@ trainaya bench --model push_ministral:8b --baseline winnow:e4b --limit 50
 
 ## 5. End-to-End Fine-Tuning (`trainaya train`)
 
-For encoder architectures (`answerdotai/ModernBERT-base`, `microsoft/deberta-v3-base`) or full PyTorch LoRA training, define a `.Trainfile` and run `trainaya train`:
+For fine-tuning GGUF or SafeTensors causal models with LoRA/projection alignment and temperature calibration, define a `.Trainfile` and run `trainaya train`:
 
 ```dockerfile
 # .Trainfile
-FROM answerdotai/ModernBERT-base
+FROM winnow:e4b
 TASK decision
 DATA ./data/curated_train.jsonl
 

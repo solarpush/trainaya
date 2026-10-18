@@ -39,7 +39,7 @@
     "prefix": ["trainfile", "TRAINFILE"],
     "body": [
       "# .Trainfile — End-to-End Fine-Tuning Recipe",
-      "FROM ${1:answerdotai/ModernBERT-base}",
+      "FROM ${1:winnow:e4b}",
       "TASK ${2|decision,classification,nli|}",
       "DATA ${3:./data/curated_train.jsonl}",
       "",
