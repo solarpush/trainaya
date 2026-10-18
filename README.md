@@ -1,405 +1,266 @@
-# Trainaya
+<div align="center">
+  <h1>⚡ Trainaya</h1>
+  <p><strong>Rust CLI & Embedded PyTorch Engine for Adapting, Curating, Training, and Benchmarking System-1 Decision Models for <a href="https://github.com/SargeDev/ollaya">Ollaya</a> & <a href="https://ollama.com">Ollama</a></strong></p>
 
-[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos-lightgrey.svg?style=flat-square)](https://github.com/solarpush/trainaya)
-[![CI](https://img.shields.io/github/actions/workflow/status/solarpush/trainaya/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/solarpush/trainaya/actions)
-
-A high-performance, native Rust toolchain for curating, fine-tuning, merging, and benchmarking edge decision and classification models for the [Ollaya](https://github.com/solarpush/ollaya) runtime.
-
-Zero Python runtime dependencies. Instant startup. Sub-millisecond SIMD kernels.
-
----
-
-## Architecture Overview
-
-```
-                       ┌────────────────────────┐
-                       │    Teacher Engines     │ (agy / claude / ollama)
-                       └───────────┬────────────┘
-                                   │ Multi-Teacher Consensus
-                                   ▼
- ┌──────────────┐          trainaya curate           ┌──────────────────────┐
- │ Raw Inputs   │ ─────────────────────────────────► │ Contrastive Dataset  │
- └──────────────┘          (.Curatefile)             │ + Counterfactuals    │
-        ▲                                            └──────────┬───────────┘
-        │                                                       │
-        │ EXPORT_FAILURES                                       ▼
-        │ (Mined Overconfident                       trainaya train / build
-        │  & Boundary Probes)                                (.Trainfile)
-        │                                                       │
- ┌──────┴───────┐          trainaya bench            ┌──────────▼───────────┐
- │ 13 Public    │ ◄───────────────────────────────── │ Calibrated Weights   │
- │ Benchmarks   │          (.Benchfile)              │ (LoRA + T* Scaling)  │
- └──────────────┘                                    └──────────────────────┘
-```
-
-- **Pure Rust Autograd & Calibration**: Built on [Candle](https://github.com/huggingface/candle) with live differentiable LoRA graph injection, dynamic length-bucketed batching, cosine/linear LR schedules, global L2 gradient clipping, and post-training Temperature Scaling ($T^*$) baked directly into output weights.
-- **Hardware-Vectorized Kernels (`src/quant/`)**:
-  - Multithreaded LoRA merge with AVX2, FMA, and NEON vectorization ($W_{\text{merged}} = W_{\text{base}} + \frac{\alpha}{r} B \cdot A$).
-  - 4-bit Normal Float 4 (`NF4`) quantization and dequantization.
-  - Symmetric INT8 matrix quantization for fast CPU inference.
-- **Multi-Family Support**:
-  - **Bidirectional Encoders**: ModernBERT, DeBERTa, BERT, RoBERTa (`laya`, `nli`).
-  - **Pointer / Causal Decoders**: Kev, Decider, Nimble (`kev-pointer-v1`).
-  - **GGUF Vocab Logit & VLM Backbones**: Winnow, Gemma 3/4, Qwen (`winnow-v1`, `llm-logits-v1`).
-- **Runtime Native Registration**: Direct registration into Ollaya's local manifest storage (`~/.ollaya/models/manifests/` or `/usr/share/ollaya/`).
+  <p>
+    <a href="https://github.com/SargeDev/trainaya/releases"><img src="https://img.shields.io/github/v/release/SargeDev/trainaya?style=flat-square&color=blue" alt="Release"></a>
+    <a href="https://github.com/SargeDev/trainaya/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-green?style=flat-square" alt="License"></a>
+    <img src="https://img.shields.io/badge/engine-Rust%20%2B%20uv%2FPyTorch%20%2B%20llama.cpp-orange?style=flat-square" alt="Engine">
+    <img src="https://img.shields.io/badge/runtimes-Ollaya%20%26%20Ollama-purple?style=flat-square" alt="Runtimes">
+  </p>
+</div>
 
 ---
 
-## Installation
+**Trainaya** is the unified model toolchain for the **Ollaya** ecosystem (and standard **Ollama**). It combines a single-binary **Rust CLI** with a self-bootstrapping **uv + PyTorch + `libllama.so.0` (ROCm / CUDA / Metal / CPU)** engine to turn raw domain use-cases and off-the-shelf foundation models into calibrated, single-forward-pass **System-1 Decision Models** (`choice`, `noul`, and `score`).
 
-### One-Line Install Script
+### ✨ Core Capabilities
 
-Installs the native prebuilt binary into `~/.local/bin` and runs self-diagnostics:
+- **🧭 Interactive Use-Case Curation & Teacher Distillation (`trainaya curate`)**: Describe your target Use-Case in free text, select a Teacher Agent (`agy`, `claude`, `codex`, `gemini`, `ollama:<model>`, `ollaya:<model>`, or multi-teacher consensus), and either **synthesize a complete tailored dataset + schema** or **reformat & distill an existing dataset** (`.jsonl`, `.csv`, `.json`, `.txt`) into ready-to-train decision records with calibrated soft target probabilities and counterfactual hard-negative twins.
+- **🧬 Zero-Overhead GGUF & HuggingFace Model Adaptation (`trainaya adapt`)**: Convert any GGUF causal LLM (`Ministral-8B`, `Ministral-3B`, `Gemma-3-4B`, `Qwen`, `Llama`) or HuggingFace model (`ModernBERT`, `DeBERTa`, `Gemma-2`) into a calibrated decision model (`llm-logits-v1` or `laya-markers-v1`) via **GGUF Untied Output Head Grafting**, **Biorthogonal Dual Template Basis (`U` & `U_s`)**, **Fisher ARD Kernel Projection**, and **Per-Primitive Temperature Scaling**.
+- **📦 Dual Zero-Copy Runtime Registration (`trainaya register`)**: Register adapted or fine-tuned models into **Ollaya**, **Ollama**, or **both simultaneously** (`--runtime auto | ollaya | ollama | both`) using zero-copy hard-linked blobs and an Ollama Go template aligned 100% with the Nimble/Ollaya decision prompt (`temperature 0`, `num_predict 1`).
+- **🏋️ Declarative End-to-End Fine-Tuning (`trainaya train`)**: Fine-tune encoder backbones (`ModernBERT`, `DeBERTa`) or LoRA/QLoRA adapters via `.Trainfile` recipes with soft-target KL distillation and dynamic version tags (`v{ patch + 1 }`).
+- **📊 13-Subset Nimble Benchmark & Calibration Scorecard (`trainaya bench`)**: Evaluate accuracy, Macro/Pooled ECE, Brier score, Public Skill, and p50/p95 latency across the 13 official [`bespokelabsai/nimble`](https://huggingface.co/datasets/bespokelabsai/nimble) (`bench.ollaya.dev`) benchmark subsets.
+
+---
+
+## 🏗️ End-to-End Workflow Architecture
+
+```mermaid
+flowchart LR
+    subgraph Curation ["1. Use-Case Curation (trainaya curate)"]
+        UC["Free-Text Use-Case\n(--use-case / Interactive Wizard)"]
+        RAW["Optional Raw Dataset\n(.csv / .jsonl / .json / .txt)"]
+        TEACH["Teacher Agent(s)\n(agy / claude / codex / ollama)"]
+        DATA["Curated Training Dataset\n(state + schema + soft targets + counterfactuals)"]
+        UC --> TEACH
+        RAW -.-> TEACH
+        TEACH --> DATA
+    end
+
+    subgraph Adaptation ["2. Adaptation & Training"]
+        BASE["Base Model\n(GGUF LLM or HF Checkpoint)"]
+        ADAPT["trainaya adapt / train\n(Biorthogonal Head + Fisher ARD + Calibration)"]
+        BASE --> ADAPT
+        DATA --> ADAPT
+    end
+
+    subgraph Deployment ["3. Dual Registration & Evaluation"]
+        REG["trainaya register\n(--runtime both)"]
+        OLLAYA["Ollaya Store\n(/v1/decide + Softmax Calibration)"]
+        OLLAMA["Ollama Store\n(Nimble Go Template + Single-Token Output)"]
+        BENCH["trainaya bench\n(13-Subset Nimble Scorecard)"]
+        ADAPT --> REG
+        REG --> OLLAYA
+        REG --> OLLAMA
+        OLLAYA --> BENCH
+    end
+```
+
+---
+
+## 📦 Installation & Diagnostics
+
+### One-Liner Install (Linux & macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/solarpush/trainaya/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SargeDev/trainaya/main/install.sh | sh
 ```
 
 ### Build from Source
 
-Requires Rust 1.85+ (2024 Edition):
-
 ```bash
-git clone https://github.com/solarpush/trainaya.git
+git clone https://github.com/SargeDev/trainaya.git
 cd trainaya
 cargo build --release
+./target/release/trainaya doctor
 ```
 
-The optimized binary is located at `./target/release/trainaya`.
-
-To build with GPU acceleration:
-```bash
-# NVIDIA CUDA
-cargo build --release --features cuda
-
-# Apple Silicon (Metal + Accelerate)
-cargo build --release --features metal,accelerate
-```
+On first execution of `trainaya doctor`, `trainaya adapt`, or `trainaya train`, Trainaya automatically provisions an isolated Python environment in `~/.cache/trainaya/py_engine` via `uv` and detects your hardware accelerator (AMD ROCm/HIP, NVIDIA CUDA, Apple Metal, or SIMD CPU).
 
 ---
 
-## The Three Declarative Files
+## 🧭 1. Interactive Use-Case Curation & Dataset Reformatting (`trainaya curate`)
 
-Trainaya operates via three declarative configuration files designed for reproducible, closed-loop machine learning pipelines.
+Instead of overfitting to benchmark test sets, `trainaya curate` starts from **your real-world Use-Case** and **distills a frontier Teacher Agent** to produce high-signal training data (with calibrated soft target distributions and counterfactual twins) ready for `trainaya adapt` or `trainaya train`.
 
-### 1. `.Curatefile` &mdash; Multi-Teacher Distillation & Counterfactual Twins
+### Option A: Launch the Interactive Wizard
 
-Distill raw data, re-annotate benchmark failures, or synthesize domain examples from one or more teacher engines (`agy`, `claude`, or local `ollama`). When multiple teachers are specified, Trainaya enforces strict consensus voting and automatically quarantines disagreements.
+Simply run `trainaya curate` (or `trainaya curate -i`) in your terminal:
+
+```bash
+trainaya curate
+```
+
+The interactive wizard guides you step by step:
+1. **Use-Case Description**: Explain in plain language what your final model must decide, domain constraints, and edge cases.
+2. **Workflow Mode**:
+   - `[1] synth`: Generate both the decision schema (`choice`, `noul`, or `score`) and a complete synthetic + counterfactual dataset directly from your Use-Case description.
+   - `[2] reformat`: Provide an existing raw dataset (`.jsonl`, `.csv`, `.tsv`, `.json`, `.txt`) and let the Teacher Agent reformat its columns/fields into structured `state` + `question` + `options` + calibrated `target` probabilities tailored to your Use-Case.
+   - `[3] augment`: Reformat an existing dataset and synthesize minimally perturbed **Counterfactual Twins** (`hard_negative` + `hard_negative_label`) where flipping one causal detail flips the decision.
+3. **Teacher Agent**: Pick from auto-detected local CLIs (`agy`, `claude`, `codex`, `gemini`), local daemons (`ollama:<model>`, `ollaya:<model>`), or multi-teacher consensus (`agy, claude`).
+4. **Save to `.Curatefile`**: Optionally persist your interactive answers into a reproducible `.Curatefile`.
+
+### Option B: CLI One-Liners
+
+```bash
+# 1. Synthesize a complete dataset & schema directly from a free-text Use-Case using 'agy'
+trainaya curate \
+  --use-case "Triage incoming SaaS support tickets into refund, technical_bug, billing_question, security_alert, or general" \
+  --teacher agy \
+  --mode synth \
+  --kind choice \
+  --count 100 \
+  --output ./data/support_triage.jsonl
+
+# 2. Reformat & distill an existing CSV/JSONL dataset for your Use-Case using 'claude'
+trainaya curate \
+  --use-case "Verify whether a clinical abstract's conclusion is directly supported by the reported trial results" \
+  --teacher claude \
+  --mode reformat \
+  --kind noul \
+  --input ./data/raw_clinical_notes.csv \
+  --output ./data/clinical_verified.jsonl
+```
+
+### Option C: Declarative `.Curatefile`
 
 ```dockerfile
-# Single teacher or comma-separated multi-teacher consensus
+# .Curatefile
+USE_CASE "Triage incoming customer support tickets into actionable routing categories (refund, technical_help, billing_question, security_incident, general)"
 TEACHER agy, claude
-
-# Operational mode: label, synth, or augment
-MODE augment
-
-# Target output format: decision, classification, or nli
+MODE synth
 FORMAT decision
+KIND choice
+OUTPUT ./data/curated_train.jsonl
+COUNT 50
 
-# Input and schema definitions
-INPUT ./data/raw_inputs.jsonl
-SCHEMA ./data/questions_schema.json
-OUTPUT ./data/curated_contrastive.jsonl
-
-# Execution parameters
 PARAMETER batch_size 10
 PARAMETER min_confidence 0.85
 PARAMETER add_hard_negatives true
 ```
 
-Run curation:
+Run non-interactively with:
 ```bash
-trainaya curate
+trainaya curate --non-interactive
 ```
-
-When `add_hard_negatives true` or `MODE augment` is active, each validated sample is paired with a minimally perturbed counterfactual twin carrying the verified opposite label. Predictions below `min_confidence` or rejected by multi-teacher disagreement are isolated in a `.quarantine.jsonl` file.
 
 ---
 
-### 2. `.Trainfile` &mdash; LoRA Fine-Tuning, Calibration & Packaging
+## 🧬 2. Adapting GGUF & HuggingFace Models (`trainaya adapt`)
 
-Define the training recipe, optimizer schedule, LoRA target layers, and automatic Ollaya model tag:
+`trainaya adapt` converts any standard GGUF causal LLM (`Ministral`, `Gemma-3`, `Llama`, `Qwen`) or HuggingFace model into a zero-overhead decision model (`llm-logits-v1` or `laya-markers-v1`) without requiring full-model backpropagation:
+
+1. **GGUF Untied Output Head Grafting**: If the source GGUF shares tied embeddings (`token_embd.weight` without `output.weight`, such as `Gemma-3` or `Ministral-3B`), Trainaya materializes an independent `F16` `output.weight` tensor so the 31 decision rows (`<A>`..`<Z>` and `0`..`4`) can be surgically replaced in-place while preserving 100% of the backbone weights.
+2. **Biorthogonal Dual Template Basis (`U` & `U_s`)**: Eliminates template-induced prior bias across both the 26 letter tokens (`<A>`..`<Z>`) and the 5 numeric rubric tokens (`0`..`4`) on arbitrary prompt formats.
+3. **Fisher-Preconditioned ARD Kernel Ridge**: Learns a non-linear Nyström RBF + polynomial decision head over `libllama.so.0` pre-final hidden states and distills it back into the exact rows of `output.weight`.
+4. **Per-Primitive Temperature Scaling**: Optimizes `T_choice`, `T_noul`, and `T_score` via NLL minimization and writes `calibration.json` + `decision.json`.
+
+```bash
+# Adapt a local GGUF or Ollaya/Ollama model and register into BOTH Ollaya and Ollama
+trainaya adapt \
+  --from ministral-8b.gguf \
+  -t push_ministral:8b \
+  --runtime both \
+  --output-dir ./output/push_ministral_8b
+
+# Adapt a model specialized on your curated Use-Case dataset
+trainaya adapt \
+  --from gemma-3-4b-it.gguf \
+  -t custom_triage:4b \
+  --data ./data/curated_train.jsonl \
+  --runtime both
+```
+
+---
+
+## 📦 3. Dual Registration for Ollaya & Ollama (`trainaya register`)
+
+Every adapted or trained model can be registered into **Ollaya**, **Ollama**, or **both** (`--runtime auto | ollaya | ollama | both`):
+
+```bash
+trainaya register \
+  --model ./output/push_ministral_8b \
+  --name push_ministral:8b \
+  --runtime both
+```
+
+- **In Ollaya (`/v1/decide`)**: Uses zero-copy hard-linked blobs (`model` + `decision.json` + `calibration.json`) to extract the exact log-probabilities over `<A>`..`<Z>` or `0`..`4` in a single forward pass.
+- **In Ollama (`ollama run <tag>`)**: Generates an OCI manifest with a Go template matching the exact Ollaya/Nimble prompt structure and deterministic single-token parameters (`temperature 0`, `top_k 1`, `num_predict 1`).
+
+---
+
+## 📊 4. Benchmarking on the 13 Nimble Subsets (`trainaya bench`)
+
+`trainaya bench` evaluates any Ollaya model across the 13 official [`bespokelabsai/nimble`](https://huggingface.co/datasets/bespokelabsai/nimble) (`bench.ollaya.dev`) subsets (`50` probes per subset, `650` probes total), computing **Macro Accuracy**, **Public Skill**, **Macro ECE**, **Pooled ECE**, **Brier Score**, and **p50/p95 Latency**:
+
+```bash
+# Full 13-subset Nimble scorecard vs winnow:e4b baseline
+trainaya bench --model push_ministral:8b --baseline winnow:e4b --limit 50
+```
+
+### Reference Benchmark Results (650 Probes — 13 Nimble Subsets)
+
+| Metric / Subset | Kind | `winnow:e4b` *(Reference)* | **`push_ministral:8b`** *(Adapted 8B)* | **`push_ministral:3b`** *(Adapted 3B)* | **`push_gemma3:4b`** *(Adapted 4B)* |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Macro Accuracy** | *All (13)* | `80.8%` | **`69.1%`** | **`66.9%`** | **`56.9%`** |
+| **Public Skill** | *0..100* | `70.1` | **`52.2`** | **`48.8`** | **`33.6`** |
+| **Macro ECE** *(↓ better)* | *Calib* | `0.133` | **`0.125`** ✅ | `0.165` | `0.219` |
+| **Pooled ECE** *(↓ better)* | *Calib* | `0.083` | **`0.046`** ✅ | `0.120` | `0.143` |
+| **Choice Family** | `choice` | `84.8%` | **`71.2%`** | **`68.8%`** | **`52.4%`** |
+| **Noul Family** | `noul` | `81.2%` | **`74.0%`** | **`72.0%`** | **`65.2%`** |
+| **Score Family** | `score` | `72.0%` | **`57.3%`** | **`55.3%`** | **`50.7%`** |
+| `boolq` | `noul` | `80.0%` | **`90.0%`** ✅ | `84.0%` ✅ | **`94.0%`** 🏆 |
+| `aegis2` | `noul` | `84.0%` | **`84.0%`** 🤝 | `82.0%` | `64.0%` |
+| `summeval-consistency` | `noul` | `78.0%` | **`80.0%`** ✅ | `76.0%` | **`78.0%`** 🤝 |
+| `massive-en-US` | `choice` | `82.0%` | `78.0%` | **`80.0%`** | `62.0%` |
+| `massive-de-DE` | `choice` | `82.0%` | **`80.0%`** | `72.0%` | `58.0%` |
+| `multinli` | `choice` | `84.0%` | `66.0%` | `60.0%` | **`74.0%`** |
+| **Latency (p50)** | *ms* | `44 ms` | `92 ms` | **`52 ms`** ⚡ | `72 ms` |
+
+---
+
+## 🏋️ 5. End-to-End Fine-Tuning (`trainaya train`)
+
+For encoder architectures (`answerdotai/ModernBERT-base`, `microsoft/deberta-v3-base`) or full PyTorch LoRA training, configure a `.Trainfile` and run `trainaya train`:
 
 ```dockerfile
-# Base foundation model (Hugging Face ID, Ollaya tag, or local directory)
-FROM winnow:e4b
-FAMILY winnow
+# .Trainfile
+FROM answerdotai/ModernBERT-base
 TASK decision
+DATA ./data/curated_train.jsonl
 
-# Training dataset
-DATA ./data/curated_contrastive.jsonl
-
-# Optimizer & schedule hyperparameters
-PARAMETER epochs 3
+PARAMETER epochs 8
 PARAMETER batch_size 8
-PARAMETER grad_accum 2
-PARAMETER lr 0.0001
-PARAMETER lr_scheduler cosine
-PARAMETER warmup_ratio 0.1
-PARAMETER max_grad_norm 1.0
+PARAMETER lr 1.5e-4
+PARAMETER max_length 512
 
-# LoRA architecture parameters
-PARAMETER lora_r 16
-PARAMETER lora_alpha 32.0
-PARAMETER lora_layers 8
-
-# Ollaya tag versioning (auto-increments: v1 -> v2 -> v3)
-TAG winnow:v{auto}
-
-# Weight merging and quantization
-MERGE true
-QUANT Q8_0
+OUTPUT ./output/{tag}
+REGISTER custom-decider:v{ patch + 1 }
 ```
-
-Execute training:
-```bash
-trainaya train -f .Trainfile
-```
-
-At the end of training, Trainaya restores the best validation checkpoint and runs a two-stage grid search to find the optimal calibration temperature $T^*$ minimizing NLL and 10-bin Expected Calibration Error (ECE). The $1/T^*$ factor is folded directly into the output layer weights prior to saving or merging.
-
----
-
-### 3. `.Benchfile` &mdash; Public Evaluation, Quality Gates & Failure Mining
-
-Run standardized benchmark suites against the Ollaya runtime `/v1/systemone` endpoint and export failure probes back into the curation loop:
-
-```dockerfile
-# Model under test (resolves latest trained version automatically)
-MODEL winnow:v{latest}
-
-# Baseline reference for side-by-side comparative A/B evaluation
-BASELINE winnow:e4b
-
-# Standard benchmark subsets
-SUBSETS multinli, paws, boolq, vitaminc-dev
-
-# Ollaya daemon endpoint
-URL http://127.0.0.1:11435
-
-# Results report and active-learning failure export
-OUTPUT ./results/bench_{model}_vs_{baseline}.json
-EXPORT_FAILURES ./data/failures_{model}.jsonl
-
-# Quality Gate assertion: fails build if overall accuracy drops below threshold
-THRESHOLD min_accuracy 0.80
-```
-
-Run benchmark:
-```bash
-trainaya bench -f .Benchfile
-```
-
----
-
-## CLI Reference
-
-### `trainaya doctor`
-Audits the host environment: CPU SIMD feature sets (AVX2, AVX-512, NEON, FMA), GPU accelerators (CUDA, ROCm/HIP, Metal, Vulkan), release status, and local Ollaya daemon connectivity.
 
 ```bash
-trainaya doctor
+trainaya train
 ```
 
 ---
 
-### `trainaya update`
-Checks GitHub Releases for newer versions and atomically upgrades the local `trainaya` binary in place.
+## 🛠️ CLI Reference Summary
 
-```bash
-# Check and install the latest release
-trainaya update
-
-# Only check for updates without installing
-trainaya update --check
-```
-
----
-
-### `trainaya curate`
-Labels raw datasets, synthesizes domain data, or generates counterfactual twins using single or multi-teacher consensus.
-
-```bash
-# Using .Curatefile (default)
-trainaya curate
-
-# Augment exported benchmark failures with multi-teacher consensus
-trainaya curate \
-  --teacher agy,claude \
-  --mode augment \
-  --input ./data/failures_winnow_v1.jsonl \
-  --schema ./data/schema.json \
-  --output ./data/curated.jsonl
-```
+| Command | Description |
+| :--- | :--- |
+| `trainaya curate` | Interactive wizard (or `.Curatefile` / CLI) to define a Use-Case, distill a Teacher Agent (`agy`, `claude`, `ollama`), and synthesize or reformat training data |
+| `trainaya adapt` | Adapt any GGUF or HuggingFace model into a calibrated decision model and register it into Ollaya/Ollama |
+| `trainaya train` | Fine-tune an encoder or LoRA decision model end-to-end from a `.Trainfile` or `--data` |
+| `trainaya register` | Zero-copy register a model directory or GGUF bundle into `ollaya`, `ollama`, or `both` |
+| `trainaya bench` | Run the 13-subset Nimble decision benchmark with calibration metrics and SHA-256 result caching |
+| `trainaya merge` | Permanently fuse LoRA adapter weights into base SafeTensors or GGUF weights |
+| `trainaya export` | Package a trained model into SafeTensors, GGUF, or ONNX with `decision.json` and `calibration.json` |
+| `trainaya doctor` | Inspect CPU/GPU hardware, ROCm/CUDA/Metal acceleration, and the embedded `uv` + PyTorch engine |
+| `trainaya update` | Self-update the `trainaya` binary from GitHub Releases |
 
 ---
 
-### `trainaya train`
-Executes local LoRA fine-tuning and post-training temperature calibration on CPU or GPU.
+## 📄 License
 
-```bash
-trainaya train \
-  --base "answerdotai/ModernBERT-base" \
-  --data "./data/train.jsonl" \
-  --task classification \
-  --epochs 3 \
-  --batch-size 8 \
-  --grad-accum 2 \
-  --lr 5e-5 \
-  --lr-scheduler cosine \
-  --warmup-ratio 0.1 \
-  --max-grad-norm 1.0 \
-  --lora-r 16 \
-  --lora-alpha 32.0 \
-  --output-dir "./output/adapter"
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--base` | `answerdotai/ModernBERT-base` | HF repo identifier, Ollaya tag, or local model path |
-| `--data` | *(required)* | Path to JSONL or CSV dataset |
-| `--task` | `classification` | Task type (`classification`, `nli`, `decision`) |
-| `--epochs` | `3` | Number of training epochs |
-| `--batch-size` | `8` | Micro-batch size per forward pass |
-| `--grad-accum` | `1` | Gradient accumulation steps |
-| `--lr` | `5e-5` | Peak AdamW learning rate |
-| `--lr-scheduler` | `cosine` | Schedule type (`cosine`, `linear`, `constant`) |
-| `--warmup-ratio` | `0.1` | Fraction of total steps used for linear LR warmup |
-| `--max-grad-norm` | `1.0` | Maximum global L2 gradient norm for clipping |
-| `--lora-r` | `16` | LoRA rank dimension |
-| `--lora-alpha` | `32.0` | LoRA scaling factor |
-| `--lora-layers` | `4` | Number of top transformer blocks targeted in GGUF models |
-| `--bf16` | `false` | Enable mixed-precision BF16 compute on supported GPUs |
-| `--device` | `auto` | Execution device (`auto`, `cpu`, `cuda`, `metal`, `rocm`) |
-| `--output-dir` | `./output_adapter` | Output directory for adapter weights |
-
----
-
-### `trainaya merge`
-Merges LoRA adapter weights directly into base model weights via SIMD vector kernels or `llama.cpp` GGUF fusion.
-
-```bash
-trainaya merge \
-  --base "answerdotai/ModernBERT-base" \
-  --lora "./output/adapter" \
-  --output-dir "./output/merged"
-```
-
----
-
-### `trainaya export`
-Packages merged models with optional INT8 / GGUF quantization and generates Ollaya runtime manifests.
-
-```bash
-# SafeTensors with INT8 quantization
-trainaya export \
-  --model "./output/merged" \
-  --format safetensors \
-  --quantize int8 \
-  --output-dir "./output/dist"
-
-# GGUF v3 format
-trainaya export \
-  --model "./output/merged" \
-  --format gguf \
-  --output-dir "./output/dist"
-```
-
----
-
-### `trainaya bench`
-Evaluates models against standard public decision datasets, computing Accuracy, Latency percentiles (p50/p95), and 10-bin Expected Calibration Error (ECE).
-
-```bash
-# Comparative A/B run with active-learning failure mining
-trainaya bench \
-  --model winnow:v1 \
-  --baseline winnow:e4b \
-  --export-failures ./data/failures_winnow_v1.jsonl
-
-# Specific subset run
-trainaya bench --model winnow:v1 --subsets boolq,paws,multinli
-```
-
-#### Included Reference Subsets (3,880 Human Probes)
-
-| Subset | Task | Target Type | Probe Fields |
-|---|---|---|---|
-| `vitaminc-dev` | Contrastive Claim Verification | Choice (3) | `claim`, `evidence` |
-| `massive-en-US` | Intent Routing (English) | Choice (18) | `utterance`, `locale` |
-| `massive-de-DE` | Intent Routing (German) | Choice (18) | `utterance`, `locale` |
-| `boolq` | Boolean Question Answering | Noul (Bool) | `passage`, `question` |
-| `squad2` | Unanswerability Detection | Noul (Bool) | `paragraph`, `question` |
-| `paws` | Paraphrase Identification | Noul (Bool) | `sentence_1`, `sentence_2` |
-| `multinli` | Natural Language Inference | Choice (3) | `premise`, `hypothesis` |
-| `civil_comments`| Toxicity & Safety Moderation | Noul (Bool) | `comment` |
-| `aegis2` | Guardrails & Prompt Injection | Noul (Bool) | `user_message` |
-| `helpsteer2` | Response Quality Evaluation | Score (0-4) | `prompt`, `response` |
-| `summeval-relevance` | Summary Relevance Assessment | Score (0-4) | `article`, `summary` |
-| `summeval-consistency` | Summary Factuality Checking | Score (0-4) | `article`, `summary` |
-| `pubmedqa` | Biomedical Question Answering | Choice (3) | `question`, `abstract` |
-
----
-
-## Dataset Formats
-
-### Single-Text Classification (`JSONL`)
-```jsonl
-{"text": "Production build succeeded without regressions.", "label": "positive"}
-{"text": "Memory leak detected in connection pool worker.", "label": "negative"}
-```
-
-### Sentence-Pair / NLI (`JSONL`)
-```jsonl
-{"premise": "Rust enforces memory safety at compile time.", "hypothesis": "The language avoids dangling pointers.", "label": "entailment"}
-{"premise": "The daemon process is running.", "hypothesis": "The port is closed and inactive.", "label": "contradiction"}
-```
-
-### Tabular Data (`CSV`)
-Columns are detected automatically (`text`, `sentence`, `premise` for inputs; `label`, `target`, `category` for targets).
-
----
-
-## External Tools & GGUF Support
-
-Trainaya's core autograd, LoRA training, and SafeTensors pipeline are 100% native Rust without external dependencies.
-
-For GGUF LoRA exporting and quantization on architectures requiring specialized GGUF manipulation (`llama-export-lora`, `llama-quantize`), Trainaya automatically discovers tools from:
-1. Environment variables (`LLAMA_EXPORT_LORA`, `LLAMA_QUANTIZE`, or `LLAMA_CPP_DIR`)
-2. Local build directory (`./vendor/llama.cpp/build/bin/`)
-3. Standard system PATH (`/usr/local/bin`, `/usr/bin`)
-
-To compile these optional GGUF binaries locally:
-```bash
-./scripts/setup_llama_cpp.sh
-```
-
----
-
-## Testing
-
-Run the test suite:
-
-```bash
-cargo test
-```
-
-The test suite covers:
-- `test_quant`: NF4 quantization/dequantization, INT8 quantization, and SIMD LoRA merge precision.
-- `test_dataset`: JSONL, CSV, and Decision schema loading, dynamic batch padding, and stratified train/val splits.
-- `test_lora`: Differentiable LoRA autograd graph injection, backward propagation, and weight updates.
-- `test_families`: Architecture family dispatch (`winnow`, `kev`, `laya`, `nli`) and prompt formatting.
-- `test_cli` & unit suites: `.Trainfile`, `.Curatefile`, `.Benchfile`, multi-teacher consensus, counterfactual twins, failure mining, and post-training Temperature Scaling ($T^*$).
-- `test_e2e_pipeline`: End-to-end training, adapter fusion, and SafeTensors/GGUF packaging.
-
----
-
-## License
-
-Licensed under either of:
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Dual-licensed under **MIT** or **Apache-2.0** at your option.

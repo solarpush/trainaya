@@ -1,24 +1,14 @@
-# ==============================================================================
-# .Benchfile: Declarative recipe for Ollaya Decision Benchmarks
-# ==============================================================================
+# .Benchfile — Declarative 13-Subset Nimble Benchmark Configuration
+# Run with: trainaya bench (or `trainaya bench --model push_ministral:8b`)
 
-# Target model to evaluate
-# Supports exact tags (winnow:custom) or dynamic resolution:
-#   winnow:v{latest} -> automatically resolves to the latest trained version (e.g. winnow:v1)
-MODEL winnow:v{latest}
-
-# Baseline reference model for comparative A/B testing
+MODEL push_ministral:8b
 BASELINE winnow:e4b
-
-# Subsets to evaluate (leave commented to evaluate all 13 public benchmark subsets)
-# SUBSETS multinli, paws, boolq, vitaminc-dev
 
 # Ollaya runtime endpoint
 URL http://127.0.0.1:11435
 
-# Output report path (expands {model}, {baseline}, {tag})
-OUTPUT ./results/bench_{model}_vs_{baseline}.json
+# Evaluate all 13 public benchmark subsets (or specify a comma-separated subset list)
+LIMIT 50
 
-# Export misclassified & overconfident probes for active learning with 'trainaya curate'
-EXPORT_FAILURES ./data/failures_{model}.jsonl
-
+# Save JSON scorecard report
+OUTPUT ./results/bench_{model}.json

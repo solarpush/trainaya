@@ -1,26 +1,34 @@
-# ==============================================================================
-# .Curatefile: Recette de composition et distillation de dataset
-# ==============================================================================
+# .Curatefile — Declarative Use-Case Dataset Curation & Teacher Distillation
+# Launch interactively with: trainaya curate
+# Or run non-interactively with: trainaya curate --non-interactive
 
-# Teacher Engine (utilise votre session locale 'agy' à zéro frais API)
+# 1. Free-text description of your target Use-Case and decision policy
+USE_CASE "Triage incoming customer support tickets and technical requests into actionable routing categories (refund, technical_help, billing_question, security_incident, general)"
+
+# 2. Teacher Agent(s) to distill ('agy', 'claude', 'codex', 'gemini', 'ollama:<model>', 'ollaya:<model>')
+#    Use comma-separated teachers (e.g. 'agy, claude') for multi-teacher consensus voting.
 TEACHER agy
 
-# Mode de curation : 'label' (annotation), 'synth' (synthèse), 'augment' (jumeaux contrefactuels)
-MODE augment
+# 3. Workflow Mode:
+#    - 'synth'    : Synthesize a tailored dataset & schema directly from USE_CASE
+#    - 'reformat' : Reformat & distill an existing dataset (INPUT) for this USE_CASE
+#    - 'augment'  : Reformat dataset + synthesize counterfactual hard-negative twins
+MODE synth
 
-# Format cible du dataset adapté à votre modèle (decision, classification, nli)
+# 4. Target Format & Decision Primitive ('choice', 'noul', 'score')
 FORMAT decision
+KIND choice
 
-# Données brutes ou erreurs extraites par 'trainaya bench'
-INPUT ./data/eval_probes.jsonl
+# Optional: Input dataset to reformat when MODE is 'reformat' or 'augment' (.jsonl, .csv, .json, .txt)
+# INPUT ./data/raw_tickets.csv
 
-# Schéma de décision et critères métier
-SCHEMA ./data/questions_schema.json
+# Optional: Explicit schema JSON file (if omitted, Teacher synthesizes it automatically from USE_CASE)
+# SCHEMA ./data/schema.json
 
-# Fichier de sortie prêt pour .Trainfile
-OUTPUT ./data/curated_from_teacher.jsonl
+# 5. Output training dataset (ready for `trainaya adapt --data` or `trainaya train --data`)
+OUTPUT ./data/curated_train.jsonl
+COUNT 50
 
-# Paramètres du Teacher (add_hard_negatives génère le jumeau inversé pour chaque exemple)
-PARAMETER batch_size 4
+PARAMETER batch_size 10
 PARAMETER min_confidence 0.85
 PARAMETER add_hard_negatives true

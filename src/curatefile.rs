@@ -1,22 +1,32 @@
-//! Curatefile: Declarative recipe for dataset curation, labeling, and synthetic generation
-//! using frontier models or CLI teacher engines (e.g., agy, claude, ollama).
+//! Curatefile: Declarative & interactive recipe for Use-Case dataset curation,
+//! raw dataset reformatting, and teacher agent distillation (e.g., agy, claude, codex, ollama).
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurateMode {
-    /// Annotate raw user text/events with gold labels and confidence
+    /// Reformat & distill raw user datasets (JSONL, CSV, JSON, TXT) with teacher labels and soft targets
     Label,
-    /// Generate synthetic examples directly from schema criteria
+    /// Synthesize a complete tailored dataset directly from a Use-Case description and/or schema
     Synth,
-    /// Paraphrase and generate contrastive hard-negatives
+    /// Reformat raw dataset and generate minimally perturbed counterfactual hard-negative twins
     Augment,
+}
+
+impl CurateMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CurateMode::Label => "reformat",
+            CurateMode::Synth => "synth",
+            CurateMode::Augment => "augment",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetDatasetFormat {
-    /// Decision dataset matching Ollaya (Winnow, Decider, Kev)
+    /// Decision dataset matching Ollaya & Trainaya (choice, noul, score with calibrated target distribution)
     Decision,
     /// Standard text classification (ModernBERT, BERT, DeBERTa)
     Classification,
@@ -26,19 +36,23 @@ pub enum TargetDatasetFormat {
 
 #[derive(Debug, Clone)]
 pub struct Curatefile {
-    /// Teacher engine (TEACHER): 'agy', 'claude', 'ollama:<model>', 'openai:<model>'
+    /// Free-text description of the final Use-Case, domain rules, and decision objective (USE_CASE)
+    pub use_case: Option<String>,
+    /// Teacher engine (TEACHER): 'agy', 'claude', 'codex', 'gemini', 'ollama:<model>', 'ollaya:<model>'
     pub teacher: String,
-    /// Curation mode (MODE): 'label', 'synth', 'augment'
+    /// Curation mode (MODE): 'reformat' (or 'label'), 'synth', 'augment'
     pub mode: CurateMode,
     /// Target dataset format (FORMAT): 'decision', 'classification', 'nli'
     pub format: TargetDatasetFormat,
-    /// Path to raw input data file (INPUT / DATA)
+    /// Decision primitive kind when synthesizing schema from Use-Case ('choice', 'noul', 'score')
+    pub kind: String,
+    /// Path to raw input dataset to reformat/distill (INPUT / DATA)
     pub input: Option<PathBuf>,
-    /// Path to question schema or policy criteria (SCHEMA)
+    /// Path to explicit question schema or policy criteria (SCHEMA)
     pub schema: Option<PathBuf>,
     /// Target output path for the curated dataset (OUTPUT)
     pub output: PathBuf,
-    /// Number of examples to generate in synth/augment mode (COUNT / LIMIT)
+    /// Number of examples to generate in synth mode (COUNT / LIMIT)
     pub count: usize,
     /// Batch size for teacher queries (PARAMETER batch_size)
     pub batch_size: usize,
@@ -46,14 +60,18 @@ pub struct Curatefile {
     pub min_confidence: f64,
     /// Generate hard-negative contrastive examples (PARAMETER add_hard_negatives)
     pub add_hard_negatives: bool,
+    /// Whether to run the interactive terminal wizard before executing
+    pub interactive: bool,
 }
 
 impl Default for Curatefile {
     fn default() -> Self {
         Self {
+            use_case: None,
             teacher: "agy".to_string(),
-            mode: CurateMode::Label,
+            mode: CurateMode::Synth,
             format: TargetDatasetFormat::Decision,
+            kind: "choice".to_string(),
             input: None,
             schema: None,
             output: PathBuf::from("./data/curated_train.jsonl"),
@@ -61,6 +79,7 @@ impl Default for Curatefile {
             batch_size: 10,
             min_confidence: 0.80,
             add_hard_negatives: true,
+            interactive: false,
         }
     }
 }
@@ -83,71 +102,110 @@ impl Curatefile {
                 None => (trimmed.to_uppercase(), ""),
             };
 
+            let unquoted = value.trim_matches('"').trim_matches('\'').trim();
+
             match directive.as_str() {
-                "TEACHER" | "ENGINE" => {
-                    cf.teacher = value.to_string();
+                "USE_CASE" | "USECASE" | "DESCRIPTION" | "DOMAIN" => {
+                    if !unquoted.is_empty() {
+                        cf.use_case = Some(unquoted.to_string());
+                    }
+                }
+                "TEACHER" | "ENGINE" | "AGENT" => {
+                    cf.teacher = unquoted.to_string();
                 }
                 "MODE" => {
-                    cf.mode = match value.to_lowercase().as_str() {
-                        "label" | "annotate" => CurateMode::Label,
+                    cf.mode = match unquoted.to_lowercase().as_str() {
+                        "reformat" | "distill" | "label" | "annotate" => CurateMode::Label,
                         "synth" | "synthetic" | "generate" => CurateMode::Synth,
                         "augment" | "contrastive" => CurateMode::Augment,
-                        _ => bail!("line {}: unknown MODE '{}'. Expected: label, synth, augment", line_num, value),
+                        _ => bail!(
+                            "line {}: unknown MODE '{}'. Expected: reformat, label, synth, augment",
+                            line_num,
+                            value
+                        ),
                     };
                 }
                 "FORMAT" | "TASK" => {
-                    cf.format = match value.to_lowercase().as_str() {
+                    let lower = unquoted.to_lowercase();
+                    cf.format = match lower.as_str() {
                         "decision" | "choice" | "noul" | "score" => TargetDatasetFormat::Decision,
                         "classification" | "text" => TargetDatasetFormat::Classification,
                         "nli" | "pair" | "pairs" => TargetDatasetFormat::Nli,
-                        _ => bail!("line {}: unknown FORMAT '{}'. Expected: decision, classification, nli", line_num, value),
+                        _ => bail!(
+                            "line {}: unknown FORMAT '{}'. Expected: decision, classification, nli",
+                            line_num,
+                            value
+                        ),
                     };
+                    if matches!(lower.as_str(), "choice" | "noul" | "score") {
+                        cf.kind = lower;
+                    }
+                }
+                "KIND" | "DECISION_TYPE" | "TYPE" => {
+                    let lower = unquoted.to_lowercase();
+                    match lower.as_str() {
+                        "choice" | "noul" | "score" => cf.kind = lower,
+                        _ => bail!(
+                            "line {}: unknown KIND '{}'. Expected: choice, noul, score",
+                            line_num,
+                            value
+                        ),
+                    }
                 }
                 "INPUT" | "DATA" => {
-                    if !value.is_empty() {
-                        cf.input = Some(resolve_path(base_dir, value));
+                    if !unquoted.is_empty() {
+                        cf.input = Some(resolve_path(base_dir, unquoted));
                     }
                 }
                 "SCHEMA" | "POLICY" => {
-                    if !value.is_empty() {
-                        cf.schema = Some(resolve_path(base_dir, value));
+                    if !unquoted.is_empty() {
+                        cf.schema = Some(resolve_path(base_dir, unquoted));
                     }
                 }
                 "OUTPUT" => {
-                    if !value.is_empty() {
-                        cf.output = resolve_path(base_dir, value);
+                    if !unquoted.is_empty() {
+                        cf.output = resolve_path(base_dir, unquoted);
                     }
                 }
                 "COUNT" | "LIMIT" => {
-                    cf.count = value
-                        .parse::<usize>()
-                        .with_context(|| format!("line {}: invalid integer for COUNT '{}'", line_num, value))?;
+                    cf.count = unquoted.parse::<usize>().with_context(|| {
+                        format!("line {}: invalid integer for COUNT '{}'", line_num, value)
+                    })?;
                 }
                 "PARAMETER" => {
-                    let (p_name, p_val) = value
-                        .split_once(char::is_whitespace)
-                        .ok_or_else(|| anyhow::anyhow!("line {}: PARAMETER requires 'name value'", line_num))?;
+                    let (p_name, p_val) = value.split_once(char::is_whitespace).ok_or_else(|| {
+                        anyhow::anyhow!("line {}: PARAMETER requires 'name value'", line_num)
+                    })?;
                     match p_name.trim().to_lowercase().as_str() {
                         "batch_size" | "batch" => {
-                            cf.batch_size = p_val.trim().parse::<usize>()
-                                .with_context(|| format!("line {}: invalid integer for batch_size", line_num))?;
+                            cf.batch_size = p_val.trim().parse::<usize>().with_context(|| {
+                                format!("line {}: invalid integer for batch_size", line_num)
+                            })?;
                         }
                         "min_confidence" | "confidence" => {
-                            cf.min_confidence = p_val.trim().parse::<f64>()
-                                .with_context(|| format!("line {}: invalid float for min_confidence", line_num))?;
+                            cf.min_confidence = p_val.trim().parse::<f64>().with_context(|| {
+                                format!("line {}: invalid float for min_confidence", line_num)
+                            })?;
                         }
                         "add_hard_negatives" | "hard_negatives" => {
                             cf.add_hard_negatives = match p_val.trim().to_lowercase().as_str() {
                                 "true" | "1" | "yes" => true,
                                 "false" | "0" | "no" => false,
-                                _ => bail!("line {}: invalid boolean for add_hard_negatives", line_num),
+                                _ => bail!(
+                                    "line {}: invalid boolean for add_hard_negatives",
+                                    line_num
+                                ),
                             };
                         }
                         _ => {}
                     }
                 }
                 _ => {
-                    bail!("line {}: unrecognized directive '{}' in Curatefile", line_num, directive);
+                    bail!(
+                        "line {}: unrecognized directive '{}' in Curatefile",
+                        line_num,
+                        directive
+                    );
                 }
             }
         }
@@ -161,6 +219,45 @@ impl Curatefile {
             .with_context(|| format!("Failed to read Curatefile at {:?}", path))?;
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
         Self::parse(&content, base_dir)
+    }
+
+    /// Render this configuration as a clean declarative `.Curatefile`
+    pub fn to_curatefile_string(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("# .Curatefile — Declarative Use-Case Dataset Curation & Teacher Distillation".to_string());
+        lines.push("# Run with: trainaya curate (interactive) or trainaya curate --non-interactive".to_string());
+        lines.push(String::new());
+        if let Some(ref uc) = self.use_case {
+            lines.push(format!("USE_CASE \"{}\"", uc.replace('"', "'")));
+        }
+        lines.push(format!("TEACHER {}", self.teacher));
+        lines.push(format!("MODE {}", self.mode.as_str()));
+        lines.push(format!(
+            "FORMAT {}",
+            match self.format {
+                TargetDatasetFormat::Decision => "decision",
+                TargetDatasetFormat::Classification => "classification",
+                TargetDatasetFormat::Nli => "nli",
+            }
+        ));
+        lines.push(format!("KIND {}", self.kind));
+        if let Some(ref inp) = self.input {
+            lines.push(format!("INPUT {}", inp.display()));
+        }
+        if let Some(ref sc) = self.schema {
+            lines.push(format!("SCHEMA {}", sc.display()));
+        }
+        lines.push(format!("OUTPUT {}", self.output.display()));
+        lines.push(format!("COUNT {}", self.count));
+        lines.push(String::new());
+        lines.push(format!("PARAMETER batch_size {}", self.batch_size));
+        lines.push(format!("PARAMETER min_confidence {:.2}", self.min_confidence));
+        lines.push(format!(
+            "PARAMETER add_hard_negatives {}",
+            self.add_hard_negatives
+        ));
+        lines.push(String::new());
+        lines.join("\n")
     }
 
     /// Return the list of configured teacher engines (supports comma-separated multi-teacher consensus)
@@ -196,9 +293,11 @@ mod tests {
     fn test_parse_curatefile_basic() {
         let content = r#"
 # Dataset curation configuration
+USE_CASE "Triage incoming customer support tickets into refund, technical_help, or billing_question"
 TEACHER agy
 MODE label
 FORMAT decision
+KIND choice
 INPUT ./data/raw.jsonl
 SCHEMA ./data/schema.json
 OUTPUT ./data/curated.jsonl
@@ -208,10 +307,15 @@ PARAMETER min_confidence 0.85
 PARAMETER add_hard_negatives true
 "#;
         let cf = Curatefile::parse(content, Path::new(".")).unwrap();
+        assert_eq!(
+            cf.use_case.as_deref(),
+            Some("Triage incoming customer support tickets into refund, technical_help, or billing_question")
+        );
         assert_eq!(cf.teacher, "agy");
         assert_eq!(cf.teachers(), vec!["agy".to_string()]);
         assert_eq!(cf.mode, CurateMode::Label);
         assert_eq!(cf.format, TargetDatasetFormat::Decision);
+        assert_eq!(cf.kind, "choice");
         assert_eq!(cf.input, Some(PathBuf::from("./data/raw.jsonl")));
         assert_eq!(cf.schema, Some(PathBuf::from("./data/schema.json")));
         assert_eq!(cf.output, PathBuf::from("./data/curated.jsonl"));
@@ -222,11 +326,13 @@ PARAMETER add_hard_negatives true
     }
 
     #[test]
-    fn test_parse_curatefile_multi_teacher() {
+    fn test_parse_curatefile_multi_teacher_and_reformat() {
         let content = r#"
+USE_CASE "Evaluate medical abstract claims against clinical trial evidence"
 TEACHER agy, claude, ollama:qwen2.5:72b
-MODE augment
+MODE reformat
 FORMAT decision
+KIND noul
 "#;
         let cf = Curatefile::parse(content, Path::new(".")).unwrap();
         assert_eq!(
@@ -237,6 +343,7 @@ FORMAT decision
                 "ollama:qwen2.5:72b".to_string()
             ]
         );
-        assert_eq!(cf.mode, CurateMode::Augment);
+        assert_eq!(cf.mode, CurateMode::Label);
+        assert_eq!(cf.kind, "noul");
     }
 }

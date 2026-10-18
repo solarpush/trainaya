@@ -1,6 +1,11 @@
-//! Dataset curation & teacher distillation engine.
-//! Supports single and multi-teacher consensus across CLI engines (agy, claude, ollama)
-//! to auto-label raw data, synthesize domain examples, and build counterfactual hard-negative twins.
+//! Interactive & Declarative Use-Case Dataset Curation, Raw Dataset Reformatting,
+//! and Teacher Agent Distillation Engine.
+//!
+//! Supports single and multi-teacher consensus across CLI agents (`agy`, `claude`, `codex`, `gemini`)
+//! and local daemons (`ollama:<model>`, `ollaya:<model>`) to:
+//! 1. Synthesize tailored decision schemas and datasets directly from a free-text Use-Case description.
+//! 2. Reformat arbitrary user datasets (`.jsonl`, `.csv`, `.json`, `.txt`) into canonical
+//!    Ollaya/Trainaya training records with calibrated soft target distributions and counterfactual twins.
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
@@ -8,13 +13,15 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::curatefile::{CurateMode, Curatefile, TargetDatasetFormat};
 
-fn deserialize_optional_usize<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
+fn deserialize_optional_usize<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -44,36 +51,62 @@ pub struct RawInputItem {
     pub premise: Option<String>,
     #[serde(default)]
     pub hypothesis: Option<String>,
-    /// Optional gold label (e.g., from exported benchmark failures or existing datasets)
-    #[serde(default, alias = "label")]
+    /// Optional existing label in the raw dataset (used as a hint or verified by the teacher)
+    #[serde(default, alias = "label", alias = "category", alias = "target")]
     pub gold_label: Option<String>,
-    /// Optional model misprediction (from 'trainaya bench --export-failures')
-    #[serde(default)]
-    pub predicted_label: Option<String>,
-    /// Optional model confidence on misprediction (from 'trainaya bench --export-failures')
-    #[serde(default)]
-    pub confidence: Option<f64>,
-    /// Optional failure severity tag (from 'trainaya bench --export-failures')
-    #[serde(default)]
-    pub failure_type: Option<String>,
+    /// Capture any arbitrary extra fields from user JSON/CSV rows so nothing is lost during reformatting
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl RawInputItem {
-    pub fn get_text(&self) -> String {
-        self.text
-            .clone()
-            .or_else(|| self.prompt.clone())
-            .or_else(|| self.utterance.clone())
-            .or_else(|| match (&self.premise, &self.hypothesis) {
-                (Some(p), Some(h)) => Some(format!("Premise: {} | Hypothesis: {}", p, h)),
-                (Some(p), None) => Some(p.clone()),
-                _ => None,
-            })
-            .or_else(|| self.state.as_ref().map(|s| s.to_string()))
-            .unwrap_or_default()
+    /// Return a structured or textual representation of the input state for the teacher & training record
+    pub fn get_state_value(&self) -> serde_json::Value {
+        if let Some(ref st) = self.state {
+            if !st.is_null() {
+                return st.clone();
+            }
+        }
+        if let (Some(p), Some(h)) = (&self.premise, &self.hypothesis) {
+            return serde_json::json!({
+                "premise": p,
+                "hypothesis": h
+            });
+        }
+        if let Some(ref t) = self.text {
+            return serde_json::Value::String(t.clone());
+        }
+        if let Some(ref p) = self.prompt {
+            return serde_json::Value::String(p.clone());
+        }
+        if let Some(ref u) = self.utterance {
+            return serde_json::Value::String(u.clone());
+        }
+        if !self.extra.is_empty() {
+            let mut map = serde_json::Map::new();
+            for (k, v) in &self.extra {
+                if !matches!(
+                    k.as_str(),
+                    "id" | "questions" | "gold_label" | "label" | "category"
+                ) {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+            if !map.is_empty() {
+                return serde_json::Value::Object(map);
+            }
+        }
+        serde_json::Value::String(String::new())
     }
 
-    /// Resolve per-item question and valid labels if embedded (e.g. from bench --export-failures), or fall back to global schema
+    pub fn get_text(&self) -> String {
+        match self.get_state_value() {
+            serde_json::Value::String(s) => s,
+            other => serde_json::to_string(&other).unwrap_or_default(),
+        }
+    }
+
+    /// Resolve per-item question and valid labels if embedded, or fall back to global schema
     pub fn resolve_item_schema(
         &self,
         default_question: &str,
@@ -99,6 +132,9 @@ pub struct TeacherAnnotation {
     pub confidence: f64,
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Optional cleaned/reformatted state produced by the teacher when reformatting messy raw data
+    #[serde(default, alias = "state", alias = "clean_state")]
+    pub reformatted_state: Option<serde_json::Value>,
     /// Minimally perturbed counterfactual state where flipping 1 causal fact flips the decision
     #[serde(
         default,
@@ -123,30 +159,54 @@ fn default_confidence() -> f64 {
 
 /// Extract the decision question instructions and ordered valid criteria labels from a schema JSON string
 pub fn extract_schema_metadata(schema_content: &str) -> (String, Vec<String>) {
+    let (_, question, valid_labels, _) = extract_full_schema_metadata(schema_content);
+    (question, valid_labels)
+}
+
+/// Extract `(kind, question, valid_labels, criteria_value)` from a schema JSON string
+pub fn extract_full_schema_metadata(
+    schema_content: &str,
+) -> (String, String, Vec<String>, serde_json::Value) {
     let default_question = "Classify the input according to policy criteria.".to_string();
     let parsed: serde_json::Value = match serde_json::from_str(schema_content) {
         Ok(v) => v,
-        Err(_) => return (default_question, Vec::new()),
+        Err(_) => {
+            return (
+                "choice".to_string(),
+                default_question,
+                Vec::new(),
+                serde_json::Value::Null,
+            )
+        }
     };
 
     let root = parsed
         .get("decision")
-        .or_else(|| {
-            parsed
-                .get("questions")
-                .and_then(|q| q.get("decision"))
-        })
+        .or_else(|| parsed.get("questions").and_then(|q| q.get("decision")))
         .unwrap_or(&parsed);
+
+    let kind = root
+        .get("type")
+        .or_else(|| root.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("choice")
+        .to_lowercase();
 
     let question = root
         .get("instructions")
         .or_else(|| root.get("question"))
+        .or_else(|| root.get("statement"))
         .and_then(|v| v.as_str())
         .unwrap_or("Classify the input according to policy criteria.")
         .to_string();
 
     let mut valid_labels = Vec::new();
-    if let Some(criteria) = root.get("criteria").or_else(|| root.get("options")) {
+    let mut criteria_val = serde_json::Value::Null;
+
+    if kind == "noul" {
+        valid_labels = vec!["false".to_string(), "true".to_string()];
+    } else if let Some(criteria) = root.get("criteria").or_else(|| root.get("options")) {
+        criteria_val = criteria.clone();
         match criteria {
             serde_json::Value::Object(map) => {
                 for k in map.keys() {
@@ -156,8 +216,7 @@ pub fn extract_schema_metadata(schema_content: &str) -> (String, Vec<String>) {
             serde_json::Value::Array(arr) => {
                 for (idx, item) in arr.iter().enumerate() {
                     if let Some(s) = item.as_str() {
-                        // If rubric levels like "Level 0: ...", use index string if > 2 items
-                        if s.to_lowercase().starts_with("level ") {
+                        if kind == "score" || s.to_lowercase().starts_with("level ") {
                             valid_labels.push(idx.to_string());
                         } else {
                             valid_labels.push(s.to_string());
@@ -171,7 +230,7 @@ pub fn extract_schema_metadata(schema_content: &str) -> (String, Vec<String>) {
         }
     }
 
-    (question, valid_labels)
+    (kind, question, valid_labels, criteria_val)
 }
 
 /// Resolve a guaranteed valid opposite/flipped label for a counterfactual twin example
@@ -182,11 +241,9 @@ pub fn resolve_counterfactual_label(
 ) -> Option<String> {
     let prim_trimmed = primary_label.trim();
 
-    // 1. If the teacher explicitly provided a flipped label that differs from primary_label, prefer it
     if let Some(cf_lbl) = explicit_cf_label {
         let cf_trimmed = cf_lbl.trim();
         if !cf_trimmed.is_empty() && !cf_trimmed.eq_ignore_ascii_case(prim_trimmed) {
-            // If valid_labels is non-empty, normalize case against valid_labels if possible
             if let Some(matched) = valid_labels
                 .iter()
                 .find(|v| v.eq_ignore_ascii_case(cf_trimmed))
@@ -197,7 +254,6 @@ pub fn resolve_counterfactual_label(
         }
     }
 
-    // 2. Otherwise pick the opposite label from schema's valid_labels
     if valid_labels.len() >= 2 {
         if let Some(opposite) = valid_labels
             .iter()
@@ -207,7 +263,6 @@ pub fn resolve_counterfactual_label(
         }
     }
 
-    // 3. Fallback canonical inversions for boolean / NLI primitives
     match prim_trimmed.to_lowercase().as_str() {
         "true" => Some("false".to_string()),
         "false" => Some("true".to_string()),
@@ -222,9 +277,6 @@ pub fn resolve_counterfactual_label(
 }
 
 /// Consolidate annotations from one or multiple teachers using strict consensus voting.
-/// - For 1 teacher: returns annotations as-is.
-/// - For 2 teachers: requires unanimous agreement; disagreement forces confidence = 0.0 (quarantine).
-/// - For >= 3 teachers: requires strict majority (> 50%); disagreement forces confidence = 0.0 (quarantine).
 pub fn consolidate_teacher_annotations(
     per_teacher: &[(String, Vec<TeacherAnnotation>)],
     batch_ids: &[usize],
@@ -252,7 +304,6 @@ pub fn consolidate_teacher_annotations(
         if votes.len() == 1 {
             let (t_name, single) = votes[0];
             let mut cloned = single.clone();
-            // Discount confidence slightly when other teachers failed to return an item
             cloned.confidence *= 0.85;
             cloned.reasoning = Some(format!(
                 "[Single response from {}]: {}",
@@ -263,7 +314,6 @@ pub fn consolidate_teacher_annotations(
             continue;
         }
 
-        // Group votes by lowercase label
         let mut label_groups: HashMap<String, Vec<(&str, &TeacherAnnotation)>> = HashMap::new();
         for (t_name, anno) in &votes {
             let norm_label = anno.label.trim().to_lowercase();
@@ -273,7 +323,6 @@ pub fn consolidate_teacher_annotations(
                 .push((*t_name, *anno));
         }
 
-        // Find winning label group
         let best_group = label_groups
             .values()
             .max_by(|a, b| {
@@ -303,6 +352,9 @@ pub fn consolidate_teacher_annotations(
             let agreement_ratio = (winning_votes as f64) / (total_votes as f64);
             let final_conf = (mean_conf * agreement_ratio).clamp(0.0, 1.0);
 
+            let best_state = best_group
+                .iter()
+                .find_map(|(_, a)| a.reformatted_state.clone());
             let best_hn = best_group
                 .iter()
                 .find_map(|(_, a)| a.hard_negative.clone().filter(|s| !s.trim().is_empty()));
@@ -323,11 +375,11 @@ pub fn consolidate_teacher_annotations(
                     vote_breakdown.join(", "),
                     best_group[0].1.reasoning.as_deref().unwrap_or("")
                 )),
+                reformatted_state: best_state,
                 hard_negative: best_hn,
                 hard_negative_label: best_hn_label,
             });
         } else {
-            // Disagreement -> force confidence = 0.0 so item is automatically quarantined
             consolidated.push(TeacherAnnotation {
                 id: item_id,
                 label: best_group[0].1.label.clone(),
@@ -336,6 +388,7 @@ pub fn consolidate_teacher_annotations(
                     "QUARANTINED (Multi-Teacher Disagreement): {}",
                     vote_breakdown.join(" vs ")
                 )),
+                reformatted_state: None,
                 hard_negative: None,
                 hard_negative_label: None,
             });
@@ -345,14 +398,47 @@ pub fn consolidate_teacher_annotations(
     consolidated
 }
 
-/// Execute teacher prompt using local CLI (agy, claude) or local Ollama daemon
+/// Detect installed CLI agents and running local model daemons to assist interactive teacher selection
+pub fn detect_available_teachers() -> Vec<String> {
+    let mut found = Vec::new();
+    for cli_bin in &["agy", "claude", "codex", "gemini"] {
+        if Command::new("which")
+            .arg(cli_bin)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            found.push((*cli_bin).to_string());
+        }
+    }
+    if ureq::get("http://127.0.0.1:11434/api/tags")
+        .timeout(std::time::Duration::from_millis(250))
+        .call()
+        .is_ok()
+    {
+        found.push("ollama:<model>".to_string());
+    }
+    if ureq::get("http://127.0.0.1:11435/api/tags")
+        .timeout(std::time::Duration::from_millis(250))
+        .call()
+        .is_ok()
+    {
+        found.push("ollaya:<model>".to_string());
+    }
+    if found.is_empty() {
+        found.push("agy".to_string());
+    }
+    found
+}
+
+/// Execute teacher prompt using local CLI (`agy`, `claude`, `codex`, `gemini`) or local daemon (`ollama:<model>`, `ollaya:<model>`)
 pub fn query_teacher(engine: &str, system_prompt: &str, user_prompt: &str) -> Result<String> {
     let combined_prompt = format!(
         "{}\n\nStrict requirement: Output ONLY valid raw JSON without any markdown code fences, headers, or explanations.\n\n{}",
         system_prompt, user_prompt
     );
 
-    let engine_lower = engine.to_lowercase();
+    let engine_lower = engine.trim().to_lowercase();
 
     if engine_lower == "agy" || engine_lower.starts_with("agy:") {
         let output = Command::new("agy")
@@ -375,7 +461,9 @@ pub fn query_teacher(engine: &str, system_prompt: &str, user_prompt: &str) -> Re
             .arg("-p")
             .arg(&combined_prompt)
             .output()
-            .with_context(|| "Failed to execute 'claude' CLI. Ensure 'claude' is installed in PATH.")?;
+            .with_context(|| {
+                "Failed to execute 'claude' CLI. Ensure 'claude' is installed in PATH."
+            })?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -384,19 +472,58 @@ pub fn query_teacher(engine: &str, system_prompt: &str, user_prompt: &str) -> Re
 
         let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(clean_json_output(&raw))
-    } else if engine_lower.starts_with("ollama:") {
-        let model = engine_lower.strip_prefix("ollama:").unwrap_or("llama3.3:70b");
+    } else if engine_lower == "codex" || engine_lower.starts_with("codex:") {
+        let output = Command::new("codex")
+            .arg("exec")
+            .arg(&combined_prompt)
+            .output()
+            .with_context(|| {
+                "Failed to execute 'codex' CLI. Ensure 'codex' is installed in PATH."
+            })?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("'codex' CLI exited with error: {}", err.trim());
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(clean_json_output(&raw))
+    } else if engine_lower == "gemini" || engine_lower.starts_with("gemini:") {
+        let output = Command::new("gemini")
+            .arg("-p")
+            .arg(&combined_prompt)
+            .output()
+            .with_context(|| {
+                "Failed to execute 'gemini' CLI. Ensure 'gemini' is installed in PATH."
+            })?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("'gemini' CLI exited with error: {}", err.trim());
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(clean_json_output(&raw))
+    } else if engine_lower.starts_with("ollama:") || engine_lower.starts_with("ollaya:") {
+        let is_ollaya = engine_lower.starts_with("ollaya:");
+        let model = if is_ollaya {
+            engine.trim()[7..].trim()
+        } else {
+            engine.trim()[7..].trim()
+        };
+        let port = if is_ollaya { 11435 } else { 11434 };
+        let endpoint = format!("http://127.0.0.1:{}/api/generate", port);
         let payload = serde_json::json!({
-            "model": model,
+            "model": if model.is_empty() { "llama3.3:70b" } else { model },
             "prompt": combined_prompt,
             "stream": false,
             "format": "json"
         });
 
-        let resp = ureq::post("http://127.0.0.1:11434/api/generate")
+        let resp = ureq::post(&endpoint)
             .set("Content-Type", "application/json")
             .send_json(&payload)
-            .with_context(|| "Failed to reach local Ollama daemon at http://127.0.0.1:11434")?;
+            .with_context(|| format!("Failed to reach local daemon at {}", endpoint))?;
 
         let res_json: serde_json::Value = resp.into_json()?;
         let resp_text = res_json["response"]
@@ -407,7 +534,7 @@ pub fn query_teacher(engine: &str, system_prompt: &str, user_prompt: &str) -> Re
         Ok(clean_json_output(&resp_text))
     } else {
         bail!(
-            "Unsupported teacher engine '{}'. Supported engines: 'agy' (default), 'claude', 'ollama:<model>'",
+            "Unsupported teacher engine '{}'. Supported engines: 'agy', 'claude', 'codex', 'gemini', 'ollama:<model>', 'ollaya:<model>'",
             engine
         );
     }
@@ -460,11 +587,161 @@ fn clean_json_output(raw: &str) -> String {
     if s.ends_with("```") {
         s = s.strip_suffix("```").unwrap_or(s);
     }
-    s.trim().to_string()
+    let s = s.trim();
+    // If teacher emitted leading commentary before '[' or '{', slice from the first JSON delimiter
+    if !s.starts_with('{') && !s.starts_with('[') {
+        if let Some(pos) = s.find(['{', '[']) {
+            return s[pos..].trim().to_string();
+        }
+    }
+    s.to_string()
 }
 
-/// Load raw input rows from file (supports JSONL, exported benchmark failure records, or plain text)
+/// Automatically synthesize a tailored Ollaya/Trainaya decision schema from a free-text Use-Case description
+pub fn synthesize_schema_from_use_case(
+    teacher: &str,
+    use_case: &str,
+    kind: &str,
+    sample_preview: Option<&str>,
+) -> Result<String> {
+    let preview_block = if let Some(prev) = sample_preview {
+        format!(
+            "\nSample raw input rows from the user's dataset:\n{}\n",
+            prev
+        )
+    } else {
+        String::new()
+    };
+
+    let system_prompt = format!(
+        "You are an expert Decision Schema Architect for Ollaya and Trainaya decision models.\n\
+         Design a crisp, non-overlapping decision schema tailored to the user's Use-Case.\n\
+         Requested decision primitive type: '{}'.\n\
+         - If type is 'choice': 'criteria' MUST be a JSON object mapping 2 to 8 snake_case category keys to clear 1-sentence boundary descriptions.\n\
+         - If type is 'noul': 'criteria' MUST be null, and 'instructions' MUST be a direct Yes/No verification question.\n\
+         - If type is 'score': 'criteria' MUST be a JSON array of 5 rubric strings ordered from index 0 (lowest) to index 4 (highest).\n\
+         Output strictly a JSON object matching:\n\
+         {{\"decision\": {{\"type\": \"{}\", \"instructions\": \"...\", \"criteria\": ...}}}}",
+        kind, kind
+    );
+
+    let user_prompt = format!(
+        "Target Use-Case Description:\n\"{}\"{}\nGenerate the JSON decision schema now.",
+        use_case, preview_block
+    );
+
+    let raw_schema = query_teacher(teacher, &system_prompt, &user_prompt)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw_schema)
+        .with_context(|| "Teacher returned invalid JSON while synthesizing decision schema")?;
+
+    let normalized = if parsed.get("decision").is_some() {
+        parsed
+    } else {
+        serde_json::json!({ "decision": parsed })
+    };
+
+    Ok(serde_json::to_string_pretty(&normalized)?)
+}
+
+/// Load raw input rows from `.jsonl`, `.json` array, `.csv` / `.tsv`, or `.txt`
 pub fn load_raw_inputs(path: &Path) -> Result<Vec<RawInputItem>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // 1. CSV / TSV support: parse header columns into structured `state` JSON objects
+    if ext == "csv" || ext == "tsv" {
+        let delimiter = if ext == "tsv" { b'\t' } else { b',' };
+        let mut rdr = csv::ReaderBuilder::new()
+            .delimiter(delimiter)
+            .flexible(true)
+            .from_path(path)
+            .with_context(|| format!("Opening CSV input at {:?}", path))?;
+
+        let headers: Vec<String> = rdr
+            .headers()?
+            .iter()
+            .map(|h| h.trim().to_string())
+            .collect();
+
+        let mut items = Vec::new();
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result?;
+            let mut state_map = serde_json::Map::new();
+            let mut gold_label = None;
+            let mut text_val = None;
+
+            for (col_idx, val) in record.iter().enumerate() {
+                let col_name = headers
+                    .get(col_idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("col_{}", col_idx));
+                let trimmed_val = val.trim();
+                if trimmed_val.is_empty() {
+                    continue;
+                }
+                let lower_col = col_name.to_lowercase();
+                if matches!(
+                    lower_col.as_str(),
+                    "label" | "gold_label" | "target" | "category" | "class"
+                ) {
+                    gold_label = Some(trimmed_val.to_string());
+                } else {
+                    if matches!(
+                        lower_col.as_str(),
+                        "text" | "prompt" | "utterance" | "input" | "message" | "body"
+                    ) && text_val.is_none()
+                    {
+                        text_val = Some(trimmed_val.to_string());
+                    }
+                    state_map.insert(
+                        col_name,
+                        serde_json::Value::String(trimmed_val.to_string()),
+                    );
+                }
+            }
+
+            let state = if state_map.len() == 1 && text_val.is_some() {
+                serde_json::Value::String(text_val.clone().unwrap())
+            } else {
+                serde_json::Value::Object(state_map)
+            };
+
+            items.push(RawInputItem {
+                id: Some(idx),
+                text: text_val,
+                state: Some(state),
+                questions: None,
+                prompt: None,
+                utterance: None,
+                premise: None,
+                hypothesis: None,
+                gold_label,
+                extra: HashMap::new(),
+            });
+        }
+        return Ok(items);
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Opening raw inputs at {:?}", path))?;
+    let trimmed_all = content.trim();
+
+    // 2. JSON array (`[...]`) support
+    if trimmed_all.starts_with('[') {
+        if let Ok(mut arr) = serde_json::from_str::<Vec<RawInputItem>>(trimmed_all) {
+            for (idx, item) in arr.iter_mut().enumerate() {
+                if item.id.is_none() {
+                    item.id = Some(idx);
+                }
+            }
+            return Ok(arr);
+        }
+    }
+
+    // 3. JSONL or plain text lines
     let file = File::open(path).with_context(|| format!("Opening raw inputs at {:?}", path))?;
     let reader = BufReader::new(file);
     let mut items = Vec::new();
@@ -476,7 +753,6 @@ pub fn load_raw_inputs(path: &Path) -> Result<Vec<RawInputItem>> {
             continue;
         }
 
-        // Support either JSONL object or plain text line
         if trimmed.starts_with('{') {
             if let Ok(mut item) = serde_json::from_str::<RawInputItem>(trimmed) {
                 if item.id.is_none() {
@@ -487,7 +763,6 @@ pub fn load_raw_inputs(path: &Path) -> Result<Vec<RawInputItem>> {
             }
         }
 
-        // Plain text fallback
         items.push(RawInputItem {
             id: Some(idx),
             text: Some(trimmed.to_string()),
@@ -498,64 +773,308 @@ pub fn load_raw_inputs(path: &Path) -> Result<Vec<RawInputItem>> {
             premise: None,
             hypothesis: None,
             gold_label: None,
-            predicted_label: None,
-            confidence: None,
-            failure_type: None,
+            extra: HashMap::new(),
         });
     }
 
     Ok(items)
 }
 
+fn prompt_line(prompt_label: &str, default_val: Option<&str>) -> Result<String> {
+    let mut stdout = io::stdout();
+    if let Some(def) = default_val {
+        if !def.is_empty() {
+            print!("  {} [{}]: ", prompt_label, def.cyan());
+        } else {
+            print!("  {}: ", prompt_label);
+        }
+    } else {
+        print!("  {}: ", prompt_label);
+    }
+    stdout.flush()?;
+
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        Ok(default_val.unwrap_or("").to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+/// Interactive terminal wizard guiding the user through Use-Case definition, teacher selection, and dataset curation/reformatting
+pub fn run_interactive_wizard(cf: &mut Curatefile) -> Result<()> {
+    println!(
+        "\n  {} {}",
+        "🧭".cyan().bold(),
+        "Interactive Use-Case Curation & Teacher Distillation Wizard"
+            .bold()
+            .white()
+    );
+    println!(
+        "  {}",
+        "Define your target Use-Case, pick a Teacher Agent (agy, claude, ollama...), and synthesize or reformat a training dataset."
+            .dimmed()
+    );
+
+    // 1. Free-text Use-Case description
+    println!(
+        "\n  {} {}",
+        "1.".cyan().bold(),
+        "Describe your final Use-Case (domain context, decision rules, what the model must decide):"
+            .bold()
+    );
+    let current_uc = cf.use_case.clone().unwrap_or_else(|| {
+        "Classify incoming user requests or documents into actionable domain decisions".to_string()
+    });
+    let uc_input = prompt_line("Use-Case Description", Some(&current_uc))?;
+    if !uc_input.is_empty() {
+        cf.use_case = Some(uc_input);
+    }
+
+    // 2. Workflow Mode
+    println!(
+        "\n  {} {}",
+        "2.".cyan().bold(),
+        "Select Curation Workflow:".bold()
+    );
+    println!(
+        "     {} {} — Generate a tailored dataset & schema from your Use-Case",
+        "[1]".green().bold(),
+        "synth".bold()
+    );
+    println!(
+        "     {} {} — Reformat & distill an existing dataset (.jsonl, .csv, .json, .txt) for this Use-Case",
+        "[2]".cyan().bold(),
+        "reformat".bold()
+    );
+    println!(
+        "     {} {} — Reformat dataset + synthesize counterfactual hard-negative twins",
+        "[3]".purple().bold(),
+        "augment".bold()
+    );
+    let default_mode_choice = match cf.mode {
+        CurateMode::Synth => "1",
+        CurateMode::Label => "2",
+        CurateMode::Augment => "3",
+    };
+    let mode_choice = prompt_line("Choice (1/2/3)", Some(default_mode_choice))?;
+    cf.mode = match mode_choice.trim().to_lowercase().as_str() {
+        "1" | "synth" | "generate" => CurateMode::Synth,
+        "2" | "reformat" | "label" | "distill" => CurateMode::Label,
+        "3" | "augment" | "contrastive" => CurateMode::Augment,
+        _ => cf.mode,
+    };
+
+    // 3. Input Dataset (if reformat or augment)
+    if matches!(cf.mode, CurateMode::Label | CurateMode::Augment) {
+        println!(
+            "\n  {} {}",
+            "3.".cyan().bold(),
+            "Path to raw dataset to reformat (.jsonl, .csv, .tsv, .json, .txt):".bold()
+        );
+        let default_inp = cf
+            .input
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "./data/raw.jsonl".to_string());
+        let inp_str = prompt_line("Input dataset path", Some(&default_inp))?;
+        if !inp_str.is_empty() {
+            cf.input = Some(PathBuf::from(inp_str));
+        }
+    }
+
+    // 4. Teacher Agent Selection
+    let detected = detect_available_teachers();
+    println!(
+        "\n  {} {} (detected: {})",
+        "4.".cyan().bold(),
+        "Select Teacher Agent(s) to distill (comma-separated for multi-teacher consensus):".bold(),
+        detected.join(", ").green()
+    );
+    let teacher_input = prompt_line("Teacher Agent", Some(&cf.teacher))?;
+    if !teacher_input.is_empty() {
+        cf.teacher = teacher_input;
+    }
+
+    // 5. Decision Primitive Type & Optional Schema
+    println!(
+        "\n  {} {}",
+        "5.".cyan().bold(),
+        "Decision Primitive Kind ('choice' = multi-option, 'noul' = yes/no verification, 'score' = 0..4 rubric):"
+            .bold()
+    );
+    let kind_input = prompt_line("Decision Kind", Some(&cf.kind))?;
+    if matches!(
+        kind_input.to_lowercase().as_str(),
+        "choice" | "noul" | "score"
+    ) {
+        cf.kind = kind_input.to_lowercase();
+    }
+
+    let default_schema = cf
+        .schema
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let schema_input = prompt_line(
+        "Optional explicit Schema JSON path (leave empty to auto-generate from Use-Case)",
+        Some(&default_schema),
+    )?;
+    if schema_input.trim().is_empty() {
+        cf.schema = None;
+    } else {
+        cf.schema = Some(PathBuf::from(schema_input));
+    }
+
+    // 6. Sample Count (for synth) & Output Path
+    if cf.mode == CurateMode::Synth {
+        let count_str = prompt_line("Number of samples to synthesize", Some(&cf.count.to_string()))?;
+        if let Ok(c) = count_str.parse::<usize>() {
+            cf.count = c.max(1);
+        }
+    }
+
+    let out_default = cf.output.to_string_lossy().to_string();
+    let out_input = prompt_line("Output dataset path (.jsonl)", Some(&out_default))?;
+    if !out_input.is_empty() {
+        cf.output = PathBuf::from(out_input);
+    }
+
+    let save_cf = prompt_line("Save this recipe to .Curatefile? (y/n)", Some("y"))?;
+    if save_cf.to_lowercase().starts_with('y') {
+        let cf_path = Path::new(".Curatefile");
+        std::fs::write(cf_path, cf.to_curatefile_string())?;
+        println!(
+            "  {} Saved curation recipe to {}",
+            "✓".green().bold(),
+            cf_path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Execute curation pipeline
-pub fn run_curate(cf: Curatefile) -> Result<()> {
-    crate::utils::print_banner("Ollaya Dataset Curation & Distillation");
+pub fn run_curate(mut cf: Curatefile) -> Result<()> {
+    crate::utils::print_banner("Use-Case Dataset Curation & Teacher Distillation");
+
+    if cf.interactive && io::stdin().is_terminal() {
+        run_interactive_wizard(&mut cf)?;
+    }
 
     let teachers = cf.teachers();
-    println!("  {} Curation Configuration:", "🔬".cyan().bold());
+    println!("\n  {} Curation Configuration:", "🔬".cyan().bold());
+    if let Some(ref uc) = cf.use_case {
+        println!("    • Use-Case          : {}", uc.bold().white());
+    }
     if teachers.len() > 1 {
         println!(
-            "    • Teacher Consensus : {} ({} engines voting)",
+            "    • Teacher Consensus : {} ({} agents voting)",
             teachers.join(" + ").bold().green(),
             teachers.len()
         );
     } else {
-        println!("    • Teacher Engine    : {}", cf.teacher.bold().green());
+        println!("    • Teacher Agent     : {}", cf.teacher.bold().green());
     }
-    println!("    • Curation Mode     : {:?}", cf.mode);
-    println!("    • Target Format     : {:?}", cf.format);
+    println!(
+        "    • Workflow Mode     : {} ({:?})",
+        cf.mode.as_str().bold().cyan(),
+        cf.mode
+    );
+    println!("    • Target Format     : {:?} ({})", cf.format, cf.kind);
     if let Some(ref inp) = cf.input {
-        println!("    • Raw Input Data    : {:?}", inp);
+        println!("    • Raw Input Dataset : {:?}", inp);
     } else {
-        println!("    • Raw Input Data    : None (Pure Synthetic Generation)");
-    }
-    if let Some(ref sc) = cf.schema {
-        println!("    • Criteria Schema   : {:?}", sc);
+        println!("    • Raw Input Dataset : None (Direct Use-Case Synthesis)");
     }
     println!("    • Batch Size        : {}", cf.batch_size);
     println!("    • Min Confidence    : {:.0}%", cf.min_confidence * 100.0);
-    println!("    • Counterfactuals   : {}", if cf.add_hard_negatives { "Enabled (Twin Pairs)".green() } else { "Disabled".yellow() });
+    println!(
+        "    • Counterfactuals   : {}",
+        if cf.add_hard_negatives {
+            "Enabled (Contrastive Twin Pairs)".green()
+        } else {
+            "Disabled".yellow()
+        }
+    );
     println!("    • Output Target     : {:?}", cf.output);
 
-    // Read schema if provided
+    // Pre-load raw items if in Reformat/Label or Augment mode so we can show a preview to the schema generator if needed
+    let preloaded_items = if matches!(cf.mode, CurateMode::Label | CurateMode::Augment) {
+        let input_path = cf.input.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "MODE '{}' requires an INPUT dataset file path (via --input, Curatefile, or interactive wizard)",
+                cf.mode.as_str()
+            )
+        })?;
+        let items = load_raw_inputs(input_path)?;
+        if items.is_empty() {
+            bail!("Raw input dataset at {:?} is empty.", input_path);
+        }
+        Some(items)
+    } else {
+        None
+    };
+
+    // Resolve or synthesize decision schema from Use-Case
     let schema_content = if let Some(ref sc_path) = cf.schema {
+        println!("    • Decision Schema   : {:?}", sc_path);
         std::fs::read_to_string(sc_path)
             .with_context(|| format!("Reading schema at {:?}", sc_path))?
+    } else if let Some(ref uc) = cf.use_case {
+        println!(
+            "    • Decision Schema   : {}",
+            "Auto-synthesizing from Use-Case via Teacher Agent...".cyan()
+        );
+        let sample_preview = preloaded_items.as_ref().map(|items| {
+            let preview_vec: Vec<serde_json::Value> = items
+                .iter()
+                .take(3)
+                .map(|it| it.get_state_value())
+                .collect();
+            serde_json::to_string_pretty(&preview_vec).unwrap_or_default()
+        });
+        let generated_schema = synthesize_schema_from_use_case(
+            &teachers[0],
+            uc,
+            &cf.kind,
+            sample_preview.as_deref(),
+        )?;
+        let schema_out_path = cf.output.with_extension("schema.json");
+        if let Some(parent) = schema_out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let _ = std::fs::write(&schema_out_path, &generated_schema);
+        println!(
+            "    • Generated Schema  : Saved to {:?}",
+            schema_out_path
+        );
+        generated_schema
     } else {
         serde_json::json!({
             "decision": {
-                "type": "choice",
-                "instructions": "Classify the input into appropriate domain category",
+                "type": cf.kind,
+                "instructions": "Classify the input into the appropriate domain category.",
                 "criteria": {
-                    "general": "General category",
-                    "urgent": "Urgent attention required"
+                    "general": "Standard or routine domain request",
+                    "priority": "Requires priority attention or specialized handling"
                 }
             }
         })
         .to_string()
     };
 
-    let (schema_question, valid_labels) = extract_schema_metadata(&schema_content);
+    let (schema_kind, schema_question, valid_labels, schema_criteria) =
+        extract_full_schema_metadata(&schema_content);
+    let effective_kind = if !schema_kind.is_empty() {
+        schema_kind
+    } else {
+        cf.kind.clone()
+    };
 
     if let Some(parent) = cf.output.parent() {
         if !parent.as_os_str().is_empty() {
@@ -575,29 +1094,25 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
     let mut total_quarantined = 0;
     let mut class_distribution: HashMap<String, usize> = HashMap::new();
 
+    let use_case_context = cf
+        .use_case
+        .as_deref()
+        .map(|uc| format!("Target Use-Case: \"{}\"\n", uc))
+        .unwrap_or_default();
+
     match cf.mode {
         CurateMode::Label | CurateMode::Augment => {
             let is_augment = cf.mode == CurateMode::Augment;
-            let input_path = cf.input.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "MODE '{:?}' requires an INPUT file path in Curatefile or --input",
-                    cf.mode
-                )
-            })?;
-
-            let raw_items = load_raw_inputs(input_path)?;
-            if raw_items.is_empty() {
-                bail!("Raw input dataset at {:?} is empty.", input_path);
-            }
+            let raw_items = preloaded_items.unwrap();
 
             println!(
-                "\n  {} Loaded {} input rows for {}...",
+                "\n  {} Loaded {} raw input records for {}...",
                 "📂".cyan(),
                 raw_items.len(),
                 if is_augment {
-                    "counterfactual twin augmentation"
+                    "Use-Case reformatting + counterfactual twin distillation"
                 } else {
-                    "annotation"
+                    "Use-Case reformatting & teacher distillation"
                 }
             );
 
@@ -609,39 +1124,33 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                     .progress_chars("━╾─"),
             );
 
-            let system_prompt = if is_augment {
-                format!(
-                    "You are a SOTA Decision Model Counterfactual Architect.\n\
-                     Default policy criteria (unless overridden by per-item 'valid_labels' / 'question'):\n\
-                     {}\n\n\
-                     For each input item (which may include 'gold_label', 'predicted_label', 'question', and 'valid_labels'),\n\
-                     verify the true 'label' (MUST be one of the item's 'valid_labels' if provided, and should match 'gold_label' if present)\n\
-                     and generate a minimally perturbed Counterfactual Twin ('hard_negative') where\n\
-                     changing ONLY ONE causal fact in the text genuinely flips the decision to a different class ('hard_negative_label') from 'valid_labels'.\n\
-                     Output a JSON array of objects with keys:\n\
-                     - 'id': integer matching input id\n\
-                     - 'label': verified true label matching the item's valid_labels\n\
-                     - 'confidence': float between 0.0 and 1.0\n\
-                     - 'reasoning': short causal explanation\n\
-                     - 'hard_negative': minimally modified text that flips the decision\n\
-                     - 'hard_negative_label': the flipped target label (must be a valid label different from 'label')",
-                    schema_content
-                )
-            } else {
-                format!(
-                    "You are an expert dataset annotator and classifier.\n\
-                     Your task is to assign the single most accurate label to each input item based on these policy criteria:\n\
-                     {}\n\n\
-                     For each input, output a JSON array of objects with keys:\n\
-                     - 'id': integer matching input id\n\
-                     - 'label': string matching one of the criteria keys (or the item's 'valid_labels' if present)\n\
-                     - 'confidence': float between 0.0 and 1.0\n\
-                     - 'reasoning': short rationale\n\
-                     - 'hard_negative': optional minimally perturbed counterfactual text that flips the label\n\
-                     - 'hard_negative_label': the flipped criteria key for 'hard_negative'",
-                    schema_content
-                )
-            };
+            let system_prompt = format!(
+                "You are a SOTA Decision Dataset Reformatter and Teacher Distiller.\n\
+                 {}\
+                 Decision Schema:\n\
+                 {}\n\n\
+                 For each raw input item:\n\
+                 1. Assign the single most accurate 'label' from the schema's valid_labels ({:?}). If 'existing_label' is present, map or verify it against valid_labels.\n\
+                 2. Estimate a calibrated probability 'confidence' in [0.50, 0.99] reflecting how unambiguous the decision is.\n\
+                 3. Optionally provide 'reformatted_state' if the raw input state needs cleaning/structuring for training (otherwise omit or keep null).\n\
+                 4. {} provide a minimally perturbed Counterfactual Twin ('hard_negative') where changing ONLY ONE causal fact in the input genuinely flips the decision to 'hard_negative_label'.\n\
+                 Output ONLY a JSON array of objects with keys:\n\
+                 - 'id': integer matching input id\n\
+                 - 'label': string matching one of valid_labels\n\
+                 - 'confidence': float between 0.0 and 1.0\n\
+                 - 'reasoning': concise rationale\n\
+                 - 'reformatted_state': optional cleaned string or JSON object\n\
+                 - 'hard_negative': minimally modified state text that flips the decision\n\
+                 - 'hard_negative_label': the flipped target label from valid_labels",
+                use_case_context,
+                schema_content,
+                valid_labels,
+                if is_augment || cf.add_hard_negatives {
+                    "Always"
+                } else {
+                    "Optionally"
+                }
+            );
 
             for chunk in raw_items.chunks(cf.batch_size.max(1)) {
                 let mut batch_ids = Vec::with_capacity(chunk.len());
@@ -655,18 +1164,12 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                             it.resolve_item_schema(&schema_question, &valid_labels);
                         let mut obj = serde_json::json!({
                             "id": id,
-                            "text": it.get_text(),
+                            "state": it.get_state_value(),
                             "question": item_q,
                             "valid_labels": item_labels,
                         });
                         if let Some(ref gl) = it.gold_label {
-                            obj["gold_label"] = serde_json::json!(gl);
-                        }
-                        if let Some(ref pl) = it.predicted_label {
-                            obj["predicted_label"] = serde_json::json!(pl);
-                        }
-                        if let Some(ref ft) = it.failure_type {
-                            obj["failure_type"] = serde_json::json!(ft);
+                            obj["existing_label"] = serde_json::json!(gl);
                         }
                         obj
                     })
@@ -678,44 +1181,48 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
 
                 for anno in annotations {
                     let source_item = chunk.iter().find(|c| c.id == Some(anno.id));
-                    let text = source_item.map(|c| c.get_text()).unwrap_or_default();
+                    let final_state = anno
+                        .reformatted_state
+                        .clone()
+                        .filter(|v| !v.is_null())
+                        .or_else(|| source_item.map(|c| c.get_state_value()))
+                        .unwrap_or_else(|| serde_json::Value::String(String::new()));
+
                     let (item_question, item_valid_labels) = source_item
                         .map(|c| c.resolve_item_schema(&schema_question, &valid_labels))
                         .unwrap_or_else(|| (schema_question.clone(), valid_labels.clone()));
 
-                    // If augmenting benchmark failures that already carry a verified gold_label, ensure primary_label belongs to item_valid_labels
-                    let primary_label = if let Some(gl) = source_item.and_then(|c| c.gold_label.as_deref()) {
-                        if !item_valid_labels.is_empty()
-                            && !item_valid_labels
-                                .iter()
-                                .any(|v| v.eq_ignore_ascii_case(anno.label.trim()))
-                        {
-                            gl.to_string()
+                    let primary_label =
+                        if let Some(gl) = source_item.and_then(|c| c.gold_label.as_deref()) {
+                            if !item_valid_labels.is_empty()
+                                && !item_valid_labels
+                                    .iter()
+                                    .any(|v| v.eq_ignore_ascii_case(anno.label.trim()))
+                            {
+                                gl.to_string()
+                            } else {
+                                anno.label.clone()
+                            }
                         } else {
                             anno.label.clone()
-                        }
-                    } else {
-                        anno.label.clone()
-                    };
+                        };
 
                     if anno.confidence >= cf.min_confidence {
-                        let src_pred = source_item.and_then(|c| c.predicted_label.as_deref());
-                        let src_conf = source_item.and_then(|c| c.confidence);
-                        write_formatted_row_with_schema(
+                        write_curated_record(
                             &mut out_file,
                             cf.format,
-                            &text,
+                            &effective_kind,
+                            &final_state,
                             &primary_label,
+                            anno.confidence,
                             &item_question,
                             &item_valid_labels,
-                            src_pred,
-                            src_conf,
+                            &schema_criteria,
+                            cf.use_case.as_deref(),
                         )?;
                         *class_distribution.entry(primary_label.clone()).or_insert(0) += 1;
                         total_accepted += 1;
 
-                        // Emit verified Counterfactual Twin if enabled or in Augment mode,
-                        // unless it would cancel out a mined failure correction by pairing high-overlap text with the model's over-predicted wrong label
                         if cf.add_hard_negatives || is_augment {
                             if let Some(hn_text) = anno.hard_negative.as_deref() {
                                 if !hn_text.trim().is_empty() {
@@ -724,36 +1231,31 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                                         anno.hard_negative_label.as_deref(),
                                         &item_valid_labels,
                                     ) {
-                                        let cancels_failure = src_pred
-                                            .map(|pl| pl.eq_ignore_ascii_case(&flipped_label))
-                                            .unwrap_or(false)
-                                            && token_overlap_ratio(&text, hn_text) > 0.45;
-                                        if !cancels_failure {
-                                            write_formatted_row_with_schema(
-                                                &mut out_file,
-                                                cf.format,
-                                                hn_text.trim(),
-                                                &flipped_label,
-                                                &item_question,
-                                                &item_valid_labels,
-                                                None,
-                                                None,
-                                            )?;
-                                            *class_distribution
-                                                .entry(flipped_label)
-                                                .or_insert(0) += 1;
-                                            total_accepted += 1;
-                                            total_counterfactuals += 1;
-                                        }
+                                        let hn_state =
+                                            serde_json::Value::String(hn_text.trim().to_string());
+                                        write_curated_record(
+                                            &mut out_file,
+                                            cf.format,
+                                            &effective_kind,
+                                            &hn_state,
+                                            &flipped_label,
+                                            anno.confidence.clamp(0.85, 0.96),
+                                            &item_question,
+                                            &item_valid_labels,
+                                            &schema_criteria,
+                                            cf.use_case.as_deref(),
+                                        )?;
+                                        *class_distribution.entry(flipped_label).or_insert(0) += 1;
+                                        total_accepted += 1;
+                                        total_counterfactuals += 1;
                                     }
                                 }
                             }
                         }
                     } else {
-                        // Quarantine low-confidence or teacher-disagreed rows for review
                         let quar_item = serde_json::json!({
-                            "text": text,
-                            "predicted_label": anno.label,
+                            "state": final_state,
+                            "candidate_label": anno.label,
                             "confidence": anno.confidence,
                             "reasoning": anno.reasoning,
                         });
@@ -763,13 +1265,14 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                     pb.inc(1);
                 }
             }
-            pb.finish_with_message("Curation batch processing complete.");
+            pb.finish_with_message("Dataset reformatting & teacher distillation complete.");
         }
         CurateMode::Synth => {
             println!(
-                "\n  {} Synthesizing {} training records from schema criteria...",
+                "\n  {} Synthesizing {} Use-Case training records via {}...",
                 "✨".cyan().bold(),
-                cf.count
+                cf.count,
+                teachers[0].bold().green()
             );
 
             let pb = ProgressBar::new(cf.count as u64);
@@ -781,26 +1284,25 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
             );
 
             let system_prompt = format!(
-                "You are an expert synthetic data generator for SOTA System-1 decision models.\n\
-                 Based on the policy criteria:\n\
+                "You are an expert synthetic dataset architect for SOTA System-1 decision models.\n\
+                 {}\
+                 Based on the decision schema:\n\
                  {}\n\n\
-                 Generate balanced, highly realistic, nuanced training examples covering each category.\n\
-                 Include boundary cases, negations, domain jargon, and optionally a minimally perturbed counterfactual twin.\n\
-                 Return a JSON array of objects with keys:\n\
-                 - 'text': realistic input state\n\
-                 - 'label': string matching one of the criteria keys\n\
-                 - 'confidence': float between 0.0 and 1.0\n\
-                 - 'hard_negative': optional minimally perturbed counterfactual state that flips the label\n\
-                 - 'hard_negative_label': optional flipped criteria key",
-                schema_content
+                 Generate balanced, realistic, domain-authentic training examples covering all valid options ({:?}).\n\
+                 Include subtle boundary cases, negations, realistic formatting, and a minimally perturbed counterfactual twin ('hard_negative' + 'hard_negative_label') where flipping one causal detail flips the decision.\n\
+                 Return ONLY a JSON array of objects with keys:\n\
+                 - 'text': realistic input state (string or structured JSON object)\n\
+                 - 'label': string matching one of the schema criteria keys ({:?})\n\
+                 - 'confidence': calibrated float between 0.80 and 0.99\n\
+                 - 'hard_negative': minimally perturbed counterfactual state that flips the label\n\
+                 - 'hard_negative_label': flipped criteria key from {:?}",
+                use_case_context, schema_content, valid_labels, valid_labels, valid_labels
             );
-
-            let user_prompt = format!("Generate {} diverse samples now.", cf.count);
-            let teacher_resp = query_teacher(&teachers[0], &system_prompt, &user_prompt)?;
 
             #[derive(Deserialize)]
             struct SynthSample {
-                text: String,
+                #[serde(alias = "state")]
+                text: serde_json::Value,
                 label: String,
                 #[serde(default = "default_confidence")]
                 confidence: f64,
@@ -810,53 +1312,78 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
                 hard_negative_label: Option<String>,
             }
 
-            let samples: Vec<SynthSample> = serde_json::from_str(&teacher_resp).unwrap_or_default();
-            for s in samples {
-                if s.confidence >= cf.min_confidence {
-                    write_formatted_row_with_schema(
-                        &mut out_file,
-                        cf.format,
-                        &s.text,
-                        &s.label,
-                        &schema_question,
-                        &valid_labels,
-                        None,
-                        None,
-                    )?;
-                    *class_distribution.entry(s.label.clone()).or_insert(0) += 1;
-                    total_accepted += 1;
+            let batch_step = cf.batch_size.clamp(5, 25);
+            let mut remaining = cf.count;
 
-                    if cf.add_hard_negatives {
-                        if let Some(hn_text) = s.hard_negative.as_deref() {
-                            if !hn_text.trim().is_empty() {
-                                if let Some(flipped_label) = resolve_counterfactual_label(
-                                    &s.label,
-                                    s.hard_negative_label.as_deref(),
-                                    &valid_labels,
-                                ) {
-                                    write_formatted_row_with_schema(
-                                        &mut out_file,
-                                        cf.format,
-                                        hn_text.trim(),
-                                        &flipped_label,
-                                        &schema_question,
+            while remaining > 0 {
+                let req_count = remaining.min(batch_step);
+                let user_prompt = format!(
+                    "Generate {} diverse, non-repetitive training samples for this Use-Case now.",
+                    req_count
+                );
+                let teacher_resp = query_teacher(&teachers[0], &system_prompt, &user_prompt)?;
+                let samples: Vec<SynthSample> =
+                    serde_json::from_str(&teacher_resp).unwrap_or_default();
+
+                if samples.is_empty() {
+                    break;
+                }
+
+                for s in samples {
+                    if s.confidence >= cf.min_confidence {
+                        write_curated_record(
+                            &mut out_file,
+                            cf.format,
+                            &effective_kind,
+                            &s.text,
+                            &s.label,
+                            s.confidence,
+                            &schema_question,
+                            &valid_labels,
+                            &schema_criteria,
+                            cf.use_case.as_deref(),
+                        )?;
+                        *class_distribution.entry(s.label.clone()).or_insert(0) += 1;
+                        total_accepted += 1;
+
+                        if cf.add_hard_negatives {
+                            if let Some(hn_text) = s.hard_negative.as_deref() {
+                                if !hn_text.trim().is_empty() {
+                                    if let Some(flipped_label) = resolve_counterfactual_label(
+                                        &s.label,
+                                        s.hard_negative_label.as_deref(),
                                         &valid_labels,
-                                        None,
-                                        None,
-                                    )?;
-                                    *class_distribution.entry(flipped_label).or_insert(0) += 1;
-                                    total_accepted += 1;
-                                    total_counterfactuals += 1;
+                                    ) {
+                                        let hn_state =
+                                            serde_json::Value::String(hn_text.trim().to_string());
+                                        write_curated_record(
+                                            &mut out_file,
+                                            cf.format,
+                                            &effective_kind,
+                                            &hn_state,
+                                            &flipped_label,
+                                            s.confidence.clamp(0.85, 0.96),
+                                            &schema_question,
+                                            &valid_labels,
+                                            &schema_criteria,
+                                            cf.use_case.as_deref(),
+                                        )?;
+                                        *class_distribution.entry(flipped_label).or_insert(0) += 1;
+                                        total_accepted += 1;
+                                        total_counterfactuals += 1;
+                                    }
                                 }
                             }
                         }
+                    } else {
+                        total_quarantined += 1;
                     }
-                } else {
-                    total_quarantined += 1;
+                    pb.inc(1);
                 }
-                pb.inc(1);
+
+                remaining = remaining.saturating_sub(req_count);
             }
-            pb.finish_with_message("Synthesis complete.");
+            pb.finish_with_message("Use-Case synthesis complete.");
         }
     }
 
@@ -884,43 +1411,88 @@ pub fn run_curate(cf: Curatefile) -> Result<()> {
     }
 
     println!(
-        "\n  {} Curated dataset written to: {:?}",
+        "\n  {} Curated dataset ready at: {:?}",
         "✓".green().bold(),
         cf.output
     );
-    println!("    You can now directly train on this dataset with 'trainaya train' or your .Trainfile!\n");
+    println!(
+        "    • Adapt a GGUF/HF model : {}",
+        format!(
+            "trainaya adapt --from <model> -t <tag> --data {}",
+            cf.output.display()
+        )
+        .cyan()
+    );
+    println!(
+        "    • Fine-tune end-to-end  : {}\n",
+        format!("trainaya train --data {} -t <tag>", cf.output.display()).cyan()
+    );
 
     Ok(())
 }
 
-fn token_overlap_ratio(a: &str, b: &str) -> f64 {
-    let set_a: std::collections::HashSet<&str> = a
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 3)
-        .collect();
-    let set_b: std::collections::HashSet<&str> = b
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 3)
-        .collect();
-    if set_a.is_empty() || set_b.is_empty() {
-        return 0.0;
+/// Build a calibrated soft probability distribution across `valid_labels` from the teacher's label and confidence
+pub fn build_soft_target_distribution(
+    kind: &str,
+    target_idx: usize,
+    num_options: usize,
+    confidence: f64,
+) -> Vec<f64> {
+    if num_options < 2 {
+        return vec![1.0];
     }
-    let inter = set_a.intersection(&set_b).count();
-    let min_len = set_a.len().min(set_b.len());
-    (inter as f64) / (min_len as f64)
+    let conf = confidence.clamp(1.0 / (num_options as f64), 0.99);
+    let remainder = 1.0 - conf;
+
+    if kind == "score" && num_options >= 3 {
+        // Ordinal unimodal smoothing around `target_idx` for score rubrics
+        let mut weights = vec![0.0; num_options];
+        let mut off_sum = 0.0;
+        for (i, w) in weights.iter_mut().enumerate() {
+            if i != target_idx {
+                let dist = (i as isize - target_idx as isize).unsigned_abs() as f64;
+                *w = (-1.35 * dist).exp();
+                off_sum += *w;
+            }
+        }
+        let mut probs = vec![0.0; num_options];
+        for i in 0..num_options {
+            if i == target_idx {
+                probs[i] = (conf * 10000.0).round() / 10000.0;
+            } else if off_sum > 0.0 {
+                probs[i] = ((remainder * (weights[i] / off_sum)) * 10000.0).round() / 10000.0;
+            }
+        }
+        return probs;
+    }
+
+    let uniform_other = remainder / ((num_options - 1) as f64);
+    (0..num_options)
+        .map(|i| {
+            let p = if i == target_idx { conf } else { uniform_other };
+            (p * 10000.0).round() / 10000.0
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_formatted_row_with_schema(
+fn write_curated_record(
     writer: &mut File,
     format: TargetDatasetFormat,
-    text: &str,
+    kind: &str,
+    state: &serde_json::Value,
     label: &str,
+    confidence: f64,
     schema_question: &str,
     valid_labels: &[String],
-    predicted_label: Option<&str>,
-    confidence: Option<f64>,
+    schema_criteria: &serde_json::Value,
+    use_case: Option<&str>,
 ) -> Result<()> {
+    let state_text = match state {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+
     match format {
         TargetDatasetFormat::Decision => {
             if valid_labels.len() >= 2 {
@@ -928,39 +1500,51 @@ fn write_formatted_row_with_schema(
                     .iter()
                     .position(|v| v.eq_ignore_ascii_case(label.trim()))
                     .unwrap_or(0);
+                let target_probs = build_soft_target_distribution(
+                    kind,
+                    target_idx,
+                    valid_labels.len(),
+                    confidence,
+                );
+                let canonical_label = &valid_labels[target_idx];
+
                 let mut row = serde_json::json!({
-                    "state": text,
-                    "label": label,
+                    "kind": kind,
+                    "state": state,
                     "question": schema_question,
                     "options": valid_labels,
+                    "target": target_probs,
                     "target_index": target_idx,
+                    "label": canonical_label,
+                    "confidence": confidence,
                 });
-                if let Some(pl) = predicted_label {
-                    row["predicted_label"] = serde_json::json!(pl);
+                if !schema_criteria.is_null() {
+                    row["criteria"] = schema_criteria.clone();
                 }
-                if let Some(conf) = confidence {
-                    row["confidence"] = serde_json::json!(conf);
+                if let Some(uc) = use_case {
+                    row["use_case"] = serde_json::json!(uc);
                 }
                 writeln!(writer, "{}", serde_json::to_string(&row)?)?;
             } else {
                 let row = serde_json::json!({
-                    "state": text,
+                    "state": state,
                     "label": label,
+                    "confidence": confidence,
                 });
                 writeln!(writer, "{}", serde_json::to_string(&row)?)?;
             }
         }
         TargetDatasetFormat::Classification => {
             let row = serde_json::json!({
-                "text": text,
+                "text": state_text,
                 "label": label
             });
             writeln!(writer, "{}", serde_json::to_string(&row)?)?;
         }
         TargetDatasetFormat::Nli => {
             let row = serde_json::json!({
-                "premise": text,
-                "hypothesis": format!("This action relates to {}", label),
+                "premise": state_text,
+                "hypothesis": format!("This input belongs to {}", label),
                 "label": label
             });
             writeln!(writer, "{}", serde_json::to_string(&row)?)?;
@@ -976,17 +1560,14 @@ mod tests {
     #[test]
     fn test_resolve_counterfactual_label() {
         let valid = vec!["general".to_string(), "urgent".to_string()];
-        // Auto-invert from schema when explicit is None
         assert_eq!(
             resolve_counterfactual_label("general", None, &valid),
             Some("urgent".to_string())
         );
-        // Reject explicit if it is identical to primary_label and fallback to opposite
         assert_eq!(
             resolve_counterfactual_label("urgent", Some("urgent"), &valid),
             Some("general".to_string())
         );
-        // Honor explicit when valid and different
         let valid3 = vec![
             "entailment".to_string(),
             "neutral".to_string(),
@@ -1006,6 +1587,7 @@ mod tests {
                 label: "urgent".to_string(),
                 confidence: 0.94,
                 reasoning: Some("Clearly urgent".to_string()),
+                reformatted_state: None,
                 hard_negative: Some("Non-urgent minor update".to_string()),
                 hard_negative_label: Some("general".to_string()),
             },
@@ -1014,6 +1596,7 @@ mod tests {
                 label: "urgent".to_string(),
                 confidence: 0.91,
                 reasoning: Some("Seems urgent".to_string()),
+                reformatted_state: None,
                 hard_negative: None,
                 hard_negative_label: None,
             },
@@ -1025,6 +1608,7 @@ mod tests {
                 label: "urgent".to_string(),
                 confidence: 0.96,
                 reasoning: Some("Critical SLA".to_string()),
+                reformatted_state: None,
                 hard_negative: None,
                 hard_negative_label: None,
             },
@@ -1033,6 +1617,7 @@ mod tests {
                 label: "general".to_string(),
                 confidence: 0.89,
                 reasoning: Some("Routine inquiry".to_string()),
+                reformatted_state: None,
                 hard_negative: None,
                 hard_negative_label: None,
             },
@@ -1042,7 +1627,6 @@ mod tests {
         let consolidated = consolidate_teacher_annotations(&per_teacher, &[0, 1]);
         assert_eq!(consolidated.len(), 2);
 
-        // Item 0: both agreed on "urgent" -> high confidence ~0.95, preserves counterfactual
         assert_eq!(consolidated[0].id, 0);
         assert_eq!(consolidated[0].label, "urgent");
         assert!((consolidated[0].confidence - 0.95).abs() < 1e-6);
@@ -1051,7 +1635,6 @@ mod tests {
             Some("Non-urgent minor update")
         );
 
-        // Item 1: teachers disagreed ("urgent" vs "general") -> confidence forced to 0.0 (quarantined!)
         assert_eq!(consolidated[1].id, 1);
         assert_eq!(consolidated[1].confidence, 0.0);
         assert!(consolidated[1]
@@ -1062,16 +1645,19 @@ mod tests {
     }
 
     #[test]
-    fn test_load_exported_bench_failure_record() {
-        let json_line = r#"{"id":"paws-1","subset":"paws","kind":"noul","text":"sentence_1: A | sentence_2: B","state":{},"questions":{},"gold_label":"true","predicted_label":"false","confidence":0.92,"failure_type":"misclassified_overconfident"}"#;
-        let item: RawInputItem = serde_json::from_str(json_line).unwrap();
-        assert_eq!(item.id, None); // String ID "paws-1" gracefully yields None so loader assigns sequential index
-        assert_eq!(item.get_text(), "sentence_1: A | sentence_2: B");
-        assert_eq!(item.gold_label.as_deref(), Some("true"));
-        assert_eq!(item.predicted_label.as_deref(), Some("false"));
-        assert_eq!(
-            item.failure_type.as_deref(),
-            Some("misclassified_overconfident")
-        );
+    fn test_soft_target_distribution_choice_and_score() {
+        let probs_choice = build_soft_target_distribution("choice", 1, 3, 0.90);
+        assert_eq!(probs_choice.len(), 3);
+        assert!((probs_choice[1] - 0.90).abs() < 1e-4);
+        assert!((probs_choice[0] - 0.05).abs() < 1e-4);
+        assert!((probs_choice[2] - 0.05).abs() < 1e-4);
+
+        let probs_score = build_soft_target_distribution("score", 4, 5, 0.85);
+        assert_eq!(probs_score.len(), 5);
+        // Ordinal unimodal decay: level 3 > level 2 > level 1 > level 0
+        assert!(probs_score[4] > probs_score[3]);
+        assert!(probs_score[3] > probs_score[2]);
+        assert!(probs_score[2] > probs_score[1]);
+        assert!(probs_score[1] > probs_score[0]);
     }
 }

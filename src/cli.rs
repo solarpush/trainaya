@@ -640,76 +640,126 @@ impl BenchOpts {
 
 #[derive(Args, Debug, Clone)]
 pub struct CurateOpts {
+    /// Path to Curatefile configuration (e.g. 'Curatefile', '.Curatefile')
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
+    /// Free-text description of your final Use-Case, domain rules, and decision objective
+    #[arg(short = 'u', long = "use-case", alias = "description")]
+    pub use_case: Option<String>,
+
+    /// Teacher agent to distill ('agy', 'claude', 'codex', 'gemini', 'ollama:<model>', 'ollaya:<model>')
     #[arg(long)]
     pub teacher: Option<String>,
 
+    /// Curation workflow mode: 'synth' (generate from Use-Case), 'reformat' / 'label' (reformat & distill dataset), or 'augment'
     #[arg(short, long)]
     pub mode: Option<String>,
 
+    /// Target dataset format: 'decision' (default), 'classification', or 'nli'
     #[arg(long)]
     pub format: Option<String>,
 
+    /// Decision primitive kind when synthesizing schema from Use-Case: 'choice' (default), 'noul', or 'score'
+    #[arg(long = "kind", alias = "decision-type")]
+    pub kind: Option<String>,
+
+    /// Path to an existing raw dataset (.jsonl, .csv, .json, .txt) to reformat & distill
     #[arg(short, long)]
     pub input: Option<PathBuf>,
 
+    /// Optional path to an explicit decision schema (.json); if omitted, Teacher synthesizes it from --use-case
     #[arg(short, long)]
     pub schema: Option<PathBuf>,
 
+    /// Output path for the curated training dataset (.jsonl)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Number of samples to synthesize in 'synth' mode
     #[arg(long)]
     pub count: Option<usize>,
 
+    /// Batch size for teacher distillation queries
     #[arg(long)]
     pub batch_size: Option<usize>,
 
+    /// Minimum teacher confidence threshold (0.0..1.0) before quarantining ambiguous samples
     #[arg(long)]
     pub min_confidence: Option<f64>,
+
+    /// Launch the interactive Use-Case & Teacher Distillation wizard
+    #[arg(long = "interactive")]
+    pub interactive: bool,
+
+    /// Run strictly non-interactively using Curatefile or CLI flags
+    #[arg(long = "non-interactive", conflicts_with = "interactive")]
+    pub non_interactive: bool,
 }
 
 impl CurateOpts {
     pub fn resolve_curate_args(self) -> anyhow::Result<crate::curatefile::Curatefile> {
+        let no_cli_workflow_flags = self.file.is_none()
+            && self.use_case.is_none()
+            && self.mode.is_none()
+            && self.input.is_none()
+            && self.schema.is_none();
+
         let mut cf = if let Some(path) = &self.file {
             crate::curatefile::Curatefile::from_file(path)?
-        } else if self.input.is_none()
-            && self.mode.is_none()
-            && std::path::Path::new("Curatefile").exists()
-        {
+        } else if std::path::Path::new("Curatefile").exists() {
             crate::curatefile::Curatefile::from_file(std::path::Path::new("Curatefile"))?
-        } else if self.input.is_none()
-            && self.mode.is_none()
-            && std::path::Path::new(".Curatefile").exists()
-        {
+        } else if std::path::Path::new(".Curatefile").exists() {
             crate::curatefile::Curatefile::from_file(std::path::Path::new(".Curatefile"))?
         } else {
             crate::curatefile::Curatefile::default()
         };
 
+        if let Some(uc) = self.use_case {
+            cf.use_case = Some(uc);
+        }
         if let Some(t) = self.teacher {
             cf.teacher = t;
         }
         if let Some(m) = self.mode {
             cf.mode = match m.to_lowercase().as_str() {
-                "label" | "annotate" => crate::curatefile::CurateMode::Label,
-                "synth" | "synthetic" => crate::curatefile::CurateMode::Synth,
-                "augment" => crate::curatefile::CurateMode::Augment,
-                other => anyhow::bail!("Unknown mode '{}'. Expected: label, synth, augment", other),
+                "reformat" | "distill" | "label" | "annotate" => {
+                    crate::curatefile::CurateMode::Label
+                }
+                "synth" | "synthetic" | "generate" => crate::curatefile::CurateMode::Synth,
+                "augment" | "contrastive" => crate::curatefile::CurateMode::Augment,
+                other => anyhow::bail!(
+                    "Unknown mode '{}'. Expected: synth, reformat, label, augment",
+                    other
+                ),
             };
+        } else if self.input.is_some() && cf.mode == crate::curatefile::CurateMode::Synth {
+            // If user passed --input without --mode, default to reformat/label mode
+            cf.mode = crate::curatefile::CurateMode::Label;
         }
         if let Some(f) = self.format {
-            cf.format = match f.to_lowercase().as_str() {
-                "decision" => crate::curatefile::TargetDatasetFormat::Decision,
-                "classification" => crate::curatefile::TargetDatasetFormat::Classification,
-                "nli" => crate::curatefile::TargetDatasetFormat::Nli,
+            let lower = f.to_lowercase();
+            cf.format = match lower.as_str() {
+                "decision" | "choice" | "noul" | "score" => {
+                    crate::curatefile::TargetDatasetFormat::Decision
+                }
+                "classification" | "text" => crate::curatefile::TargetDatasetFormat::Classification,
+                "nli" | "pair" | "pairs" => crate::curatefile::TargetDatasetFormat::Nli,
                 other => anyhow::bail!(
                     "Unknown format '{}'. Expected: decision, classification, nli",
                     other
                 ),
             };
+            if matches!(lower.as_str(), "choice" | "noul" | "score") {
+                cf.kind = lower;
+            }
+        }
+        if let Some(k) = self.kind {
+            let lower = k.to_lowercase();
+            match lower.as_str() {
+                "choice" | "noul" | "score" => cf.kind = lower,
+                other => anyhow::bail!("Unknown kind '{}'. Expected: choice, noul, score", other),
+            }
         }
         if let Some(i) = self.input {
             cf.input = Some(i);
@@ -728,6 +778,15 @@ impl CurateOpts {
         }
         if let Some(mc) = self.min_confidence {
             cf.min_confidence = mc;
+        }
+
+        if self.interactive {
+            cf.interactive = true;
+        } else if self.non_interactive {
+            cf.interactive = false;
+        } else if no_cli_workflow_flags {
+            // Default to interactive wizard when `trainaya curate` is run directly without CLI flags
+            cf.interactive = true;
         }
 
         Ok(cf)

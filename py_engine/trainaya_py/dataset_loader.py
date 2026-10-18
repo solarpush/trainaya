@@ -204,6 +204,11 @@ def _parse_jev_distill_row(obj: Dict[str, Any], idx: int) -> Optional[Normalized
                 option_keys = [str(o) for o in options_raw[:k]]
                 criteria = {str(o): None for o in options_raw[:k]}
                 gold_idx = min(gold_idx, k - 1)
+        elif isinstance(obj.get("criteria"), dict) and isinstance(options_raw, list) and len(options_raw) >= k:
+            option_keys = [str(o) for o in options_raw[:k]]
+            crit_map = obj["criteria"]
+            criteria = {ok: crit_map.get(ok) for ok in option_keys}
+            gold_idx = min(gold_idx, k - 1)
         elif isinstance(options_raw, list) and len(options_raw) >= k:
             option_keys = [str(o) for o in options_raw[:k]]
             criteria = {str(o): None for o in options_raw[:k]}

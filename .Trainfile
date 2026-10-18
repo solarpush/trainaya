@@ -1,42 +1,26 @@
-# ==============================================================================
-# .Trainfile: Trainaya recipe mirroring Ollaya's Modelfile syntax
-# ==============================================================================
+# .Trainfile — Declarative Training Recipe for Trainaya (uv + PyTorch Engine)
+# Run with: trainaya train
 
-# Base model to fine-tune (Ollaya model tag, HuggingFace repo, or local file)
-FROM winnow:e4b
+# Base model: HuggingFace repo ID, local directory, or Ollaya/Ollama tag
+FROM answerdotai/ModernBERT-base
 
-# Training dataset and Ollaya question schema
-DATA ./data/train_specific_decision.jsonl
-SCHEMA ./data/questions_schema.json
+# Task type: 'decision' (choice / noul / score), 'classification', or 'nli'
+TASK decision
 
-# Model family layout
-FAMILY winnow-v1
+# Curated dataset produced by `trainaya curate` (or custom JSONL/CSV)
+DATA ./data/curated_train.jsonl
 
-# Task type: classification or nli
-TASK classification
-
-# Optimization hyperparameters
-PARAMETER epochs 4
+# Hyperparameters
+PARAMETER epochs 8
 PARAMETER batch_size 8
-PARAMETER grad_accum 2
-PARAMETER lr 5e-5
+PARAMETER lr 1.5e-4
+PARAMETER max_length 512
+PARAMETER warmup_ratio 0.10
 PARAMETER lr_scheduler cosine
-PARAMETER warmup_ratio 0.1
-PARAMETER max_grad_norm 1.0
-
-# LoRA hyperparameters (multi-layer top blocks + post-training T* calibration)
 PARAMETER lora_r 16
 PARAMETER lora_alpha 32
-PARAMETER lora_layers 8
-PARAMETER target_modules attn_output,ffn_down
+PARAMETER device auto
 
-# Weight merging & quantization
-MERGE true
-QUANT Q8_0
-
-# Model tag for the trained model in Ollaya (auto-increments: v1, v2...)
-TAG winnow:v{auto}
-
-# Output directory (isolated by tag)
+# Output directory & automatic registration tag
 OUTPUT ./output/{tag}
-
+REGISTER custom-decider:v{ patch + 1 }

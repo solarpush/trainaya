@@ -251,5 +251,62 @@ fn test_cli_bench_export_failures_and_curate_multi_teacher() {
     }
 }
 
+#[test]
+fn test_cli_curate_use_case_and_adapt_runtime_both() {
+    let curate_args = vec![
+        "trainaya",
+        "curate",
+        "--use-case",
+        "Triage customer support tickets into refund or technical_help",
+        "--teacher",
+        "agy",
+        "--mode",
+        "reformat",
+        "--kind",
+        "choice",
+        "--input",
+        "examples/sample_classification.csv",
+        "--output",
+        "./data/reformatted.jsonl",
+    ];
+    let cli = Cli::try_parse_from(curate_args).expect("Failed to parse curate use-case CLI args");
+    match cli.command {
+        Commands::Curate(opts) => {
+            let cf = opts.resolve_curate_args().unwrap();
+            assert_eq!(
+                cf.use_case.as_deref(),
+                Some("Triage customer support tickets into refund or technical_help")
+            );
+            assert_eq!(cf.teacher, "agy");
+            assert_eq!(cf.mode, trainaya::curatefile::CurateMode::Label);
+            assert_eq!(cf.kind, "choice");
+            assert!(!cf.interactive);
+        }
+        _ => panic!("Expected Curate command"),
+    }
+
+    let adapt_args = vec![
+        "trainaya",
+        "adapt",
+        "--from",
+        "gemma-3-4b.gguf",
+        "-t",
+        "push_gemma3:4b",
+        "--runtime",
+        "both",
+    ];
+    let cli_adapt = Cli::try_parse_from(adapt_args).expect("Failed to parse adapt CLI args");
+    match cli_adapt.command {
+        Commands::Adapt(opts) => {
+            let (args, _, runtime) = opts.into_adapt_args();
+            assert_eq!(args.from, "gemma-3-4b.gguf");
+            assert_eq!(args.target, "push_gemma3:4b");
+            assert_eq!(runtime, trainaya::config::RuntimeTarget::Both);
+        }
+        _ => panic!("Expected Adapt command"),
+    }
+}
+
+
 
 
