@@ -27,6 +27,7 @@ fn main() {
                     base_template: Some(base_model),
                     tokenizer_path: None,
                     models_dir,
+                    runtime: trainaya::config::RuntimeTarget::Auto,
                 };
                 if let Err(e) = run_register(reg_args) {
                     eprintln!(
@@ -38,7 +39,7 @@ fn main() {
             Ok(())
         })(),
         Commands::Adapt(opts) => (|| -> Result<()> {
-            let (adapt_args, models_dir) = opts.into_adapt_args();
+            let (adapt_args, models_dir, runtime) = opts.into_adapt_args();
             let out_dir = adapt_args.output_dir.clone();
             let target_name = adapt_args.target.clone();
             run_adapt(adapt_args)?;
@@ -49,6 +50,7 @@ fn main() {
                 base_template: None,
                 tokenizer_path: None,
                 models_dir,
+                runtime,
             };
             if let Err(e) = run_register(reg_args) {
                 eprintln!(

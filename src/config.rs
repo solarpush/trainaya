@@ -38,6 +38,27 @@ impl std::fmt::Display for ExportFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeTarget {
+    #[default]
+    Auto,
+    Ollaya,
+    Ollama,
+    Both,
+}
+
+impl std::fmt::Display for RuntimeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeTarget::Auto => write!(f, "auto"),
+            RuntimeTarget::Ollaya => write!(f, "ollaya"),
+            RuntimeTarget::Ollama => write!(f, "ollama"),
+            RuntimeTarget::Both => write!(f, "both"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoraConfig {
     pub r: usize,

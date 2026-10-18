@@ -103,6 +103,50 @@ KNOWN_GGUF_REPOS = {
         "bartowski/Ministral-8B-Instruct-2410-GGUF",
         "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
     ),
+    "gemma": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
+    "gemma3": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
+    "gemma3:4b": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
+    "gemma-3-4b": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
+    "gemma-3-4b-it": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
+    "google/gemma-3-4b-it": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
+    "ggml-org/gemma-3-4b-it-gguf": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
+    "gemma-3-4b-q8": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q8_0.gguf",
+    ),
+    "push_ministral:3b": (
+        "mistralai/Ministral-3-3B-Instruct-2512-GGUF",
+        "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
+    ),
+    "push_ministral:8b": (
+        "bartowski/Ministral-8B-Instruct-2410-GGUF",
+        "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
+    ),
+    "push_gemma3:4b": (
+        "ggml-org/gemma-3-4b-it-GGUF",
+        "gemma-3-4b-it-Q4_K_M.gguf",
+    ),
 }
 
 
@@ -176,19 +220,32 @@ def _render_jinja_template(chat_template: str, system_msg: str, user_msg: str) -
         ]
         try:
             tmpl = env.from_string(chat_template)
-            return tmpl.render(messages=messages, add_generation_prompt=True, enable_thinking=False, bos_token="")
+            rendered = tmpl.render(
+                messages=messages,
+                add_generation_prompt=True,
+                enable_thinking=False,
+                bos_token="",
+            )
+            if system_msg and system_msg not in rendered:
+                raise ValueError("Template silently dropped system role")
+            return rendered
         except Exception:
             messages_merged = [
                 {"role": "user", "content": f"{system_msg}\n\n{user_msg}"},
             ]
             tmpl = env.from_string(chat_template)
             return tmpl.render(
+                messages_merged=messages_merged,
                 messages=messages_merged,
                 add_generation_prompt=True,
                 enable_thinking=False,
                 bos_token="",
             )
     except Exception:
+        if "<|turn>" in chat_template:
+            return f"<|turn>system\n{system_msg}<turn|>\n<|turn>user\n{user_msg}<turn|>\n<|turn>model\n<|thought\n<thought|>"
+        if "<start_of_turn>" in chat_template:
+            return f"<start_of_turn>user\n{system_msg}\n\n{user_msg}<end_of_turn>\n<start_of_turn>model\n"
         if "[SYSTEM_PROMPT]" in chat_template:
             return f"[SYSTEM_PROMPT]{system_msg}[/SYSTEM_PROMPT][INST]{user_msg}[/INST]"
         if "[INST]" in chat_template:
@@ -299,6 +356,59 @@ def _resolve_hf_label_table(tokenizer) -> Dict[str, Any]:
     }
 
 
+def _download_hf_file_direct(
+    repo_id: str,
+    filename: str,
+    emit: Callable[[Dict[str, Any]], None],
+) -> str:
+    """Download a file from HuggingFace without requiring `huggingface_hub`."""
+    import urllib.request
+
+    cache_dir = Path.home() / ".cache" / "trainaya" / "models" / repo_id.replace("/", "--")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = cache_dir / filename
+    if dest_path.exists() and dest_path.stat().st_size > 1024 * 1024:
+        emit(
+            {
+                "event": "status",
+                "message": f"Resolved '{filename}' from local Trainaya cache ('{dest_path}').",
+            }
+        )
+        return str(dest_path)
+
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    tmp_path = dest_path.with_suffix(".gguf.part")
+    emit(
+        {
+            "event": "status",
+            "message": f"Downloading '{filename}' from '{url}' into '{dest_path}'...",
+        }
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "trainaya/0.3"})
+    with urllib.request.urlopen(req, timeout=60) as resp, tmp_path.open("wb") as out_f:
+        total = int(resp.headers.get("Content-Length", "0") or "0")
+        downloaded = 0
+        last_report = 0
+        while True:
+            chunk = resp.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            out_f.write(chunk)
+            downloaded += len(chunk)
+            if downloaded - last_report >= 256 * 1024 * 1024 or (total and downloaded == total):
+                last_report = downloaded
+                mb_done = downloaded / (1024 * 1024)
+                mb_tot = total / (1024 * 1024) if total else 0.0
+                emit(
+                    {
+                        "event": "status",
+                        "message": f"Downloaded {mb_done:.0f} MB / {mb_tot:.0f} MB of '{filename}'...",
+                    }
+                )
+    tmp_path.replace(dest_path)
+    return str(dest_path)
+
+
 def _try_resolve_gguf_from_hf(
     source: str,
     emit: Callable[[Dict[str, Any]], None],
@@ -308,38 +418,41 @@ def _try_resolve_gguf_from_hf(
     lower = source.strip().lower()
     if lower in KNOWN_GGUF_REPOS:
         repo_id, filename = KNOWN_GGUF_REPOS[lower]
+        if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
+            existing = os.path.join(output_dir, "model.gguf")
+            emit(
+                {
+                    "event": "status",
+                    "message": f"Resolved '{source}' from existing output GGUF ('{existing}').",
+                }
+            )
+            return existing
         try:
             from huggingface_hub import hf_hub_download
 
-            cached = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
-            emit(
-                {
-                    "event": "status",
-                    "message": f"Resolved '{source}' from local cache ('{filename}' in '{repo_id}').",
-                }
-            )
-            return cached
-        except Exception:
-            if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
-                existing = os.path.join(output_dir, "model.gguf")
+            try:
+                cached = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
                 emit(
                     {
                         "event": "status",
-                        "message": f"Resolved '{source}' from existing output GGUF ('{existing}').",
+                        "message": f"Resolved '{source}' from local cache ('{filename}' in '{repo_id}').",
                     }
                 )
-                return existing
-            from huggingface_hub import hf_hub_download
-
-            emit(
-                {
-                    "event": "status",
-                    "message": f"Resolving '{source}' -> downloading '{filename}' from HuggingFace repo '{repo_id}'...",
-                }
-            )
-            return hf_hub_download(repo_id=repo_id, filename=filename)
+                return cached
+            except Exception:
+                emit(
+                    {
+                        "event": "status",
+                        "message": f"Resolving '{source}' -> downloading '{filename}' from HuggingFace repo '{repo_id}'...",
+                    }
+                )
+                return hf_hub_download(repo_id=repo_id, filename=filename)
+        except ImportError:
+            return _download_hf_file_direct(repo_id, filename, emit)
 
     if "/" in source and not os.path.exists(source):
+        if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
+            return os.path.join(output_dir, "model.gguf")
         try:
             from huggingface_hub import HfApi, hf_hub_download
 
@@ -363,8 +476,7 @@ def _try_resolve_gguf_from_hf(
                 )
                 return hf_hub_download(repo_id=source, filename=preferred)
         except Exception:
-            if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
-                return os.path.join(output_dir, "model.gguf")
+            pass
     return None
 
 
@@ -479,8 +591,11 @@ def _adapt_gguf_llm_logits(
 
     rendered = _render_jinja_template(chat_tmpl, SENTINEL_SYSTEM, SENTINEL_USER)
     pre, mid, post = _split_sentinel_template(rendered)
-    if add_bos and pre.startswith("<s>"):
-        pre = pre[3:]
+    if add_bos:
+        if pre.startswith("<s>"):
+            pre = pre[3:]
+        elif pre.startswith("<bos>"):
+            pre = pre[5:]
     labels = _resolve_gguf_label_table(tokens)
     yes_no_ids = labels.pop("_yes_no_ids", None)
 
@@ -574,7 +689,7 @@ def _adapt_gguf_llm_logits(
         },
         "llama": {
             "n_ctx": 8192,
-            "swa_full": False,
+            "swa_full": arch.lower().startswith("gemma"),
             "plan": "prefix",
         },
     }
@@ -622,13 +737,19 @@ def _format_llm_logits_prompt(pre: str, mid: str, post: str, rec) -> str:
     opts_lines = []
     if rec.qtype == "noul":
         c = rec.criteria if isinstance(rec.criteria, dict) else {}
-        f_txt = c.get("false") or "No, the statement does not hold."
-        t_txt = c.get("true") or "Yes, the statement holds."
-        opts_lines = [f"A. false: {f_txt}", f"B. true: {t_txt}"]
+        t_txt = c.get("true")
+        f_txt = c.get("false")
+        opts_lines = [
+            f"A. Yes: {t_txt}" if t_txt else "A. Yes",
+            f"B. No: {f_txt}" if f_txt else "B. No",
+        ]
     elif rec.qtype == "score":
-        c_list = rec.criteria if isinstance(rec.criteria, list) else rec.option_keys
-        for i, desc in enumerate(c_list[:10]):
-            opts_lines.append(f"{labels[i]}. level {i}: {desc}")
+        if isinstance(rec.criteria, list) and len(rec.criteria) >= 2:
+            for i, desc in enumerate(rec.criteria[:10]):
+                opts_lines.append(f"{labels[i]}. {desc}")
+        else:
+            for i in range(min(10, max(2, len(rec.option_keys)))):
+                opts_lines.append(f"{labels[i]}. level {i}")
     else:
         if isinstance(rec.criteria, dict):
             for i, (k, v) in enumerate(list(rec.criteria.items())[:26]):
@@ -640,7 +761,7 @@ def _format_llm_logits_prompt(pre: str, mid: str, post: str, rec) -> str:
 
     user_body = (
         f"State:\n{state_str}\n\n"
-        f"Question: {rec.instructions}\n"
+        f"Question: {rec.instructions}\n\n"
         f"Options:\n" + "\n".join(opts_lines) + "\n" + FINAL_LINE
     )
     if pre or mid != "\n\n":

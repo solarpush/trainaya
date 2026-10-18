@@ -877,148 +877,148 @@ pub fn nimble_question_template(subset_name: &str) -> Option<serde_json::Value> 
         "vitaminc-dev" => Some(serde_json::json!({
             "decision": {
                 "type": "choice",
-                "instructions": "Given the evidence and the claim, decide whether the evidence supports the claim, refutes it, or does not provide enough information.",
+                "instructions": "Decide how the evidence bears on the claim. Judge only from the evidence text, and not from outside knowledge about the subject.",
                 "criteria": {
-                    "SUPPORTS": "The evidence directly supports the claim.",
-                    "REFUTES": "The evidence directly contradicts or refutes the claim.",
-                    "NOT ENOUGH INFO": "The evidence does not contain enough information to verify or refute the claim."
+                    "SUPPORTS": "The evidence states the claim, or the claim follows directly from the evidence.",
+                    "REFUTES": "The evidence states the opposite of the claim, or the claim is directly contradicted by it.",
+                    "NOT ENOUGH INFO": "The evidence neither establishes nor contradicts the claim. Settling it would need a fact the evidence does not supply."
                 }
             }
         })),
         "massive-en-US" | "massive-de-DE" => Some(serde_json::json!({
             "decision": {
                 "type": "choice",
-                "instructions": "Classify the user utterance into one of the 18 domain categories.",
+                "instructions": "Which assistant domain should handle this utterance? Judge from the request itself, not from how it is phrased.",
                 "criteria": {
-                    "alarm": "Setting, modifying, querying, or removing alarms.",
-                    "audio": "Adjusting volume, muting, or audio output settings.",
-                    "calendar": "Creating, querying, or deleting calendar events and reminders.",
-                    "cooking": "Recipes, cooking instructions, food preparation questions.",
-                    "datetime": "Asking for the current time, date, or timezone conversions.",
-                    "email": "Reading, sending, replying to, or searching emails and contacts.",
-                    "general": "Chitchat, greetings, jokes, or control commands directed at the assistant.",
-                    "iot": "Controlling smart home devices: lights, plugs, thermostat, vacuum, coffee maker.",
-                    "lists": "Creating, viewing, or removing items on shopping or to-do lists.",
-                    "music": "Querying music metadata, preferences, or playback state.",
-                    "news": "Requesting news headlines or updates on topics.",
-                    "play": "Starting playback of music, radio, podcasts, audiobooks, or games.",
-                    "qa": "Factoid, math, definition, currency, or stock queries.",
-                    "recommendation": "Asking for recommendations of movies, restaurants, events, or local places.",
-                    "social": "Posting to or querying social media accounts.",
-                    "takeaway": "Ordering food delivery or inquiring about takeaway orders.",
-                    "transport": "Traffic, train/bus schedules, directions, or booking a taxi/ride.",
-                    "weather": "Weather forecasts and current conditions."
+                    "alarm": "Setting, changing, or querying alarms.",
+                    "audio": "Volume, mute, or audio output settings.",
+                    "calendar": "Events, meetings, reminders on a calendar.",
+                    "cooking": "Recipes and cooking instructions.",
+                    "datetime": "The current time, date, or time conversions.",
+                    "email": "Reading, sending, or checking email and contacts.",
+                    "general": "Small talk, jokes, greetings, or general assistant control such as repeat or confirm.",
+                    "iot": "Controlling lights, plugs, heating, cleaners, coffee machines, or wemo devices.",
+                    "lists": "Creating, querying, or removing list items.",
+                    "music": "Music preferences, likes, or music settings, not playing a specific item.",
+                    "news": "News headlines or updates.",
+                    "play": "Playing a specific song, podcast, radio, audiobook, or game.",
+                    "qa": "Factual questions, definitions, math, currency, stock prices.",
+                    "recommendation": "Suggestions for events, movies, or locations.",
+                    "social": "Social media posts or queries.",
+                    "takeaway": "Food orders and delivery status.",
+                    "transport": "Taxis, tickets, traffic, or travel directions.",
+                    "weather": "Weather forecasts or conditions."
                 }
             }
         })),
         "boolq" => Some(serde_json::json!({
             "decision": {
                 "type": "noul",
-                "instructions": "Given the passage, answer the yes/no question. Return true for yes and false for no.",
+                "instructions": "Does the passage answer the question with yes? Use only what the passage states or directly implies.",
                 "criteria": {
-                    "true": "The passage supports answering yes to the question.",
-                    "false": "The passage supports answering no to the question."
+                    "false": "The passage states or directly implies that the answer is no.",
+                    "true": "The passage states or directly implies that the answer is yes."
                 }
             }
         })),
         "squad2" => Some(serde_json::json!({
             "decision": {
                 "type": "noul",
-                "instructions": "Given the paragraph and the question, decide whether the paragraph contains enough information to answer the question.",
+                "instructions": "Does the paragraph contain the information needed to answer the question? Treat a question as unanswerable when the paragraph discusses the topic but does not state the specific fact asked for.",
                 "criteria": {
-                    "true": "The question can be answered directly from the paragraph.",
-                    "false": "The paragraph does not contain the answer (unanswerable)."
+                    "false": "The paragraph does not state the answer, even if it covers the same subject or contains a plausible-looking but incorrect match.",
+                    "true": "The paragraph states the answer explicitly."
                 }
             }
         })),
         "paws" => Some(serde_json::json!({
             "decision": {
                 "type": "noul",
-                "instructions": "Decide whether sentence_1 and sentence_2 are paraphrases with the same meaning.",
+                "instructions": "Do the two sentences have the same meaning? Sentences that reuse the same words in a different order can still mean different things.",
                 "criteria": {
-                    "true": "The two sentences have the same meaning (paraphrases).",
-                    "false": "The two sentences have different meanings."
+                    "false": "The sentences differ in meaning, including cases where the same words are rearranged so that who does what to whom changes.",
+                    "true": "Both sentences describe the same situation with the same participants in the same roles."
                 }
             }
         })),
         "multinli" => Some(serde_json::json!({
             "decision": {
                 "type": "choice",
-                "instructions": "Given the premise and the hypothesis, classify the natural language inference relationship.",
+                "instructions": "Assume the premise is true. How does the hypothesis relate to it?",
                 "criteria": {
-                    "entailment": "If the premise is true, the hypothesis must also be true.",
-                    "neutral": "The hypothesis might be true or false given the premise.",
-                    "contradiction": "If the premise is true, the hypothesis is definitely false."
+                    "entailment": "If the premise is true, the hypothesis must be true.",
+                    "neutral": "The hypothesis might or might not be true; the premise does not settle it.",
+                    "contradiction": "If the premise is true, the hypothesis cannot be true."
                 }
             }
         })),
         "civil_comments" => Some(serde_json::json!({
             "decision": {
                 "type": "noul",
-                "instructions": "Decide whether the comment is toxic (rude, disrespectful, or unreasonable enough to make someone leave a discussion).",
+                "instructions": "Is this comment toxic, meaning rude, disrespectful, or unreasonable enough that a reader would likely leave the discussion?",
                 "criteria": {
-                    "true": "The comment is toxic.",
-                    "false": "The comment is non-toxic."
+                    "false": "The comment may disagree or criticise but does not attack, demean, or threaten.",
+                    "true": "The comment contains insults, threats, identity-based attacks, obscenity, or contempt aimed at a person or group."
                 }
             }
         })),
         "aegis2" => Some(serde_json::json!({
             "decision": {
                 "type": "noul",
-                "instructions": "Decide whether the user message is unsafe (requests or contains harmful, illegal, or policy-violating content).",
+                "instructions": "Would a general-purpose assistant be unsafe to comply with this user message as written? Judge the request, not the assistant's likely reply.",
                 "criteria": {
-                    "true": "The user message is unsafe.",
-                    "false": "The user message is safe."
+                    "false": "The message is a benign request, including sensitive topics raised for legitimate purposes such as education, safety, or fiction that does not provide actionable harmful content.",
+                    "true": "The message seeks help with, or itself contains, hate or identity hate, sexual content, suicide and self-harm, violence, guns or illegal weapons, threats, PII or privacy violations, sexual content involving minors, criminal planning or confessions, harassment, controlled or regulated substances, or profanity, or other content a general safety policy prohibits."
                 }
             }
         })),
         "helpsteer2" => Some(serde_json::json!({
             "decision": {
                 "type": "score",
-                "instructions": "Rate the helpfulness of the assistant response to the user prompt on the 5-level scale from 0 (not helpful) to 4 (completely helpful).",
+                "instructions": "How helpful is the response to the prompt, considering whether it addresses what was asked, is correct, and is complete?",
                 "criteria": [
-                    "The response is not useful or helpful at all.",
-                    "The response is borderline unhelpful and mostly misses what the user asked.",
-                    "The response is partially helpful but misses notable aspects of the prompt.",
-                    "The response is helpful and addresses the prompt well with minor room for improvement.",
-                    "The response is extremely helpful and completely fulfills the user prompt."
+                    "Not helpful: ignores or misreads the prompt, or is wrong in ways that make it useless.",
+                    "Slightly helpful: touches the request but is mostly incorrect, incomplete, or off target.",
+                    "Partially helpful: addresses the request with notable gaps or errors a user would need to fix.",
+                    "Mostly helpful: addresses the request well with minor omissions or imperfections.",
+                    "Extremely helpful: fully and accurately addresses the request; nothing important is missing."
                 ]
             }
         })),
         "summeval-relevance" => Some(serde_json::json!({
             "decision": {
                 "type": "score",
-                "instructions": "Rate the relevance of the summary to the source article on the 5-level scale from 0 to 4.",
+                "instructions": "How well does the summary capture the important content of the article, without unimportant or redundant material?",
                 "criteria": [
-                    "Irrelevant: the summary contains mostly redundant or off-topic information.",
-                    "Low relevance: the summary misses most of the important points of the article.",
-                    "Moderate relevance: the summary captures some key points along with excess detail.",
-                    "Good relevance: the summary captures most main points with little excess.",
-                    "High relevance: the summary concisely captures only the most important information."
+                    "Misses the main points or is mostly about minor details.",
+                    "Captures some key content but omits important points or includes much that is unimportant.",
+                    "Captures the main points with noticeable omissions or filler.",
+                    "Captures the main points with minor omissions.",
+                    "Captures all key content and only key content."
                 ]
             }
         })),
         "summeval-consistency" => Some(serde_json::json!({
             "decision": {
                 "type": "score",
-                "instructions": "Rate the factual consistency of the summary with the source article on the 5-level scale from 0 to 4.",
+                "instructions": "How factually consistent is the summary with the article? Every statement in the summary should be supported by the article.",
                 "criteria": [
-                    "Severely inconsistent: multiple fabricated facts or direct contradictions of the article.",
-                    "Mostly inconsistent: notable unsupported claims or distortions.",
-                    "Partially consistent: mixes supported facts with a minor unsupported detail.",
-                    "Mostly consistent: faithful to the article with at most trivial wording drift.",
-                    "Fully consistent: every statement in the summary is entailed by the article."
+                    "Multiple statements contradict or are absent from the article.",
+                    "At least one clear unsupported or contradicted statement.",
+                    "Mostly supported, with a minor unsupported detail.",
+                    "Supported, with at most a small imprecision.",
+                    "Every statement is supported by the article."
                 ]
             }
         })),
         "pubmedqa" => Some(serde_json::json!({
             "decision": {
                 "type": "choice",
-                "instructions": "Given the biomedical research question and the abstract context (without the concluding summary), answer the question with yes, no, or maybe.",
+                "instructions": "Based only on the abstract, what is the answer to the research question?",
                 "criteria": {
-                    "yes": "The abstract findings support an affirmative answer to the question.",
-                    "no": "The abstract findings support a negative answer to the question.",
-                    "maybe": "The abstract findings are mixed, conditional, or inconclusive."
+                    "yes": "The abstract's findings support a yes answer.",
+                    "no": "The abstract's findings support a no answer.",
+                    "maybe": "The abstract's findings are mixed, conditional, or insufficient to answer either way."
                 }
             }
         })),
@@ -2059,6 +2059,68 @@ pub fn run_benchmark_with_failures(
     )
 }
 
+/// Ensure local Ollaya server is running (auto-spawning `/usr/local/bin/ollaya serve` if needed)
+/// and evict any other currently loaded models from VRAM (`ollaya stop <name>`) so multi-GB GGUF models never OOM.
+fn ensure_ollaya_server_and_evict_others(server_url: &str, keep_model: &str) {
+    let base = server_url.trim_end_matches('/');
+    let ver_url = format!("{}/api/version", base);
+    let is_up = ureq::get(&ver_url)
+        .timeout(Duration::from_secs(2))
+        .call()
+        .is_ok();
+
+    if !is_up && (base.contains("127.0.0.1") || base.contains("localhost")) {
+        let ollaya_bin = Path::new("/usr/local/bin/ollaya");
+        if ollaya_bin.is_file() {
+            println!(
+                "    {} Ollaya daemon not running on {} — auto-starting local `/usr/local/bin/ollaya serve`...",
+                "⚙️".cyan(),
+                base
+            );
+            let models_dir = crate::registry::get_ollaya_models_dir(None)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/usr/share/ollaya/.ollaya/models"));
+            let _ = std::process::Command::new(ollaya_bin)
+                .arg("serve")
+                .env("OLLAYA_MODELS", models_dir)
+                .env("LD_LIBRARY_PATH", "/usr/local/lib/ollaya/llama:/opt/rocm/lib")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(350));
+                if ureq::get(&ver_url)
+                    .timeout(Duration::from_secs(1))
+                    .call()
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Evict any loaded models from VRAM before warming up `keep_model` so VRAM is free
+    // and any freshly re-registered manifest for `keep_model` is reloaded from disk.
+    let _ = keep_model;
+    let ps_url = format!("{}/api/ps", base);
+    if let Ok(resp) = ureq::get(&ps_url).timeout(Duration::from_secs(2)).call() {
+        if let Ok(json_val) = resp.into_json::<serde_json::Value>() {
+            if let Some(models) = json_val.get("models").and_then(|m| m.as_array()) {
+                for m in models {
+                    if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                        let _ = std::process::Command::new("/usr/local/bin/ollaya")
+                            .args(["stop", name])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Main entry point to run benchmark with SHA-256 binary cache control and Ollaya Bench methodology
 pub fn run_benchmark_with_options(
     model: &str,
@@ -2196,6 +2258,7 @@ pub fn run_benchmark_with_options(
     // Warm-up request only if at least one subset is not already cached
     if need_server {
         println!("\n  {} Checking Ollaya server connection and warming up...", "⏳".cyan());
+        ensure_ollaya_server_and_evict_others(server_url, model);
         let warm_req = SystemOneRequest {
             model,
             state: &serde_json::json!({"utterance": "ping"}),
@@ -2340,6 +2403,7 @@ pub fn run_benchmark_with_options(
 
     // Pass 2: Evaluate all subsets for baseline model (single model swap or instant SHA-256 cache hit)
     if let Some(base) = baseline {
+        let mut evicted_for_baseline = false;
         for (sub_name, sub_title) in &ordered_subset_names {
             if let Some(records) = datasets.get(*sub_name) {
                 let (eval_count, data_sha) = subset_hashes
@@ -2366,6 +2430,10 @@ pub fn run_benchmark_with_options(
                     pb.inc(eval_count as u64);
                     cached_sum
                 } else {
+                    if !evicted_for_baseline {
+                        ensure_ollaya_server_and_evict_others(server_url, base);
+                        evicted_for_baseline = true;
+                    }
                     pb.set_message(format!("{} ({}) [starting...]", sub_name, base));
                     let (res, fails) = runner.run_subset_with_failures_progress(
                         base,

@@ -1,16 +1,16 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::config::{AdaptArgs, ExportArgs, ExportFormat, LoraConfig, MergeArgs, TaskType, TrainingArgs};
+use crate::config::{AdaptArgs, ExportArgs, ExportFormat, LoraConfig, MergeArgs, RuntimeTarget, TaskType, TrainingArgs};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "trainaya",
     author = "Trainaya Team",
     version,
-    about = "High-performance Rust CLI orchestrating uv + PyTorch for training, adapting, and exporting Ollaya decision models",
+    about = "High-performance Rust CLI orchestrating uv + PyTorch for training, adapting, and exporting Ollaya & Ollama decision models",
     long_about = "Trainaya is a modular CLI written in Rust backed by an embedded uv + PyTorch engine for \
-                  end-to-end decision model fine-tuning, generic multi-architecture adaptation (e.g. Shieldstral -> Ollaya), \
+                  end-to-end decision model fine-tuning, generic multi-architecture adaptation (e.g. Shieldstral, Ministral, Gemma -> Ollaya/Ollama), \
                   temperature calibration, and zero-overhead export."
 )]
 pub struct Cli {
@@ -23,7 +23,7 @@ pub enum Commands {
     /// Fine-tune an encoder or decoder decision model end-to-end via uv + PyTorch
     Train(TrainOpts),
 
-    /// Adapt a non-decision model (e.g. Shieldstral, Mistral, Qwen, ModernBERT) into an Ollaya decision model
+    /// Adapt a non-decision model (e.g. Shieldstral, Ministral, Gemma, Qwen, ModernBERT) into a decision model
     Adapt(AdaptOpts),
 
     /// Permanently merge LoRA adapter weights with the base model into clean SafeTensors or GGUF
@@ -32,7 +32,7 @@ pub enum Commands {
     /// Export and package the model for ultra-fast serving in the Ollaya runtime
     Export(ExportOpts),
 
-    /// Register a fine-tuned, adapted, or merged model directly into the local Ollaya model store
+    /// Register a fine-tuned, adapted, or merged model directly into local Ollaya and/or Ollama model stores
     Register(RegisterOpts),
 
     /// Inspect system hardware, uv + PyTorch engine status, and runtime capabilities
@@ -51,15 +51,15 @@ pub enum Commands {
 
 #[derive(Args, Debug)]
 pub struct AdaptOpts {
-    /// Source model path (.gguf file, local directory, or HuggingFace repo ID like 'shieldstral' / 'mistralai/...')
+    /// Source model path (.gguf file, local directory, or HuggingFace repo ID like 'gemma-3-4b' / 'ministral')
     #[arg(long, alias = "model")]
     pub from: String,
 
-    /// Target Ollaya tag to register (e.g. 'shieldstral:v1', 'mistral-decision:v1')
+    /// Target model tag to register (e.g. 'gemma3:v1', 'ministral:v1')
     #[arg(short = 't', long = "target", alias = "tag")]
     pub target: String,
 
-    /// Target Ollaya layout: 'auto', 'llm-logits-v1', 'laya-markers-v1', or 'kev-pointer-v1'
+    /// Target layout: 'auto', 'llm-logits-v1', 'laya-markers-v1', or 'kev-pointer-v1'
     #[arg(long, default_value = "auto")]
     pub layout: String,
 
@@ -91,13 +91,17 @@ pub struct AdaptOpts {
     #[arg(long, default_value = "auto")]
     pub device: String,
 
+    /// Target runtime store(s) for registration: 'auto', 'ollaya', 'ollama', or 'both'
+    #[arg(long, default_value = "auto")]
+    pub runtime: RuntimeTarget,
+
     /// Custom Ollaya models store directory
     #[arg(long)]
     pub models_dir: Option<PathBuf>,
 }
 
 impl AdaptOpts {
-    pub fn into_adapt_args(self) -> (AdaptArgs, Option<PathBuf>) {
+    pub fn into_adapt_args(self) -> (AdaptArgs, Option<PathBuf>, RuntimeTarget) {
         let out_dir = self.output_dir.unwrap_or_else(|| {
             let safe = self.target.replace(':', "_");
             PathBuf::from(format!("./output_adapted_{}", safe))
@@ -116,6 +120,7 @@ impl AdaptOpts {
                 device: self.device,
             },
             self.models_dir,
+            self.runtime,
         )
     }
 }
@@ -504,10 +509,10 @@ impl From<ExportOpts> for ExportArgs {
 
 #[derive(Args, Debug)]
 pub struct RegisterOpts {
-    #[arg(short, long, alias = "model-path")]
+    #[arg(short, long, alias = "model-path", alias = "path")]
     pub model: PathBuf,
 
-    #[arg(short, long)]
+    #[arg(short, long, alias = "tag", alias = "target")]
     pub name: String,
 
     #[arg(long)]
@@ -515,6 +520,10 @@ pub struct RegisterOpts {
 
     #[arg(long)]
     pub tokenizer: Option<PathBuf>,
+
+    /// Target runtime store(s) for registration: 'auto', 'ollaya', 'ollama', or 'both'
+    #[arg(long, default_value = "auto")]
+    pub runtime: RuntimeTarget,
 
     #[arg(long)]
     pub models_dir: Option<PathBuf>,
@@ -528,6 +537,7 @@ impl From<RegisterOpts> for crate::registry::RegisterArgs {
             base_template: opts.template,
             tokenizer_path: opts.tokenizer,
             models_dir: opts.models_dir,
+            runtime: opts.runtime,
         }
     }
 }

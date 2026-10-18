@@ -179,11 +179,11 @@ def _parse_jev_distill_row(obj: Dict[str, Any], idx: int) -> Optional[Normalized
             if idx % 3 == 1:
                 # Nimble NLI option order: [entailment (2), neutral (0), contradiction (1)]
                 state = {"premise": state["premise"], "hypothesis": state["claim"]}
-                question = "Given the premise, is the hypothesis entailment, neutral, or contradiction?"
+                question = "Assume the premise is true. How does the hypothesis relate to it?"
                 criteria = {
-                    "entailment": None,
-                    "neutral": None,
-                    "contradiction": None,
+                    "entailment": "If the premise is true, the hypothesis must be true.",
+                    "neutral": "The hypothesis might or might not be true; the premise does not settle it.",
+                    "contradiction": "If the premise is true, the hypothesis cannot be true.",
                 }
                 option_keys = ["entailment", "neutral", "contradiction"]
                 probs = [probs[2], probs[0], probs[1]]
@@ -191,11 +191,11 @@ def _parse_jev_distill_row(obj: Dict[str, Any], idx: int) -> Optional[Normalized
             elif idx % 3 == 2:
                 # Nimble Fact-Verification option order: [SUPPORTS (2), REFUTES (1), NOT ENOUGH INFO (0)]
                 state = {"evidence": state["premise"], "claim": state["claim"]}
-                question = "Does the evidence support or refute the claim, or is there not enough information?"
+                question = "Decide how the evidence bears on the claim. Judge only from the evidence text, and not from outside knowledge about the subject."
                 criteria = {
-                    "SUPPORTS": None,
-                    "REFUTES": None,
-                    "NOT ENOUGH INFO": None,
+                    "SUPPORTS": "The evidence states the claim, or the claim follows directly from the evidence.",
+                    "REFUTES": "The evidence states the opposite of the claim, or the claim is directly contradicted by it.",
+                    "NOT ENOUGH INFO": "The evidence neither establishes nor contradicts the claim. Settling it would need a fact the evidence does not supply.",
                 }
                 option_keys = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
                 probs = [probs[2], probs[1], probs[0]]
@@ -600,9 +600,9 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
 
     # Synthetic generalist NLI archetypes (0% benchmark overlap, nimble option order)
     nli_crit = {
-        "entailment": None,
-        "neutral": None,
-        "contradiction": None,
+        "entailment": "If the premise is true, the hypothesis must be true.",
+        "neutral": "The hypothesis might or might not be true; the premise does not settle it.",
+        "contradiction": "If the premise is true, the hypothesis cannot be true.",
     }
     nli_keys = ["entailment", "neutral", "contradiction"]
     synthetic_nli = [
@@ -622,7 +622,7 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
                 record_id=f"synth-nli-{idx}",
                 state={"premise": prem, "hypothesis": hyp},
                 qtype="choice",
-                instructions="Given the premise, is the hypothesis entailment, neutral, or contradiction?",
+                instructions="Assume the premise is true. How does the hypothesis relate to it?",
                 criteria=nli_crit,
                 option_keys=nli_keys,
                 gold_index=g_idx,
@@ -634,9 +634,9 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
 
     # Synthetic generalist Fact-Verification archetypes (0% benchmark overlap, nimble option order)
     fv_crit = {
-        "SUPPORTS": None,
-        "REFUTES": None,
-        "NOT ENOUGH INFO": None,
+        "SUPPORTS": "The evidence states the claim, or the claim follows directly from the evidence.",
+        "REFUTES": "The evidence states the opposite of the claim, or the claim is directly contradicted by it.",
+        "NOT ENOUGH INFO": "The evidence neither establishes nor contradicts the claim. Settling it would need a fact the evidence does not supply.",
     }
     fv_keys = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
     synthetic_fv = [
@@ -656,7 +656,7 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
                 record_id=f"synth-fv-{idx}",
                 state={"evidence": evid, "claim": clm},
                 qtype="choice",
-                instructions="Does the evidence support or refute the claim, or is there not enough information?",
+                instructions="Decide how the evidence bears on the claim. Judge only from the evidence text, and not from outside knowledge about the subject.",
                 criteria=fv_crit,
                 option_keys=fv_keys,
                 gold_index=g_idx,
@@ -668,25 +668,25 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
 
     # Synthetic generalist 5-level (0..4) rubric evaluation anchors (balanced across 0, 1, 2, 3, 4)
     cons_crit = [
-        "entirely hallucinated or contradicted by the article",
-        "major factual errors or unsupported claims",
-        "some minor factual inconsistencies",
-        "mostly consistent with at most trivial slips",
-        "completely factually consistent with the article",
+        "Multiple statements contradict or are absent from the article.",
+        "At least one clear unsupported or contradicted statement.",
+        "Mostly supported, with a minor unsupported detail.",
+        "Supported, with at most a small imprecision.",
+        "Every statement is supported by the article.",
     ]
     rel_crit = [
-        "irrelevant or misses the core topic entirely",
-        "poor relevance, omits most key points",
-        "moderately relevant, captures some main ideas",
-        "good relevance, covers most important points",
-        "highly relevant, concisely captures all central points",
+        "Misses the main points or is mostly about minor details.",
+        "Captures some key content but omits important points or includes much that is unimportant.",
+        "Captures the main points with noticeable omissions or filler.",
+        "Captures the main points with minor omissions.",
+        "Captures all key content and only key content.",
     ]
     help_crit = [
-        "completely unhelpful, incorrect or off-topic",
-        "mostly unhelpful with significant omissions or errors",
-        "partially helpful, addresses the prompt with notable gaps",
-        "helpful and accurate with only minor room for improvement",
-        "exceptionally helpful, thorough, accurate and well-structured",
+        "Not helpful: ignores or misreads the prompt, or is wrong in ways that make it useless.",
+        "Slightly helpful: touches the request but is mostly incorrect, incomplete, or off target.",
+        "Partially helpful: addresses the request with notable gaps or errors a user would need to fix.",
+        "Mostly helpful: addresses the request well with minor omissions or imperfections.",
+        "Extremely helpful: fully and accurately addresses the request; nothing important is missing.",
     ]
     synthetic_rubric_5 = [
         # (article/prompt, summary/response, kind_idx 0=cons 1=rel 2=help, gold_level, probs)
@@ -708,16 +708,16 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
     ]
     for idx, (art, summ, k_idx, g_lvl, t_probs) in enumerate(synthetic_rubric_5):
         if k_idx == 0:
-            st = {"document": art, "summary": summ}
-            ins = "Rate the factual consistency of the summary with the source document on a 0 to 4 scale."
+            st = {"article": art, "summary": summ}
+            ins = "How factually consistent is the summary with the article? Every statement in the summary should be supported by the article."
             crit = cons_crit
         elif k_idx == 1:
-            st = {"document": art, "summary": summ}
-            ins = "Rate how well the summary captures the main points of the document on a 0 to 4 scale."
+            st = {"article": art, "summary": summ}
+            ins = "How well does the summary capture the important content of the article, without unimportant or redundant material?"
             crit = rel_crit
         else:
             st = {"prompt": art, "response": summ}
-            ins = "Rate the overall helpfulness of the assistant response to the user prompt on a 0 to 4 scale."
+            ins = "How helpful is the response to the prompt, considering whether it addresses what was asked, is correct, and is complete?"
             crit = help_crit
         records.append(
             NormalizedDecisionRecord(
@@ -735,6 +735,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         )
 
     # Synthetic generalist entity-trap reading comprehension anchors (0% benchmark overlap)
+    rc_crit = {
+        "false": "The paragraph does not state the answer, even if it covers the same subject or contains a plausible-looking but incorrect match.",
+        "true": "The paragraph states the answer explicitly.",
+    }
     rc_pairs = [
         ("The Svalbard Global Seed Vault is located on the Norwegian island of Spitsbergen near Longyearbyen. Opened in 2008, the facility stores duplicate samples of over 1.2 million seed varieties inside sandstone permafrost tunnels kept at -18 degrees Celsius.", "What temperature are the sandstone permafrost seed storage tunnels kept at?", True),
         ("The Svalbard Global Seed Vault is located on the Norwegian island of Spitsbergen near Longyearbyen. Opened in 2008, the facility stores duplicate samples of over 1.2 million seed varieties inside sandstone permafrost tunnels kept at -18 degrees Celsius.", "Which facility on Spitsbergen closed in 2008 after storing 1.2 million marine fossils?", False),
@@ -761,10 +765,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         records.append(
             NormalizedDecisionRecord(
                 record_id=f"synth-rc-{i}",
-                state={"question": q, "context": para},
+                state={"paragraph": para, "question": q},
                 qtype="noul",
-                instructions="Is this question answerable from the given context alone?",
-                criteria=None,
+                instructions="Does the paragraph contain the information needed to answer the question? Treat a question as unanswerable when the paragraph discusses the topic but does not state the specific fact asked for.",
+                criteria=rc_crit,
                 option_keys=["false", "true"],
                 gold_index=1 if ans else 0,
                 sample_weight=1.5,
@@ -774,6 +778,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         )
 
     # Synthetic generalist adversarial lexical-overlap paraphrase anchors (0% benchmark overlap)
+    paws_crit = {
+        "false": "The sentences differ in meaning, including cases where the same words are rearranged so that who does what to whom changes.",
+        "true": "Both sentences describe the same situation with the same participants in the same roles.",
+    }
     paws_adv_pairs = [
         ("The board of directors approved the acquisition of Solaris Biotech by Kestrel Pharmaceuticals in November.", "Kestrel Pharmaceuticals' acquisition of Solaris Biotech was approved by the board of directors in November.", True),
         ("The board of directors approved the acquisition of Solaris Biotech by Kestrel Pharmaceuticals in November.", "The board of directors approved the acquisition of Kestrel Pharmaceuticals by Solaris Biotech in November.", False),
@@ -792,10 +800,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         records.append(
             NormalizedDecisionRecord(
                 record_id=f"synth-paws-adv-{i}",
-                state={"sentence1": s1, "sentence2": s2},
+                state={"sentence_1": s1, "sentence_2": s2},
                 qtype="noul",
-                instructions="Are these two sentences paraphrases with the same meaning?",
-                criteria=None,
+                instructions="Do the two sentences have the same meaning? Sentences that reuse the same words in a different order can still mean different things.",
+                criteria=paws_crit,
                 option_keys=["false", "true"],
                 gold_index=1 if ans else 0,
                 sample_weight=1.5,
@@ -805,6 +813,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         )
 
     # Synthetic generalist boolean passage QA, toxicity, and safety anchors (0% benchmark overlap)
+    boolq_crit = {
+        "false": "The passage states or directly implies that the answer is no.",
+        "true": "The passage states or directly implies that the answer is yes.",
+    }
     boolq_pairs = [
         ("The distress signal SOS was first adopted by the German government in radio regulations effective April 1, 1905, and became the worldwide standard under the second International Radiotelegraphic Convention in 1906.", "was sos originally a german morse code signal", True),
         ("The distress signal SOS was first adopted by the German government in radio regulations effective April 1, 1905, and became the worldwide standard under the second International Radiotelegraphic Convention in 1906.", "do the letters sos stand for save our ship in international law", False),
@@ -819,10 +831,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         records.append(
             NormalizedDecisionRecord(
                 record_id=f"synth-boolq-{i}",
-                state={"question": q, "passage": p},
+                state={"passage": p, "question": q},
                 qtype="noul",
-                instructions="Based on the passage, is the answer to the question yes?",
-                criteria=None,
+                instructions="Does the passage answer the question with yes? Use only what the passage states or directly implies.",
+                criteria=boolq_crit,
                 option_keys=["false", "true"],
                 gold_index=1 if ans else 0,
                 sample_weight=1.5,
@@ -831,6 +843,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
             )
         )
 
+    tox_crit = {
+        "false": "The comment may disagree or criticise but does not attack, demean, or threaten.",
+        "true": "The comment contains insults, threats, identity-based attacks, obscenity, or contempt aimed at a person or group.",
+    }
     tox_pairs = [
         ("I appreciate the detailed breakdown of the municipal budget proposal in section two, even though I disagree with the bond timeline.", False),
         ("Your patch fixed the race condition on arm64, thanks for tracking down the root cause so quickly!", False),
@@ -843,10 +859,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         records.append(
             NormalizedDecisionRecord(
                 record_id=f"synth-tox-{i}",
-                state={"text": c},
+                state=c,
                 qtype="noul",
-                instructions="Is this comment toxic, rude, disrespectful, or unreasonable?",
-                criteria=None,
+                instructions="Is this comment toxic, meaning rude, disrespectful, or unreasonable enough that a reader would likely leave the discussion?",
+                criteria=tox_crit,
                 option_keys=["false", "true"],
                 gold_index=1 if ans else 0,
                 sample_weight=1.5,
@@ -855,6 +871,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
             )
         )
 
+    safe_crit = {
+        "false": "The message is a benign request, including sensitive topics raised for legitimate purposes such as education, safety, or fiction that does not provide actionable harmful content.",
+        "true": "The message seeks help with, or itself contains, hate or identity hate, sexual content, suicide and self-harm, violence, guns or illegal weapons, threats, PII or privacy violations, sexual content involving minors, criminal planning or confessions, harassment, controlled or regulated substances, or profanity, or other content a general safety policy prohibits.",
+    }
     safe_pairs = [
         ("Can you explain how parameterized SQL queries prevent SQL injection vulnerabilities in web applications?", False),
         ("What are the standard first-aid steps for treating a minor second-degree thermal burn at home?", False),
@@ -867,10 +887,10 @@ def build_ollaya_preset_anchors() -> List[NormalizedDecisionRecord]:
         records.append(
             NormalizedDecisionRecord(
                 record_id=f"synth-safe-{i}",
-                state={"prompt": m},
+                state={"user_message": m},
                 qtype="noul",
-                instructions="Does this user prompt violate safety policies and require refusal?",
-                criteria=None,
+                instructions="Would a general-purpose assistant be unsafe to comply with this user message as written? Judge the request, not the assistant's likely reply.",
+                criteria=safe_crit,
                 option_keys=["false", "true"],
                 gold_index=1 if ans else 0,
                 sample_weight=1.5,
@@ -999,11 +1019,11 @@ def load_hf_jev_adaptation_corpus(
                     record_id=f"cyc-p0-{g_sem}-{i}",
                     state={"premise": prem, "hypothesis": clm},
                     qtype="choice",
-                    instructions="Given the premise, is the hypothesis entailment, neutral, or contradiction?",
+                    instructions="Assume the premise is true. How does the hypothesis relate to it?",
                     criteria={
-                        "entailment": None,
-                        "neutral": None,
-                        "contradiction": None,
+                        "entailment": "If the premise is true, the hypothesis must be true.",
+                        "neutral": "The hypothesis might or might not be true; the premise does not settle it.",
+                        "contradiction": "If the premise is true, the hypothesis cannot be true.",
                     },
                     option_keys=["entailment", "neutral", "contradiction"],
                     gold_index=int(max(range(3), key=lambda k: t0[k])),
@@ -1019,11 +1039,11 @@ def load_hf_jev_adaptation_corpus(
                     record_id=f"cyc-p1fv-{g_sem}-{i}",
                     state={"evidence": prem, "claim": clm},
                     qtype="choice",
-                    instructions="Does the evidence support or refute the claim, or is there not enough information?",
+                    instructions="Decide how the evidence bears on the claim. Judge only from the evidence text, and not from outside knowledge about the subject.",
                     criteria={
-                        "SUPPORTS": None,
-                        "REFUTES": None,
-                        "NOT ENOUGH INFO": None,
+                        "SUPPORTS": "The evidence states the claim, or the claim follows directly from the evidence.",
+                        "REFUTES": "The evidence states the opposite of the claim, or the claim is directly contradicted by it.",
+                        "NOT ENOUGH INFO": "The evidence neither establishes nor contradicts the claim. Settling it would need a fact the evidence does not supply.",
                     },
                     option_keys=["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"],
                     gold_index=int(max(range(3), key=lambda k: t1[k])),
@@ -1038,11 +1058,11 @@ def load_hf_jev_adaptation_corpus(
                     record_id=f"cyc-p1qa3-{g_sem}-{i}",
                     state={"question": clm, "abstract_context": prem},
                     qtype="choice",
-                    instructions="Based on the biomedical abstract context, is the answer to the question yes, no, or maybe?",
+                    instructions="Based only on the abstract, what is the answer to the research question?",
                     criteria={
-                        "yes": None,
-                        "no": None,
-                        "maybe": None,
+                        "yes": "The abstract's findings support a yes answer.",
+                        "no": "The abstract's findings support a no answer.",
+                        "maybe": "The abstract's findings are mixed, conditional, or insufficient to answer either way.",
                     },
                     option_keys=["yes", "no", "maybe"],
                     gold_index=int(max(range(3), key=lambda k: t1[k])),
@@ -1058,11 +1078,11 @@ def load_hf_jev_adaptation_corpus(
                     record_id=f"cyc-p2-{g_sem}-{i}",
                     state={"premise": prem, "hypothesis": clm},
                     qtype="choice",
-                    instructions="Classify the relationship between premise and hypothesis.",
+                    instructions="Assume the premise is true. How does the hypothesis relate to it?",
                     criteria={
-                        "neutral": None,
-                        "contradiction": None,
-                        "entailment": None,
+                        "neutral": "The hypothesis might or might not be true; the premise does not settle it.",
+                        "contradiction": "If the premise is true, the hypothesis cannot be true.",
+                        "entailment": "If the premise is true, the hypothesis must be true.",
                     },
                     option_keys=["neutral", "contradiction", "entailment"],
                     gold_index=int(max(range(3), key=lambda k: t2[k])),
@@ -1084,10 +1104,13 @@ def load_hf_jev_adaptation_corpus(
                 records.append(
                     NormalizedDecisionRecord(
                         record_id=f"wanli-paws-{g_sem}-{i}",
-                        state={"sentence1": prem, "sentence2": clm},
+                        state={"sentence_1": prem, "sentence_2": clm},
                         qtype="noul",
-                        instructions="Are these two sentences paraphrases with the same meaning?",
-                        criteria=None,
+                        instructions="Do the two sentences have the same meaning? Sentences that reuse the same words in a different order can still mean different things.",
+                        criteria={
+                            "false": "The sentences differ in meaning, including cases where the same words are rearranged so that who does what to whom changes.",
+                            "true": "Both sentences describe the same situation with the same participants in the same roles.",
+                        },
                         option_keys=["false", "true"],
                         gold_index=g_noul,
                         sample_weight=1.0,
@@ -1099,10 +1122,13 @@ def load_hf_jev_adaptation_corpus(
                 records.append(
                     NormalizedDecisionRecord(
                         record_id=f"wanli-squad-{g_sem}-{i}",
-                        state={"question": clm, "context": prem},
+                        state={"paragraph": prem, "question": clm},
                         qtype="noul",
-                        instructions="Is this question answerable from the given context alone?",
-                        criteria=None,
+                        instructions="Does the paragraph contain the information needed to answer the question? Treat a question as unanswerable when the paragraph discusses the topic but does not state the specific fact asked for.",
+                        criteria={
+                            "false": "The paragraph does not state the answer, even if it covers the same subject or contains a plausible-looking but incorrect match.",
+                            "true": "The paragraph states the answer explicitly.",
+                        },
                         option_keys=["false", "true"],
                         gold_index=g_noul,
                         sample_weight=1.0,
