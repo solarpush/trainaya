@@ -55,95 +55,27 @@ SENTINEL_SYSTEM = "<<<OLLAYA_SYSTEM_7f3a9c2e>>>"
 SENTINEL_USER = "<<<OLLAYA_USER_7f3a9c2e>>>"
 
 KNOWN_GGUF_REPOS = {
-    "shieldstral": ("noctrex/Shieldstral-1.0-3B-GGUF", "Shieldstral-1.0-3B-Q4_K_M.gguf"),
-    "mistralai/shieldstral-1.0-3b": ("noctrex/Shieldstral-1.0-3B-GGUF", "Shieldstral-1.0-3B-Q4_K_M.gguf"),
-    "noctrex/shieldstral-1.0-3b-gguf": ("noctrex/Shieldstral-1.0-3B-GGUF", "Shieldstral-1.0-3B-Q4_K_M.gguf"),
-    "nani-nithin/shieldstral-1.0-3b-gguf": ("NANI-Nithin/Shieldstral-1.0-3B-GGUF", "Shieldstral-1.0-3B-Q4_K_M.gguf"),
-    "ministral": ("mistralai/Ministral-3-3B-Instruct-2512-GGUF", "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"),
-    "ministral-3b": ("mistralai/Ministral-3-3B-Instruct-2512-GGUF", "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"),
-    "mistral": ("mistralai/Ministral-3-3B-Instruct-2512-GGUF", "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"),
-    "mistral-3b": ("mistralai/Ministral-3-3B-Instruct-2512-GGUF", "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"),
-    "mistralai/ministral-3-3b-instruct-2512-gguf": (
+    "shieldstral": (
+        "noctrex/Shieldstral-1.0-3B-GGUF",
+        "Shieldstral-1.0-3B-Q4_K_M.gguf",
+    ),
+    "ministral-3b": (
         "mistralai/Ministral-3-3B-Instruct-2512-GGUF",
         "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
     ),
-    "phi-4": (
-        "bartowski/microsoft_Phi-4-mini-instruct-GGUF",
-        "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
+    "ministral-8b": (
+        "mistralai/Ministral-3-8B-Instruct-2512-GGUF",
+        "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf",
+    ),
+    "ministral-14b": (
+        "mistralai/Ministral-3-14B-Reasoning-2512-GGUF",
+        "Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf",
     ),
     "phi4": (
         "bartowski/microsoft_Phi-4-mini-instruct-GGUF",
         "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
     ),
-    "phi-4-mini": (
-        "bartowski/microsoft_Phi-4-mini-instruct-GGUF",
-        "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
-    ),
-    "microsoft/phi-4-mini-instruct": (
-        "bartowski/microsoft_Phi-4-mini-instruct-GGUF",
-        "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
-    ),
-    "ministral-8b": (
-        "bartowski/Ministral-8B-Instruct-2410-GGUF",
-        "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
-    ),
-    "mistral-8b": (
-        "bartowski/Ministral-8B-Instruct-2410-GGUF",
-        "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
-    ),
-    "ministral:8b": (
-        "bartowski/Ministral-8B-Instruct-2410-GGUF",
-        "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
-    ),
-    "mistral:8b": (
-        "bartowski/Ministral-8B-Instruct-2410-GGUF",
-        "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
-    ),
-    "mistralai/ministral-8b-instruct-2410": (
-        "bartowski/Ministral-8B-Instruct-2410-GGUF",
-        "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
-    ),
-    "gemma": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q4_K_M.gguf",
-    ),
-    "gemma3": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q4_K_M.gguf",
-    ),
     "gemma3:4b": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q4_K_M.gguf",
-    ),
-    "gemma-3-4b": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q4_K_M.gguf",
-    ),
-    "gemma-3-4b-it": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q4_K_M.gguf",
-    ),
-    "google/gemma-3-4b-it": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q4_K_M.gguf",
-    ),
-    "ggml-org/gemma-3-4b-it-gguf": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q4_K_M.gguf",
-    ),
-    "gemma-3-4b-q8": (
-        "ggml-org/gemma-3-4b-it-GGUF",
-        "gemma-3-4b-it-Q8_0.gguf",
-    ),
-    "push_ministral:3b": (
-        "mistralai/Ministral-3-3B-Instruct-2512-GGUF",
-        "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
-    ),
-    "push_ministral:8b": (
-        "bartowski/Ministral-8B-Instruct-2410-GGUF",
-        "Ministral-8B-Instruct-2410-Q4_K_M.gguf",
-    ),
-    "push_gemma3:4b": (
         "ggml-org/gemma-3-4b-it-GGUF",
         "gemma-3-4b-it-Q4_K_M.gguf",
     ),
@@ -431,15 +363,6 @@ def _try_resolve_gguf_from_hf(
     lower = source.strip().lower()
     if lower in KNOWN_GGUF_REPOS:
         repo_id, filename = KNOWN_GGUF_REPOS[lower]
-        if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
-            existing = os.path.join(output_dir, "model.gguf")
-            emit(
-                {
-                    "event": "status",
-                    "message": f"Resolved '{source}' from existing output GGUF ('{existing}').",
-                }
-            )
-            return existing
         try:
             from huggingface_hub import hf_hub_download
 
@@ -461,7 +384,21 @@ def _try_resolve_gguf_from_hf(
                 )
                 return hf_hub_download(repo_id=repo_id, filename=filename)
         except ImportError:
-            return _download_hf_file_direct(repo_id, filename, emit)
+            try:
+                return _download_hf_file_direct(repo_id, filename, emit)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):
+            existing = os.path.join(output_dir, "model.gguf")
+            emit(
+                {
+                    "event": "status",
+                    "message": f"Resolved '{source}' from existing output GGUF ('{existing}').",
+                }
+            )
+            return existing
 
     if "/" in source and not os.path.exists(source):
         if output_dir and os.path.exists(os.path.join(output_dir, "model.gguf")):

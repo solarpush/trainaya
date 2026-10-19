@@ -25,12 +25,33 @@ pub const PUBLIC_SUBSETS: &[(&str, &str, &str)] = &[
     ("pubmedqa", "PubMedQA pqa_labeled train", "Choice, 3"),
 ];
 
+/// The 14 official tasks of Ollaya Bench (bench.ollaya.dev/methodology):
+/// typed-decisions (400 states × 5 questions = 2,000 questions) + 13 public subsets (3,880 questions) = 5,880 questions total.
+pub const ALL_BENCHMARK_SUBSETS: &[(&str, &str, &str)] = &[
+    ("typed-decisions", "Typed Decisions test (400 states × 5q)", "Choice, noul, score"),
+    ("vitaminc-dev", "VitaminC dev", "Choice, 3"),
+    ("massive-en-US", "MASSIVE 1.1 en-US", "Choice, 18"),
+    ("massive-de-DE", "MASSIVE 1.1 de-DE", "Choice, 18"),
+    ("boolq", "BoolQ validation", "Noul"),
+    ("squad2", "SQuAD 2.0 validation", "Noul"),
+    ("paws", "PAWS labeled_final test", "Noul"),
+    ("multinli", "MultiNLI dev matched", "Choice, 3"),
+    ("civil_comments", "Civil Comments test", "Noul"),
+    ("aegis2", "Aegis AI Content Safety 2.0 test", "Noul"),
+    ("helpsteer2", "HelpSteer2 validation", "Score, 5"),
+    ("summeval-relevance", "SummEval relevance test", "Score, 5"),
+    ("summeval-consistency", "SummEval consistency test", "Score, 5"),
+    ("pubmedqa", "PubMedQA pqa_labeled train", "Choice, 3"),
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchRecord {
     #[serde(default)]
     pub id: String,
     #[serde(rename = "type", default = "default_type")]
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
     pub input: BenchInput,
     pub reference: BenchReference,
 }
@@ -68,6 +89,10 @@ struct SystemOneResponse {
     answers: HashMap<String, SystemOneAnswer>,
     #[serde(default)]
     usage: Option<serde_json::Value>,
+    #[serde(default)]
+    load_duration: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -101,50 +126,54 @@ fn default_chance() -> f64 {
     0.5
 }
 
-/// Compute random-guess chance probability (1/K) for a benchmark record following bench.ollaya.dev
-pub fn record_chance(record: &BenchRecord) -> f64 {
-    let decision = record
-        .input
-        .questions
-        .get("decision")
-        .or_else(|| record.input.questions.as_object().and_then(|m| m.values().next()));
-
-    let q_type = decision
-        .and_then(|d| d.get("type"))
+/// Compute random-guess chance probability (1/K) for a single question definition
+pub fn question_def_chance(q_def: &serde_json::Value, fallback_kind: &str) -> f64 {
+    let q_type = q_def
+        .get("type")
         .and_then(|v| v.as_str())
-        .unwrap_or(record.kind.as_str());
+        .unwrap_or(fallback_kind);
 
     if q_type == "noul" {
         return 0.5;
     }
 
-    if let Some(dec) = decision {
-        if let Some(crit) = dec.get("criteria") {
-            match crit {
-                serde_json::Value::Object(map) if !map.is_empty() => {
-                    return 1.0 / (map.len().max(2) as f64);
-                }
-                serde_json::Value::Array(arr) if !arr.is_empty() => {
-                    return 1.0 / (arr.len().max(2) as f64);
-                }
-                _ => {}
+    if let Some(crit) = q_def.get("criteria") {
+        match crit {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                return 1.0 / (map.len().max(2) as f64);
             }
+            serde_json::Value::Array(arr) if !arr.is_empty() => {
+                return 1.0 / (arr.len().max(2) as f64);
+            }
+            _ => {}
+        }
+    }
+    0.5
+}
+
+/// Compute random-guess chance probability (1/K) for a benchmark record following bench.ollaya.dev
+pub fn record_chance(record: &BenchRecord) -> f64 {
+    if let Some(decision) = record.input.questions.get("decision") {
+        return question_def_chance(decision, record.kind.as_str());
+    }
+    if let Some(map) = record.input.questions.as_object() {
+        if !map.is_empty() {
+            let sum: f64 = map
+                .values()
+                .map(|q| question_def_chance(q, record.kind.as_str()))
+                .sum();
+            return sum / (map.len() as f64);
         }
     }
     0.5
 }
 
 /// Extract ordered candidate label keys for multiclass Brier computation
-fn record_candidate_keys(record: &BenchRecord, kind: &str) -> Vec<String> {
+fn question_candidate_keys(q_def: Option<&serde_json::Value>, kind: &str) -> Vec<String> {
     if kind == "noul" {
         return vec!["false".to_string(), "true".to_string()];
     }
-    let decision = record
-        .input
-        .questions
-        .get("decision")
-        .or_else(|| record.input.questions.as_object().and_then(|m| m.values().next()));
-    if let Some(dec) = decision {
+    if let Some(dec) = q_def {
         if let Some(crit) = dec.get("criteria") {
             match crit {
                 serde_json::Value::Object(map) => {
@@ -242,11 +271,39 @@ pub struct SubsetSummary {
     pub ece10: f64,
     #[serde(default)]
     pub brier: f64,
+    /// Soft cross-entropy against gold distributions (for typed-decisions)
+    #[serde(default)]
+    pub soft_ce: f64,
     pub median_ms: f64,
     pub p95_ms: f64,
+    /// Per-question type accuracy breakdown (used by typed-decisions)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub by_type: HashMap<String, f64>,
+    /// Per-workflow accuracy breakdown (used by typed-decisions)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub by_workflow: HashMap<String, f64>,
     /// Per-probe (top_probability, correct, brier, chance) for exact pooled ECE and bootstrap CIs
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe_outcomes: Vec<(f64, bool, f64, f64)>,
+}
+
+/// Speed (5-question triage preset) and memory (VRAM / RAM) profile matching bench.ollaya.dev/methodology
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LatencyMemoryProfile {
+    /// Median client end-to-end latency (ms) over 20 timed 5-question triage requests
+    pub triage_p50_ms: f64,
+    /// p90 client end-to-end latency (ms) over 20 timed 5-question triage requests
+    pub triage_p90_ms: f64,
+    /// Cold load latency (ms)
+    pub load_ms: f64,
+    /// GPU VRAM used by the model (MB)
+    pub vram_mb: u64,
+    /// Host runner peak resident memory (MB)
+    pub ram_peak_mb: u64,
+    /// Parameter size label (e.g. "3B", "4B", "8B")
+    pub params: String,
+    /// Model license (e.g. "Apache-2.0")
+    pub license: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,12 +316,30 @@ pub struct BenchmarkRunResult {
     pub binary_sha256: Option<String>,
     pub total_records: usize,
     pub total_errors: usize,
-    /// Chance-corrected Public Skill Score (0..100) matching bench.ollaya.dev
+    /// Overall 14-task Chance-Corrected Skill Score (0..100) matching bench.ollaya.dev Leaderboard "Score"
     #[serde(default)]
     pub skill_score: f64,
     /// 95% bootstrap confidence interval for skill_score (1,000 draws, seed 20261014)
     #[serde(default)]
     pub skill_score_ci: [f64; 2],
+    /// 13-task Public Skill Score (0..100)
+    #[serde(default)]
+    pub public_skill_score: f64,
+    /// Macro accuracy on Bespoke Labs' 13 public subsets (3,880 questions) matching Leaderboard "Public"
+    #[serde(default)]
+    pub public_macro_accuracy: f64,
+    /// 10-bin Pooled ECE on the 13 public subsets matching Leaderboard "ECE"
+    #[serde(default)]
+    pub public_pooled_ece: f64,
+    /// Accuracy on typed-decisions (2,000 questions) matching Leaderboard "Typed"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_accuracy: Option<f64>,
+    /// 10-bin Pooled ECE on typed-decisions (2,000 questions)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_ece: Option<f64>,
+    /// Soft cross-entropy against gold distributions on typed-decisions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_soft_ce: Option<f64>,
     pub macro_accuracy: f64,
     /// 95% bootstrap confidence interval for macro_accuracy (0.0..1.0)
     #[serde(default)]
@@ -280,6 +355,9 @@ pub struct BenchmarkRunResult {
     pub by_type: HashMap<String, f64>,
     pub median_ms: f64,
     pub p95_ms: f64,
+    /// Dedicated 5-question triage latency and GPU VRAM profile matching bench.ollaya.dev
+    #[serde(default)]
+    pub latency_profile: LatencyMemoryProfile,
     pub per_subset: HashMap<String, SubsetSummary>,
 }
 
@@ -289,6 +367,183 @@ pub struct FullBenchmarkReport {
     pub evaluated_model: BenchmarkRunResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_model: Option<BenchmarkRunResult>,
+}
+
+/// Score a single answered question (choice, noul, or score) against its gold label and optional gold probability distribution.
+/// Returns (predicted_label, top_probability, is_correct, multiclass_brier, soft_cross_entropy).
+fn score_question_answer(
+    q_def: Option<&serde_json::Value>,
+    fallback_kind: &str,
+    gold_label: &serde_json::Value,
+    gold_probs: Option<&serde_json::Map<String, serde_json::Value>>,
+    answer: &SystemOneAnswer,
+) -> (String, f64, bool, f64, f64) {
+    let kind = answer
+        .kind
+        .as_deref()
+        .or_else(|| q_def.and_then(|d| d.get("type")).and_then(|v| v.as_str()))
+        .unwrap_or(fallback_kind);
+
+    let (predicted, top_prob, is_correct, brier) = match kind {
+        "noul" => {
+            let gold_bool = match gold_label {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => {
+                    s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+                }
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) == 1,
+                _ => false,
+            };
+
+            let p = answer
+                .noul
+                .or_else(|| {
+                    answer
+                        .probabilities
+                        .as_ref()
+                        .and_then(|pr| pr.get("true").copied())
+                })
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+            let pred_bool = p >= 0.5;
+            let top_p = if pred_bool { p } else { 1.0 - p };
+            let corr = pred_bool == gold_bool;
+            let gold_t = if gold_bool { 1.0 } else { 0.0 };
+            let brier_val = 2.0 * (p - gold_t).powi(2);
+            (pred_bool.to_string(), top_p, corr, brier_val)
+        }
+        "score" => {
+            let gold_str = match gold_label {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string().trim_matches('"').to_string(),
+            };
+
+            let best_key = if let Some(probs) = &answer.probabilities {
+                probs
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(k, _)| k.clone())
+                    .unwrap_or_else(|| "0".to_string())
+            } else if let Some(c) = &answer.choice {
+                c.clone()
+            } else if let Some(s) = answer.score {
+                s.round().to_string()
+            } else {
+                "0".to_string()
+            };
+
+            let top_p = answer
+                .probabilities
+                .as_ref()
+                .and_then(|p| p.get(&best_key).copied())
+                .or(answer.confidence)
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+
+            let corr = best_key.trim() == gold_str.trim();
+            let cand_keys = question_candidate_keys(q_def, "score");
+            let brier_val = if let Some(probs) = &answer.probabilities {
+                let keys: Vec<String> = if cand_keys.is_empty() {
+                    probs.keys().cloned().collect()
+                } else {
+                    cand_keys
+                };
+                keys.iter()
+                    .map(|k| {
+                        let pk = probs.get(k).copied().unwrap_or(0.0);
+                        let yk = if k.trim() == gold_str.trim() { 1.0 } else { 0.0 };
+                        (pk - yk).powi(2)
+                    })
+                    .sum()
+            } else {
+                let y = if corr { 1.0 } else { 0.0 };
+                (top_p - y).powi(2) + ((1.0 - top_p) - (1.0 - y)).powi(2)
+            };
+            (best_key, top_p, corr, brier_val)
+        }
+        _ => {
+            let gold_str = match gold_label {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string().trim_matches('"').to_string(),
+            };
+
+            let pred_choice = if let Some(probs) = &answer.probabilities {
+                probs
+                    .iter()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(k, _)| k.clone())
+                    .or_else(|| answer.choice.clone())
+                    .unwrap_or_default()
+            } else if let Some(c) = &answer.choice {
+                c.clone()
+            } else {
+                "".to_string()
+            };
+
+            let top_p = answer
+                .probabilities
+                .as_ref()
+                .and_then(|p| p.get(&pred_choice).copied())
+                .or(answer.confidence)
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+
+            let corr = pred_choice.trim().eq_ignore_ascii_case(gold_str.trim());
+            let cand_keys = question_candidate_keys(q_def, "choice");
+            let brier_val = if let Some(probs) = &answer.probabilities {
+                let keys: Vec<String> = if cand_keys.is_empty() {
+                    probs.keys().cloned().collect()
+                } else {
+                    cand_keys
+                };
+                keys.iter()
+                    .map(|k| {
+                        let pk = probs.get(k).copied().unwrap_or(0.0);
+                        let yk = if k.trim().eq_ignore_ascii_case(gold_str.trim()) {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        (pk - yk).powi(2)
+                    })
+                    .sum()
+            } else {
+                let y = if corr { 1.0 } else { 0.0 };
+                (top_p - y).powi(2) + ((1.0 - top_p) - (1.0 - y)).powi(2)
+            };
+            (pred_choice, top_p, corr, brier_val)
+        }
+    };
+
+    // Soft cross-entropy against gold probability distribution if provided
+    let soft_ce = if let Some(gp_map) = gold_probs {
+        let mut ce = 0.0;
+        for (k, v) in gp_map {
+            let p_gold = v.as_f64().unwrap_or(0.0);
+            if p_gold > 0.0 {
+                let p_pred = if kind == "noul" {
+                    let p_true = answer
+                        .noul
+                        .or_else(|| answer.probabilities.as_ref().and_then(|pr| pr.get("true").copied()))
+                        .unwrap_or(0.5);
+                    if k == "true" { p_true } else { 1.0 - p_true }
+                } else {
+                    answer
+                        .probabilities
+                        .as_ref()
+                        .and_then(|pr| pr.get(k).copied())
+                        .unwrap_or(1e-6)
+                };
+                ce -= p_gold * p_pred.clamp(1e-12, 1.0).ln();
+            }
+        }
+        ce
+    } else {
+        -top_prob.clamp(1e-12, 1.0).ln()
+    };
+
+    (predicted, top_prob.clamp(0.0, 1.0), is_correct, brier, soft_ce)
 }
 
 pub struct BenchRunner {
@@ -301,19 +556,14 @@ impl BenchRunner {
         Self { url, limit }
     }
 
-    /// Post one request to /v1/systemone with retry on transient network errors
-    pub fn evaluate_record(
-        &self,
-        model: &str,
-        record: &BenchRecord,
-    ) -> Result<EvaluationRow> {
+    /// Send one HTTP request to /v1/systemone with retry on transient network errors
+    fn post_systemone(&self, model: &str, record: &BenchRecord) -> (Option<SystemOneResponse>, f64, Option<String>) {
         let payload = SystemOneRequest {
             model,
             state: &record.input.state,
             questions: &record.input.questions,
         };
 
-        let chance = record_chance(record);
         let start = Instant::now();
         let api_url = format!("{}/v1/systemone", self.url.trim_end_matches('/'));
 
@@ -327,17 +577,15 @@ impl BenchRunner {
                 .timeout(Duration::from_secs(120))
                 .send_json(&payload)
             {
-                Ok(resp) => {
-                    match resp.into_json::<SystemOneResponse>() {
-                        Ok(parsed) => {
-                            resp_opt = Some(parsed);
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(format!("Failed to parse response: {}", e));
-                        }
+                Ok(resp) => match resp.into_json::<SystemOneResponse>() {
+                    Ok(parsed) => {
+                        resp_opt = Some(parsed);
+                        break;
                     }
-                }
+                    Err(e) => {
+                        last_err = Some(format!("Failed to parse response: {}", e));
+                    }
+                },
                 Err(ureq::Error::Status(code, resp)) => {
                     let err_body = resp.into_string().unwrap_or_default();
                     last_err = Some(format!("HTTP {}: {}", code, err_body));
@@ -356,6 +604,17 @@ impl BenchRunner {
         }
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        (resp_opt, elapsed_ms, last_err)
+    }
+
+    /// Post one single-question request to /v1/systemone with retry on transient network errors
+    pub fn evaluate_record(
+        &self,
+        model: &str,
+        record: &BenchRecord,
+    ) -> Result<EvaluationRow> {
+        let chance = record_chance(record);
+        let (resp_opt, elapsed_ms, last_err) = self.post_systemone(model, record);
 
         let resp = match resp_opt {
             Some(r) => r,
@@ -375,7 +634,6 @@ impl BenchRunner {
             }
         };
 
-        // Get the decision answer
         let answer = resp
             .answers
             .get("decision")
@@ -398,133 +656,14 @@ impl BenchRunner {
             }
         };
 
-        // Determine question kind
-        let kind = answer
-            .kind
-            .as_deref()
-            .unwrap_or_else(|| record.kind.as_str());
+        let q_def = record
+            .input
+            .questions
+            .get("decision")
+            .or_else(|| record.input.questions.as_object().and_then(|m| m.values().next()));
 
-        let (predicted, top_prob, correct, brier) = match kind {
-            "noul" => {
-                let gold_bool = match &record.reference.label {
-                    serde_json::Value::Bool(b) => *b,
-                    serde_json::Value::String(s) => s.to_lowercase() == "true" || s.to_lowercase() == "yes",
-                    serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) == 1,
-                    _ => false,
-                };
-
-                let p = answer.noul.unwrap_or(0.5).clamp(0.0, 1.0);
-                let pred_bool = p >= 0.5;
-                let top_p = if pred_bool { p } else { 1.0 - p };
-                let is_correct = pred_bool == gold_bool;
-                let gold_t = if gold_bool { 1.0 } else { 0.0 };
-                // Multiclass Brier over {"false": 1 - p, "true": p}
-                let brier_val = 2.0 * (p - gold_t).powi(2);
-                (pred_bool.to_string(), top_p, is_correct, brier_val)
-            }
-            "score" => {
-                let gold_str = match &record.reference.label {
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-
-                let best_key = if let Some(probs) = &answer.probabilities {
-                    probs
-                        .iter()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(k, _)| k.clone())
-                        .unwrap_or_else(|| "0".to_string())
-                } else if let Some(c) = &answer.choice {
-                    c.clone()
-                } else if let Some(s) = answer.score {
-                    s.round().to_string()
-                } else {
-                    "0".to_string()
-                };
-
-                let top_p = answer
-                    .probabilities
-                    .as_ref()
-                    .and_then(|p| p.get(&best_key).copied())
-                    .or(answer.confidence)
-                    .unwrap_or(0.5)
-                    .clamp(0.0, 1.0);
-
-                let is_correct = best_key.trim() == gold_str.trim();
-                let cand_keys = record_candidate_keys(record, "score");
-                let brier_val = if let Some(probs) = &answer.probabilities {
-                    let keys: Vec<String> = if cand_keys.is_empty() {
-                        probs.keys().cloned().collect()
-                    } else {
-                        cand_keys
-                    };
-                    keys.iter()
-                        .map(|k| {
-                            let pk = probs.get(k).copied().unwrap_or(0.0);
-                            let yk = if k.trim() == gold_str.trim() { 1.0 } else { 0.0 };
-                            (pk - yk).powi(2)
-                        })
-                        .sum()
-                } else {
-                    let y = if is_correct { 1.0 } else { 0.0 };
-                    (top_p - y).powi(2) + ((1.0 - top_p) - (1.0 - y)).powi(2)
-                };
-                (best_key, top_p, is_correct, brier_val)
-            }
-            _ => {
-                // choice
-                let gold_str = match &record.reference.label {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string().trim_matches('"').to_string(),
-                };
-
-                let pred_choice = if let Some(c) = &answer.choice {
-                    c.clone()
-                } else if let Some(probs) = &answer.probabilities {
-                    probs
-                        .iter()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(k, _)| k.clone())
-                        .unwrap_or_default()
-                } else {
-                    "".to_string()
-                };
-
-                let top_p = answer
-                    .probabilities
-                    .as_ref()
-                    .and_then(|p| p.get(&pred_choice).copied())
-                    .or(answer.confidence)
-                    .unwrap_or(0.5)
-                    .clamp(0.0, 1.0);
-
-                let is_correct = pred_choice.trim().eq_ignore_ascii_case(gold_str.trim());
-                let cand_keys = record_candidate_keys(record, "choice");
-                let brier_val = if let Some(probs) = &answer.probabilities {
-                    let keys: Vec<String> = if cand_keys.is_empty() {
-                        probs.keys().cloned().collect()
-                    } else {
-                        cand_keys
-                    };
-                    keys.iter()
-                        .map(|k| {
-                            let pk = probs.get(k).copied().unwrap_or(0.0);
-                            let yk = if k.trim().eq_ignore_ascii_case(gold_str.trim()) {
-                                1.0
-                            } else {
-                                0.0
-                            };
-                            (pk - yk).powi(2)
-                        })
-                        .sum()
-                } else {
-                    let y = if is_correct { 1.0 } else { 0.0 };
-                    (top_p - y).powi(2) + ((1.0 - top_p) - (1.0 - y)).powi(2)
-                };
-                (pred_choice, top_p, is_correct, brier_val)
-            }
-        };
+        let (predicted, top_prob, correct, brier, _) =
+            score_question_answer(q_def, record.kind.as_str(), &record.reference.label, None, answer);
 
         let clean_ref = match &record.reference.label {
             serde_json::Value::String(s) => s.clone(),
@@ -534,7 +673,7 @@ impl BenchRunner {
         Ok(EvaluationRow {
             id: record.id.clone(),
             correct,
-            top_probability: top_prob.clamp(0.0, 1.0),
+            top_probability: top_prob,
             elapsed_ms,
             predicted,
             reference: clean_ref,
@@ -596,12 +735,22 @@ impl BenchRunner {
                     skill: 0.0,
                     ece10: 0.0,
                     brier: 0.0,
+                    soft_ce: 0.0,
                     median_ms: 0.0,
                     p95_ms: 0.0,
+                    by_type: HashMap::new(),
+                    by_workflow: HashMap::new(),
                     probe_outcomes: Vec::new(),
                 },
                 Vec::new(),
             ));
+        }
+
+        let is_multi_question = subset_name == "typed-decisions"
+            || records.first().is_some_and(|r| r.kind == "typed");
+
+        if is_multi_question {
+            return self.run_typed_decisions_subset(model, subset_name, subset_title, records, pb);
         }
 
         let subset_kind = records
@@ -621,8 +770,11 @@ impl BenchRunner {
 
         for (idx, record) in records.iter().enumerate() {
             let row = self.evaluate_record(model, record)?;
+            chance_sum += row.chance;
             if row.error.is_some() {
+                // Per bench.ollaya.dev/methodology: a rejected request counts as wrong on the task
                 errors += 1;
+                probe_outcomes.push((0.0, false, 1.0, row.chance));
             } else {
                 if row.correct {
                     correct_count += 1;
@@ -645,7 +797,6 @@ impl BenchRunner {
                 ece_pairs.push((row.top_probability, row.correct));
                 probe_outcomes.push((row.top_probability, row.correct, row.brier, row.chance));
                 brier_sum += row.brier;
-                chance_sum += row.chance;
             }
             rows.push(row);
 
@@ -674,26 +825,27 @@ impl BenchRunner {
             latencies[idx.saturating_sub(1).min(latencies.len() - 1)]
         };
 
-        let valid_n = probe_outcomes.len();
-        let accuracy = if valid_n == 0 {
+        let total_n = probe_outcomes.len();
+        let answered_n = ece_pairs.len();
+        let accuracy = if total_n == 0 {
             0.0
         } else {
-            correct_count as f64 / valid_n as f64
+            correct_count as f64 / total_n as f64
         };
-        let chance = if valid_n == 0 {
+        let chance = if total_n == 0 {
             record_chance(&records[0])
         } else {
-            chance_sum / valid_n as f64
+            chance_sum / total_n as f64
         };
         let skill = if (1.0 - chance).abs() < 1e-9 {
             0.0
         } else {
             100.0 * (accuracy - chance) / (1.0 - chance)
         };
-        let brier = if valid_n == 0 {
+        let brier = if answered_n == 0 {
             0.0
         } else {
-            brier_sum / valid_n as f64
+            brier_sum / answered_n as f64
         };
 
         let ece10 = compute_ece(&ece_pairs, 10);
@@ -703,15 +855,244 @@ impl BenchRunner {
                 subset: subset_name.to_string(),
                 title: subset_title.to_string(),
                 kind: subset_kind,
-                count: rows.len(),
+                count: total_n,
                 errors,
                 accuracy,
                 chance,
                 skill,
                 ece10,
                 brier,
+                soft_ce: 0.0,
                 median_ms,
                 p95_ms,
+                by_type: HashMap::new(),
+                by_workflow: HashMap::new(),
+                probe_outcomes,
+            },
+            failures,
+        ))
+    }
+
+    /// Evaluate the 14th task (`typed-decisions`): 400 JSON states, 5 typed questions per state sent in a single HTTP request (2,000 questions total)
+    fn run_typed_decisions_subset(
+        &self,
+        model: &str,
+        subset_name: &str,
+        subset_title: &str,
+        records: &[BenchRecord],
+        pb: Option<&ProgressBar>,
+    ) -> Result<(SubsetSummary, Vec<FailureExportRecord>)> {
+        let total_states = records.len();
+        let mut latencies = Vec::with_capacity(total_states);
+        let mut ece_pairs = Vec::with_capacity(total_states * 5);
+        let mut probe_outcomes = Vec::with_capacity(total_states * 5);
+        let mut failures = Vec::new();
+        let mut errors = 0usize;
+        let mut correct_count = 0usize;
+        let mut total_questions = 0usize;
+        let mut brier_sum = 0.0;
+        let mut soft_ce_sum = 0.0;
+        let mut chance_sum = 0.0;
+        let mut by_type_counts: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut by_wf_counts: HashMap<String, (usize, usize)> = HashMap::new();
+
+        for (state_idx, record) in records.iter().enumerate() {
+            let (resp_opt, elapsed_ms, _last_err) = self.post_systemone(model, record);
+            let q_map = record.input.questions.as_object();
+            let gold_map = record.reference.label.as_object();
+
+            let mut q_keys: Vec<String> = q_map
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            q_keys.sort();
+
+            let wf_name = record
+                .workflow
+                .clone()
+                .unwrap_or_else(|| "general".to_string());
+
+            if let Some(ref resp) = resp_opt {
+                latencies.push(elapsed_ms);
+                for q_key in &q_keys {
+                    let q_def = q_map.and_then(|m| m.get(q_key));
+                    let q_type = q_def
+                        .and_then(|d| d.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("choice")
+                        .to_string();
+                    let q_chance = q_def
+                        .map(|d| question_def_chance(d, &q_type))
+                        .unwrap_or(0.5);
+                    chance_sum += q_chance;
+                    total_questions += 1;
+
+                    let gold_entry = gold_map.and_then(|g| g.get(q_key));
+                    let gold_lbl = gold_entry
+                        .and_then(|ge| ge.get("label"))
+                        .unwrap_or(&serde_json::Value::Null);
+                    let gold_probs = gold_entry
+                        .and_then(|ge| ge.get("probabilities"))
+                        .and_then(|p| p.as_object());
+
+                    if let Some(ans) = resp.answers.get(q_key) {
+                        let (pred, top_p, is_corr, brier_v, ce_v) =
+                            score_question_answer(q_def, &q_type, gold_lbl, gold_probs, ans);
+                        if is_corr {
+                            correct_count += 1;
+                        }
+                        let ty_stat = by_type_counts.entry(q_type.clone()).or_insert((0, 0));
+                        if is_corr {
+                            ty_stat.0 += 1;
+                        }
+                        ty_stat.1 += 1;
+
+                        let wf_stat = by_wf_counts.entry(wf_name.clone()).or_insert((0, 0));
+                        if is_corr {
+                            wf_stat.0 += 1;
+                        }
+                        wf_stat.1 += 1;
+
+                        ece_pairs.push((top_p, is_corr));
+                        probe_outcomes.push((top_p, is_corr, brier_v, q_chance));
+                        brier_sum += brier_v;
+                        soft_ce_sum += ce_v;
+
+                        let eval_row = EvaluationRow {
+                            id: format!("{}::{}", record.id, q_key),
+                            correct: is_corr,
+                            top_probability: top_p,
+                            elapsed_ms,
+                            predicted: pred.clone(),
+                            reference: gold_lbl.to_string().trim_matches('"').to_string(),
+                            brier: brier_v,
+                            chance: q_chance,
+                            error: None,
+                        };
+                        if let Some(ft) = classify_failure_row(&eval_row) {
+                            failures.push(FailureExportRecord {
+                                id: eval_row.id,
+                                subset: subset_name.to_string(),
+                                kind: q_type,
+                                text: format!("{} | Question ({}): {:?}", record.input.state, q_key, q_def),
+                                state: record.input.state.clone(),
+                                questions: serde_json::json!({ "decision": q_def }),
+                                gold_label: eval_row.reference,
+                                predicted_label: pred,
+                                confidence: top_p,
+                                failure_type: ft.to_string(),
+                            });
+                        }
+                    } else {
+                        errors += 1;
+                        probe_outcomes.push((0.0, false, 1.0, q_chance));
+                        by_type_counts.entry(q_type).or_insert((0, 0)).1 += 1;
+                        by_wf_counts.entry(wf_name.clone()).or_insert((0, 0)).1 += 1;
+                    }
+                }
+            } else {
+                // Rejected state request counts as wrong on all 5 of its questions
+                let n_q = q_keys.len().max(5);
+                errors += n_q;
+                for q_key in &q_keys {
+                    let q_def = q_map.and_then(|m| m.get(q_key));
+                    let q_type = q_def
+                        .and_then(|d| d.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("choice")
+                        .to_string();
+                    let q_chance = q_def
+                        .map(|d| question_def_chance(d, &q_type))
+                        .unwrap_or(0.5);
+                    chance_sum += q_chance;
+                    total_questions += 1;
+                    probe_outcomes.push((0.0, false, 1.0, q_chance));
+                    by_type_counts.entry(q_type).or_insert((0, 0)).1 += 1;
+                    by_wf_counts.entry(wf_name.clone()).or_insert((0, 0)).1 += 1;
+                }
+            }
+
+            if let Some(bar) = pb {
+                let done_states = state_idx + 1;
+                let live_acc = if total_questions > 0 {
+                    (correct_count as f64 / total_questions as f64) * 100.0
+                } else {
+                    0.0
+                };
+                bar.set_message(format!(
+                    "{} [{}/{} states ({}q) | acc: {:.1}%]",
+                    subset_name, done_states, total_states, total_questions, live_acc
+                ));
+                bar.inc(1);
+            }
+        }
+
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_ms = if latencies.is_empty() {
+            0.0
+        } else {
+            latencies[latencies.len() / 2]
+        };
+        let p95_ms = if latencies.is_empty() {
+            0.0
+        } else {
+            let idx = ((latencies.len() as f64) * 0.95).ceil() as usize;
+            latencies[idx.saturating_sub(1).min(latencies.len() - 1)]
+        };
+
+        let answered_n = ece_pairs.len();
+        let accuracy = if total_questions == 0 {
+            0.0
+        } else {
+            correct_count as f64 / total_questions as f64
+        };
+        let chance = if total_questions == 0 {
+            0.317
+        } else {
+            chance_sum / total_questions as f64
+        };
+        let skill = if (1.0 - chance).abs() < 1e-9 {
+            0.0
+        } else {
+            100.0 * (accuracy - chance) / (1.0 - chance)
+        };
+        let brier = if answered_n == 0 {
+            0.0
+        } else {
+            brier_sum / answered_n as f64
+        };
+        let soft_ce = if answered_n == 0 {
+            0.0
+        } else {
+            soft_ce_sum / answered_n as f64
+        };
+        let ece10 = compute_ece(&ece_pairs, 10);
+
+        let by_type = by_type_counts
+            .into_iter()
+            .map(|(k, (c, t))| (k, if t > 0 { c as f64 / t as f64 } else { 0.0 }))
+            .collect();
+        let by_workflow = by_wf_counts
+            .into_iter()
+            .map(|(k, (c, t))| (k, if t > 0 { c as f64 / t as f64 } else { 0.0 }))
+            .collect();
+
+        Ok((
+            SubsetSummary {
+                subset: subset_name.to_string(),
+                title: subset_title.to_string(),
+                kind: "typed".to_string(),
+                count: total_questions,
+                errors,
+                accuracy,
+                chance,
+                skill,
+                ece10,
+                brier,
+                soft_ce,
+                median_ms,
+                p95_ms,
+                by_type,
+                by_workflow,
                 probe_outcomes,
             },
             failures,
@@ -1135,6 +1516,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("vitaminc-dev-{}", idx + 1),
                     kind: "choice".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "evidence": evidence, "claim": claim }),
                         questions: q_tmpl.clone(),
@@ -1155,6 +1537,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("massive-en-{}", idx + 1),
                     kind: "choice".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "utterance": text, "locale": "en-US" }),
                         questions: q_tmpl.clone(),
@@ -1175,6 +1558,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("massive-de-{}", idx + 1),
                     kind: "choice".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "utterance": text, "locale": "de-DE" }),
                         questions: q_tmpl.clone(),
@@ -1195,6 +1579,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("boolq-{}", idx + 1),
                     kind: "noul".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "passage": passage, "question": question }),
                         questions: q_tmpl.clone(),
@@ -1220,6 +1605,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("squad2-{}", idx + 1),
                     kind: "noul".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "paragraph": paragraph, "question": question }),
                         questions: q_tmpl.clone(),
@@ -1240,6 +1626,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("paws-{}", idx + 1),
                     kind: "noul".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "sentence_1": s1, "sentence_2": s2 }),
                         questions: q_tmpl.clone(),
@@ -1265,6 +1652,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("multinli-{}", idx + 1),
                     kind: "choice".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "premise": premise, "hypothesis": hypothesis }),
                         questions: q_tmpl.clone(),
@@ -1284,6 +1672,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("civil-{}", idx + 1),
                     kind: "noul".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!(comment),
                         questions: q_tmpl.clone(),
@@ -1307,6 +1696,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("aegis-{}", idx + 1),
                     kind: "noul".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "user_message": msg }),
                         questions: q_tmpl.clone(),
@@ -1333,6 +1723,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("helpsteer-{}", idx + 1),
                     kind: "score".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({ "prompt": prompt, "response": response }),
                         questions: q_tmpl.clone(),
@@ -1361,6 +1752,7 @@ pub fn fetch_and_cache_public_subset(
                             records.push(BenchRecord {
                                 id: format!("{}-{}", subset_name, records.len() + 1),
                                 kind: "score".to_string(),
+                                workflow: None,
                                 input: BenchInput {
                                     state: serde_json::json!({ "article": article, "summary": summary }),
                                     questions: q_tmpl.clone(),
@@ -1404,6 +1796,7 @@ pub fn fetch_and_cache_public_subset(
                 records.push(BenchRecord {
                     id: format!("pubmedqa-{}", idx + 1),
                     kind: "choice".to_string(),
+                    workflow: None,
                     input: BenchInput {
                         state: serde_json::json!({
                             "question": question,
@@ -1414,6 +1807,44 @@ pub fn fetch_and_cache_public_subset(
                     reference: BenchReference {
                         label: serde_json::json!(decision),
                         distribution: None,
+                    },
+                });
+            }
+        }
+        "typed-decisions" => {
+            let raw = fetch_hf_rows("LocalLLaMA/typed-decisions", "all", "test", 400)?;
+            for (idx, r) in raw.into_iter().enumerate() {
+                let id = r
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("typed-decisions-{}", idx + 1));
+                let workflow = r
+                    .get("workflow")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let state_str = r.get("state").and_then(|v| v.as_str()).unwrap_or("{}");
+                let questions_str = r.get("questions").and_then(|v| v.as_str()).unwrap_or("{}");
+                let gold_str = r.get("gold").and_then(|v| v.as_str()).unwrap_or("{}");
+
+                let state_val: serde_json::Value =
+                    serde_json::from_str(state_str).unwrap_or_else(|_| serde_json::json!(state_str));
+                let questions_val: serde_json::Value =
+                    serde_json::from_str(questions_str).unwrap_or_else(|_| serde_json::json!({}));
+                let gold_val: serde_json::Value =
+                    serde_json::from_str(gold_str).unwrap_or_else(|_| serde_json::json!({}));
+
+                records.push(BenchRecord {
+                    id,
+                    kind: "typed".to_string(),
+                    workflow,
+                    input: BenchInput {
+                        state: state_val,
+                        questions: questions_val,
+                    },
+                    reference: BenchReference {
+                        label: gold_val.clone(),
+                        distribution: Some(gold_val),
                     },
                 });
             }
@@ -1456,7 +1887,7 @@ pub fn resolve_benchmark_data(
                 return result;
             }
         } else if dir.is_dir() {
-            for (sub_name, _, _) in PUBLIC_SUBSETS {
+            for (sub_name, _, _) in ALL_BENCHMARK_SUBSETS {
                 if let Some(req) = requested_subsets {
                     if !req.iter().any(|r| r.eq_ignore_ascii_case(sub_name)) {
                         continue;
@@ -1486,7 +1917,7 @@ pub fn resolve_benchmark_data(
     let cache_root = get_benchmark_cache_dir();
     let built_in = get_builtin_subsets();
 
-    for (sub_name, _, _) in PUBLIC_SUBSETS {
+    for (sub_name, _, _) in ALL_BENCHMARK_SUBSETS {
         if let Some(req) = requested_subsets {
             if !req.iter().any(|r| r.eq_ignore_ascii_case(sub_name)) {
                 continue;
@@ -1513,7 +1944,7 @@ pub fn resolve_benchmark_data(
         if let Some(template_recs) = built_in.get(*sub_name) {
             if let Some(first_rec) = template_recs.first() {
                 println!(
-                    "    {} Caching public benchmark subset '{}' into {:?}...",
+                    "    {} Caching benchmark subset '{}' into {:?}...",
                     "⬇️".cyan(),
                     sub_name.bold(),
                     cache_root.join(sub_name)
@@ -1863,9 +2294,14 @@ fn load_cached_subset_result(
     let path = get_subset_cache_path(identity, subset_name, eval_count, subset_data_sha256);
     let raw = std::fs::read_to_string(&path).ok()?;
     let entry: CachedSubsetEntry = serde_json::from_str(&raw).ok()?;
+    let expected_questions = if subset_name == "typed-decisions" {
+        eval_count * 5
+    } else {
+        eval_count
+    };
     if entry.composite_binary_sha256 == identity.composite_binary_sha256
         && entry.subset_data_sha256 == subset_data_sha256
-        && entry.summary.count == eval_count
+        && (entry.summary.count == expected_questions || entry.summary.count == eval_count)
         && entry.summary.errors == 0
     {
         Some((entry.summary, entry.failures))
@@ -1903,10 +2339,11 @@ fn save_cached_subset_result(
     }
 }
 
-/// Compute 95% bootstrap confidence intervals (1,000 draws, seed 20261014) for Public Skill Score and Macro Accuracy
-/// following bench.ollaya.dev (bench_edition.py)
+/// Compute 95% bootstrap confidence intervals (1,000 draws, seed 20261014) for Overall 14-task Skill Score and Macro Accuracy
+/// following bench.ollaya.dev/methodology:
+/// "questions are resampled within each public subset, and typed-decisions states are resampled whole, their five questions together."
 pub fn compute_bootstrap_cis(summaries: &HashMap<String, SubsetSummary>) -> ([f64; 2], [f64; 2]) {
-    let active_subsets: Vec<&SubsetSummary> = PUBLIC_SUBSETS
+    let active_subsets: Vec<&SubsetSummary> = ALL_BENCHMARK_SUBSETS
         .iter()
         .filter_map(|(name, _, _)| summaries.get(*name))
         .filter(|s| !s.probe_outcomes.is_empty())
@@ -1949,14 +2386,33 @@ pub fn compute_bootstrap_cis(summaries: &HashMap<String, SubsetSummary>) -> ([f6
             let n = items.len();
             let mut c_sum = 0.0;
             let mut ch_sum = 0.0;
-            for _ in 0..n {
-                let idx = (next_u64() as usize) % n;
-                let (_, correct, _, chance) = items[idx];
-                if correct {
-                    c_sum += 1.0;
+
+            if sub.subset == "typed-decisions" && n >= 5 && n % 5 == 0 {
+                // Resample whole states (5 questions together)
+                let n_states = n / 5;
+                for _ in 0..n_states {
+                    let s_idx = (next_u64() as usize) % n_states;
+                    let base = s_idx * 5;
+                    for q_off in 0..5 {
+                        let (_, correct, _, chance) = items[base + q_off];
+                        if correct {
+                            c_sum += 1.0;
+                        }
+                        ch_sum += chance;
+                    }
                 }
-                ch_sum += chance;
+            } else {
+                // Resample individual questions within each public subset
+                for _ in 0..n {
+                    let idx = (next_u64() as usize) % n;
+                    let (_, correct, _, chance) = items[idx];
+                    if correct {
+                        c_sum += 1.0;
+                    }
+                    ch_sum += chance;
+                }
             }
+
             let acc = c_sum / (n as f64);
             let ch = ch_sum / (n as f64);
             let sk = if (1.0 - ch).abs() < 1e-9 {
@@ -2121,6 +2577,285 @@ fn ensure_ollaya_server_and_evict_others(server_url: &str, keep_model: &str) {
     }
 }
 
+/// Read current GPU VRAM used in MB from Linux DRM sysfs (AMD ROCm / Intel) or `nvidia-smi`
+fn sample_gpu_vram_mb() -> Option<f64> {
+    // 1. Check /sys/class/drm/card*/device/mem_info_vram_used (zero-overhead sysfs on ROCm/AMDGPU)
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        let mut max_bytes: u64 = 0;
+        for entry in entries.flatten() {
+            let path = entry.path().join("device/mem_info_vram_used");
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Ok(bytes) = raw.trim().parse::<u64>() {
+                    if bytes > max_bytes {
+                        max_bytes = bytes;
+                    }
+                }
+            }
+        }
+        if max_bytes > 0 {
+            return Some((max_bytes as f64) / (1024.0 * 1024.0));
+        }
+    }
+
+    // 2. Fallback to nvidia-smi on NVIDIA CUDA hosts
+    if let Ok(out) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(first_line) = text.lines().next() {
+                if let Ok(mb) = first_line.trim().parse::<f64>() {
+                    if mb > 0.0 {
+                        return Some(mb);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve model parameter count and license metadata from Ollaya manifest or model name heuristics
+fn resolve_model_params_and_license(model: &str, server_url: &str) -> (String, String) {
+    let lower = model.to_lowercase();
+    let mut params = if lower.contains("e2b") {
+        "2B (5.1B total)".to_string()
+    } else if lower.contains("e4b") {
+        "4B (8B total)".to_string()
+    } else if lower.contains("270m") {
+        "270M".to_string()
+    } else if lower.contains("14b") {
+        "14B".to_string()
+    } else if lower.contains("8b") {
+        "8B".to_string()
+    } else if lower.contains("7b") {
+        "7B".to_string()
+    } else if lower.contains("4b") {
+        "4B".to_string()
+    } else if lower.contains("3b") || lower.contains("ministral:v1") {
+        "3B".to_string()
+    } else if lower.contains("1b") {
+        "1B".to_string()
+    } else {
+        "Custom".to_string()
+    };
+
+    let license = if lower.contains("winnow") || lower.contains("gemma") {
+        "Apache 2.0".to_string()
+    } else if lower.contains("ministral") || lower.contains("mistral") {
+        "Apache 2.0".to_string()
+    } else if lower.contains("qwen") {
+        "Apache 2.0".to_string()
+    } else if lower.contains("llama") {
+        "Llama 3".to_string()
+    } else {
+        "Apache 2.0".to_string()
+    };
+
+    // Check `/api/ps` for live parameter_size if reported by Ollaya
+    let ps_url = format!("{}/api/ps", server_url.trim_end_matches('/'));
+    if let Ok(resp) = ureq::get(&ps_url).timeout(Duration::from_secs(2)).call() {
+        if let Ok(json_val) = resp.into_json::<serde_json::Value>() {
+            if let Some(models) = json_val.get("models").and_then(|m| m.as_array()) {
+                for m in models {
+                    let m_name = m.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                    if m_name == model || m_name.starts_with(model) {
+                        if params == "Custom" {
+                            if let Some(ps) = m
+                                .get("details")
+                                .and_then(|d| d.get("parameter_size"))
+                                .and_then(|v| v.as_str())
+                            {
+                                if !ps.is_empty() {
+                                    params = ps.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (params, license)
+}
+
+/// Official `bench.ollaya.dev` Speed & Memory measurement:
+/// - Built-in `triage` preset (5 questions: 1 choice, 3 noul, 1 score) on short customer messages
+/// - 1 cold load + 5 warm-up requests + `n_timed` timed requests
+/// - Samples GPU VRAM (`nvidia-smi` / DRM `mem_info_vram_used` / `/api/ps` `size_vram`) while loaded
+fn measure_triage_latency_and_vram(
+    server_url: &str,
+    model: &str,
+    n_timed: usize,
+) -> Option<LatencyMemoryProfile> {
+    let triage_questions = serde_json::json!({
+        "intent": {
+            "type": "choice",
+            "instructions": "What does the customer want in `message`?",
+            "criteria": {
+                "refund": "money returned or a duplicate charge reversed",
+                "technical_help": "a bug, outage or integration problem",
+                "billing_question": "a question about an invoice, plan or payment method",
+                "information": "general information, pricing or how-to",
+                "cancellation": "wants to cancel or downgrade",
+                "other": "none of the other options fits"
+            }
+        },
+        "is_urgent": {
+            "type": "noul",
+            "instructions": "Does `message` communicate time pressure or a deadline?"
+        },
+        "frustration": {
+            "type": "score",
+            "instructions": "How frustrated does the customer sound in `message`?",
+            "criteria": [
+                "calm and neutral",
+                "concerned but civil",
+                "clearly annoyed",
+                "very angry or using strong language"
+            ]
+        },
+        "refund_requested": {
+            "type": "noul",
+            "instructions": "Does the customer ask for money back?"
+        },
+        "churn_risk": {
+            "type": "noul",
+            "instructions": "Does `message` suggest the customer may leave for a competitor or cancel?"
+        }
+    });
+
+    const CUSTOMER_MESSAGES: &[&str] = &[
+        "I was charged twice for my Pro subscription this morning (#INV-4982). Please refund the duplicate charge today.",
+        "Our production webhook endpoint has been returning 502 errors since 09:00 UTC and customers cannot check out.",
+        "Could you let me know whether annual billing includes SSO or if that requires the Enterprise tier?",
+        "This is the third outage this week. Cancel my account immediately and send confirmation.",
+        "Hi team, how do I rotate an API key without downtime in the dashboard?",
+        "My invoice shows 14 seats instead of 10. Can someone explain the prorated line item?",
+        "Your SDK crashes on Node 22 when streaming responses. We have a launch in two hours, please help!",
+        "Just checking if you offer a nonprofit discount for educational institutions.",
+        "I asked for a refund five days ago and still haven't heard back. If this isn't resolved today we're switching to Linear.",
+        "Thanks, the migration guide worked great. One question: where can I download last month's VAT receipt?",
+        "We need to downgrade from Team to Starter before our renewal tomorrow.",
+        "Login with Google is stuck in a redirect loop on Safari 18.",
+        "Please reverse the $49 renewal charge—I meant to cancel during the trial period.",
+        "Everything is broken again and support never answers! Give me my money back right now!",
+        "Can I export our audit logs as CSV from the settings page?",
+        "We're evaluating alternatives because your rate limits are too restrictive for our batch jobs.",
+        "Urgent: our SSO certificate expires in 3 hours and the upload button is disabled.",
+        "How many workspaces are included in the standard plan?",
+        "I canceled last month but my card was still billed $99 today. Please refund immediately.",
+        "Could you share the status page link for EU-West region?",
+    ];
+
+    let base = server_url.trim_end_matches('/');
+    let sys_url = format!("{}/v1/systemone", base);
+
+    // 1. Cold/initial request
+    let cold_t0 = Instant::now();
+    let cold_state = serde_json::json!({ "message": CUSTOMER_MESSAGES[0] });
+    let cold_req = SystemOneRequest {
+        model,
+        state: &cold_state,
+        questions: &triage_questions,
+    };
+    let ok = ureq::post(&sys_url)
+        .set("Authorization", "Bearer local")
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(90))
+        .send_json(&cold_req)
+        .is_ok();
+    if !ok {
+        return None;
+    }
+    let cold_load_ms = cold_t0.elapsed().as_secs_f64() * 1000.0;
+
+    // 2. 5 warm-up requests
+    for i in 0..5 {
+        let state = serde_json::json!({ "message": CUSTOMER_MESSAGES[(i + 1) % CUSTOMER_MESSAGES.len()] });
+        let req = SystemOneRequest {
+            model,
+            state: &state,
+            questions: &triage_questions,
+        };
+        let _ = ureq::post(&sys_url)
+            .set("Authorization", "Bearer local")
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(30))
+            .send_json(&req);
+    }
+
+    // 3. Timed requests (default 20 on full run, or fewer when --limit is small)
+    let mut timings = Vec::with_capacity(n_timed);
+    for i in 0..n_timed {
+        let state = serde_json::json!({ "message": CUSTOMER_MESSAGES[i % CUSTOMER_MESSAGES.len()] });
+        let req = SystemOneRequest {
+            model,
+            state: &state,
+            questions: &triage_questions,
+        };
+        let t0 = Instant::now();
+        if ureq::post(&sys_url)
+            .set("Authorization", "Bearer local")
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(30))
+            .send_json(&req)
+            .is_ok()
+        {
+            timings.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    if timings.is_empty() {
+        return None;
+    }
+    timings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = timings.len();
+    let triage_p50_ms = timings[n / 2];
+    let triage_p90_ms = timings[((n as f64) * 0.90).floor().min((n - 1) as f64) as usize];
+
+    // 4. Sample VRAM while model is hot in memory
+    let mut vram_mb = sample_gpu_vram_mb().unwrap_or(0.0);
+    let ps_url = format!("{}/api/ps", base);
+    if let Ok(resp) = ureq::get(&ps_url).timeout(Duration::from_secs(2)).call() {
+        if let Ok(json_val) = resp.into_json::<serde_json::Value>() {
+            if let Some(models) = json_val.get("models").and_then(|m| m.as_array()) {
+                for m in models {
+                    let m_name = m.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                    if m_name == model || m_name.starts_with(model) {
+                        if let Some(sz) = m
+                            .get("size_vram")
+                            .and_then(|v| v.as_u64())
+                            .filter(|&s| s > 0)
+                            .or_else(|| m.get("size").and_then(|v| v.as_u64()))
+                        {
+                            let ps_mb = (sz as f64) / (1024.0 * 1024.0);
+                            if vram_mb <= 0.0 && ps_mb > 0.0 {
+                                vram_mb = ps_mb;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (params, license) = resolve_model_params_and_license(model, server_url);
+
+    Some(LatencyMemoryProfile {
+        triage_p50_ms,
+        triage_p90_ms,
+        load_ms: cold_load_ms,
+        vram_mb: vram_mb.round() as u64,
+        ram_peak_mb: 0,
+        params,
+        license,
+    })
+}
+
 /// Main entry point to run benchmark with SHA-256 binary cache control and Ollaya Bench methodology
 pub fn run_benchmark_with_options(
     model: &str,
@@ -2137,7 +2872,7 @@ pub fn run_benchmark_with_options(
     // Never run the exact same model twice if baseline == model
     let baseline = baseline.filter(|b| *b != model);
 
-    crate::utils::print_banner("Ollaya Public Decision Benchmark");
+    crate::utils::print_banner("Ollaya Decision Benchmark (bench.ollaya.dev Methodology)");
 
     let model_identity = compute_model_binary_identity(model);
     let baseline_identity = baseline.and_then(compute_model_binary_identity);
@@ -2191,7 +2926,7 @@ pub fn run_benchmark_with_options(
         println!("    • Dataset Source   : {:?}", dir);
     } else {
         println!(
-            "    • Dataset Cache    : {:?} (13 Public Subsets, 3,880 records)",
+            "    • Dataset Cache    : {:?} (14 Tasks: 13 Public + Typed-Decisions = 5,880 questions)",
             get_benchmark_cache_dir()
         );
     }
@@ -2204,7 +2939,7 @@ pub fn run_benchmark_with_options(
         );
     }
 
-    // Resolve datasets
+    // Resolve datasets across all 14 official tasks
     let datasets = resolve_benchmark_data(data_dir, subsets_filter);
     if datasets.is_empty() {
         bail!("No benchmark datasets found to evaluate.");
@@ -2212,7 +2947,7 @@ pub fn run_benchmark_with_options(
 
     // Check which subsets are already cached by cryptographic SHA-256
     let ordered_subset_names: Vec<(&str, &str)> = {
-        let mut v: Vec<(&str, &str)> = PUBLIC_SUBSETS
+        let mut v: Vec<(&str, &str)> = ALL_BENCHMARK_SUBSETS
             .iter()
             .filter(|(name, _, _)| datasets.contains_key(*name))
             .map(|(name, title, _)| (*name, *title))
@@ -2255,7 +2990,7 @@ pub fn run_benchmark_with_options(
         }
     }
 
-    // Warm-up request only if at least one subset is not already cached
+    // Warm-up request
     if need_server {
         println!("\n  {} Checking Ollaya server connection and warming up...", "⏳".cyan());
         ensure_ollaya_server_and_evict_others(server_url, model);
@@ -2296,7 +3031,7 @@ pub fn run_benchmark_with_options(
         }
     } else {
         println!(
-            "\n  {} All requested subsets matched SHA-256 binary cache — skipping server warmup!",
+            "\n  {} All requested subsets matched SHA-256 binary cache — skipping subset re-evaluation!",
             "⚡".green().bold()
         );
     }
@@ -2314,7 +3049,7 @@ pub fn run_benchmark_with_options(
     };
 
     println!(
-        "\n  {} Executing Public Benchmark Suites ({} Subsets, {} Probes):",
+        "\n  {} Executing Ollaya Benchmark Suites ({} Tasks, {} HTTP Requests):",
         "🚀".cyan().bold(),
         ordered_subset_names.len(),
         total_probes
@@ -2329,12 +3064,12 @@ pub fn run_benchmark_with_options(
     let pb = ProgressBar::new(total_probes as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("    [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} probes: {msg}")
+            .template("    [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} reqs: {msg}")
             .unwrap()
             .progress_chars("━╾─"),
     );
 
-    // Pass 1: Evaluate all subsets for target model while keeping it hot in Ollaya memory
+    // Pass 1: Evaluate all tasks for target model while keeping it hot in Ollaya memory
     for (sub_name, sub_title) in &ordered_subset_names {
         if let Some(records) = datasets.get(*sub_name) {
             let (eval_count, data_sha) = subset_hashes
@@ -2401,7 +3136,13 @@ pub fn run_benchmark_with_options(
         }
     }
 
+    // Measure 5-question `triage` latency & GPU VRAM for target model
+    let timed_runs = limit.map_or(20, |l| l.clamp(5, 20));
+    ensure_ollaya_server_and_evict_others(server_url, model);
+    let model_latency_profile = measure_triage_latency_and_vram(server_url, model, timed_runs);
+
     // Pass 2: Evaluate all subsets for baseline model (single model swap or instant SHA-256 cache hit)
+    let mut baseline_latency_profile = None;
     if let Some(base) = baseline {
         let mut evicted_for_baseline = false;
         for (sub_name, sub_title) in &ordered_subset_names {
@@ -2450,28 +3191,141 @@ pub fn run_benchmark_with_options(
                 baseline_summaries.insert(sub_name.to_string(), b_res);
             }
         }
+        ensure_ollaya_server_and_evict_others(server_url, base);
+        baseline_latency_profile = measure_triage_latency_and_vram(server_url, base, timed_runs);
     }
-    pb.finish_with_message("All subsets completed.");
+    pb.finish_with_message("All tasks completed.");
 
     if model_cached_subsets > 0 || baseline_cached_subsets > 0 {
         println!(
-            "    {} Cache hits: {}/{} target subsets{}",
+            "    {} Cache hits: {}/{} target tasks{}",
             "⚡".green(),
             model_cached_subsets,
             ordered_subset_names.len(),
             if baseline.is_some() {
-                format!(", {}/{} baseline subsets", baseline_cached_subsets, ordered_subset_names.len())
+                format!(", {}/{} baseline tasks", baseline_cached_subsets, ordered_subset_names.len())
             } else {
                 String::new()
             }
         );
     }
 
-    let m_result = build_run_result(model, server_url, &model_summaries, model_identity.as_ref());
-    let b_result = baseline.map(|b| build_run_result(b, server_url, &baseline_summaries, baseline_identity.as_ref()));
+    let m_result = build_run_result(
+        model,
+        server_url,
+        &model_summaries,
+        model_identity.as_ref(),
+        model_latency_profile,
+    );
+    let b_result = baseline.map(|b| {
+        build_run_result(
+            b,
+            server_url,
+            &baseline_summaries,
+            baseline_identity.as_ref(),
+            baseline_latency_profile,
+        )
+    });
 
-    // Print Results Table
-    println!("\n  {} Benchmark Results:", "📊".purple().bold());
+    // Print Official Leaderboard Table (exact bench.ollaya.dev columns)
+    println!(
+        "\n  {} Official Ollaya Leaderboard Summary (bench.ollaya.dev Methodology):",
+        "🏆".yellow().bold()
+    );
+    println!(
+        "┌──────────────────────┬───────────────────────┬──────────┬──────────┬──────────┬───────────┬───────────┬──────────────────┬────────────┐"
+    );
+    println!(
+        "│ {:<20} │ {:<21} │ {:<8} │ {:<8} │ {:<8} │ {:<9} │ {:<9} │ {:<16} │ {:<10} │",
+        "Model", "Score [95% CI]", "Public", "Typed", "ECE", "Latency", "VRAM", "Params", "License"
+    );
+    println!(
+        "├──────────────────────┼───────────────────────┼──────────┼──────────┼──────────┼───────────┼───────────┼──────────────────┼────────────┤"
+    );
+
+    let print_leaderboard_row = |res: &BenchmarkRunResult, is_primary: bool| {
+        let score_str = format!(
+            "{:>4.1} [{:>4.1}–{:>4.1}]",
+            res.skill_score, res.skill_score_ci[0], res.skill_score_ci[1]
+        );
+        let pub_str = format!("{:>6.1}%", res.public_macro_accuracy * 100.0);
+        let typed_str = res
+            .typed_accuracy
+            .map(|a| format!("{:>6.1}%", a * 100.0))
+            .unwrap_or_else(|| "    N/A".to_string());
+        // bench.ollaya.dev Leaderboard ECE column shows calibration error (lower is better)
+        let ece_val = if res.public_pooled_ece > 0.0 {
+            res.public_pooled_ece
+        } else {
+            res.pooled_ece
+        };
+        let ece_str = format!("{:>6.1}%", ece_val * 100.0);
+        let lp = &res.latency_profile;
+        let lat_ms = if lp.triage_p50_ms > 0.0 {
+            lp.triage_p50_ms
+        } else {
+            res.median_ms
+        };
+        let lat_str = format!("{:>6.0} ms", lat_ms);
+        let vram_str = if lp.vram_mb > 0 {
+            if lp.vram_mb >= 1024 {
+                format!("{:>6.1} GB", (lp.vram_mb as f64) / 1024.0)
+            } else {
+                format!("{:>6} MB", lp.vram_mb)
+            }
+        } else {
+            "      N/A".to_string()
+        };
+        let params_str = if lp.params.is_empty() {
+            "Custom"
+        } else {
+            lp.params.as_str()
+        };
+        let license_str = if lp.license.is_empty() {
+            "Apache 2.0"
+        } else {
+            lp.license.as_str()
+        };
+
+        if is_primary {
+            println!(
+                "│ {:<20} │ {:<21} │ {:>8} │ {:>8} │ {:>8} │ {:>9} │ {:>9} │ {:<16} │ {:<10} │",
+                res.model.bold().green(),
+                score_str.bold().green(),
+                pub_str,
+                typed_str,
+                ece_str,
+                lat_str,
+                vram_str,
+                params_str,
+                license_str
+            );
+        } else {
+            println!(
+                "│ {:<20} │ {:<21} │ {:>8} │ {:>8} │ {:>8} │ {:>9} │ {:>9} │ {:<16} │ {:<10} │",
+                res.model.yellow(),
+                score_str,
+                pub_str,
+                typed_str,
+                ece_str,
+                lat_str,
+                vram_str,
+                params_str,
+                license_str
+            );
+        }
+    };
+
+    print_leaderboard_row(&m_result, true);
+    if let Some(ref b_res) = b_result {
+        print_leaderboard_row(b_res, false);
+    }
+    println!(
+        "└──────────────────────┴───────────────────────┴──────────┴──────────┴──────────┴───────────┴───────────┴──────────────────┴────────────┘"
+    );
+
+    // Print Per-Task Breakdown Table
+    println!("\n  {} Per-Task Breakdown ({} Tasks):", "📊".purple().bold(), ordered_subset_names.len());
 
     if let Some(ref b_res) = b_result {
         println!(
@@ -2479,7 +3333,7 @@ pub fn run_benchmark_with_options(
         );
         println!(
             "│ {:<22} │ {:<5} │ {:<12} │ {:<12} │ {:<7} │ {:<10} │ {:<10} │ {:<10} │ {:<10} │ {:<11} │",
-            "Benchmark Subset", "Count", "Baseline Acc", "Model Acc", "Delta", "Base Skill", "Mod Skill", "Base ECE", "Model ECE", "Latency p50"
+            "Benchmark Task", "Count", "Baseline Acc", "Model Acc", "Delta", "Base Skill", "Mod Skill", "Base ECE", "Model ECE", "Latency p50"
         );
         println!(
             "├────────────────────────┼───────┼──────────────┼──────────────┼─────────┼────────────┼────────────┼────────────┼────────────┼─────────────┤"
@@ -2522,7 +3376,7 @@ pub fn run_benchmark_with_options(
 
         println!(
             "│ {:<22} │ {:>5} │ {:>11.1}% │ {:>11.1}% │ {:>7} │ {:>10.1} │ {:>10.1} │ {:>10.3} │ {:>10.3} │ {:>8.0} ms │",
-            "OVERALL (Macro)",
+            "OVERALL (14 Tasks)",
             m_result.total_records,
             b_res.macro_accuracy * 100.0,
             m_result.macro_accuracy * 100.0,
@@ -2542,7 +3396,7 @@ pub fn run_benchmark_with_options(
         );
         println!(
             "│ {:<22} │ {:<5} │ {:<12} │ {:<12} │ {:<10} │ {:<8} │ {:<11} │ {:<11} │",
-            "Benchmark Subset", "Count", "Accuracy", "Skill (0-100)", "ECE (10bin)", "Brier", "Median (ms)", "p95 (ms)"
+            "Benchmark Task", "Count", "Accuracy", "Skill (0-100)", "ECE (10bin)", "Brier", "Median (ms)", "p95 (ms)"
         );
         println!(
             "├────────────────────────┼───────┼──────────────┼──────────────┼────────────┼──────────┼─────────────┼─────────────┤"
@@ -2568,7 +3422,7 @@ pub fn run_benchmark_with_options(
         );
         println!(
             "│ {:<22} │ {:>5} │ {:>11.1}% │ {:>12.1} │ {:>10.3} │ {:>8.3} │ {:>8.0} ms │ {:>8.0} ms │",
-            "OVERALL (Macro)",
+            "OVERALL (14 Tasks)",
             m_result.total_records,
             m_result.macro_accuracy * 100.0,
             m_result.skill_score,
@@ -2582,78 +3436,52 @@ pub fn run_benchmark_with_options(
         );
     }
 
-    // Print Official Ollaya Bench Scorecard (bench.ollaya.dev methodology)
+    // Print Detailed Methodology Scorecard
     println!(
-        "\n  {} Ollaya Bench Scorecard (bench.ollaya.dev Methodology):",
-        "🏆".yellow().bold()
+        "\n  {} Detailed Methodology Metrics:",
+        "📐".cyan().bold()
     );
-    if let Some(ref b_res) = b_result {
-        let skill_diff = m_result.skill_score - b_res.skill_score;
-        let skill_diff_s = if skill_diff >= 0.0 {
-            format!("+{:.1}", skill_diff).green().bold()
-        } else {
-            format!("{:.1}", skill_diff).red().bold()
-        };
+    println!(
+        "    • Overall Skill Score (14 tasks) : {} (95% CI: [{:.1}, {:.1}], 1,000 bootstrap draws, seed 20261014)",
+        format!("{:.1}", m_result.skill_score).bold().green(),
+        m_result.skill_score_ci[0],
+        m_result.skill_score_ci[1],
+    );
+    println!(
+        "    • Public (13 tasks, 3,880 q)     : Skill {:.1} | Macro Acc {:.1}% | Pooled ECE {:.1}% ({:.3})",
+        m_result.public_skill_score,
+        m_result.public_macro_accuracy * 100.0,
+        m_result.public_pooled_ece * 100.0,
+        m_result.public_pooled_ece
+    );
+    if let Some(td_sum) = model_summaries.get("typed-decisions") {
+        let mut parts: Vec<String> = td_sum
+            .by_workflow
+            .iter()
+            .map(|(k, v)| format!("{}: {:.1}%", k, v * 100.0))
+            .collect();
+        parts.sort();
+        let wf_s = parts.join(" | ");
         println!(
-            "    • Public Skill Score (0-100) : {} (95% CI: [{:.1}, {:.1}]) vs Baseline {:.1} ({})",
-            format!("{:.1}", m_result.skill_score).bold().green(),
-            m_result.skill_score_ci[0],
-            m_result.skill_score_ci[1],
-            b_res.skill_score,
-            skill_diff_s
+            "    • Typed-Decisions (2,000 q)      : Skill {:.1} | Acc {:.1}% | ECE {:.1}% | Soft-CE {:.3} ({})",
+            td_sum.skill,
+            td_sum.accuracy * 100.0,
+            td_sum.ece10 * 100.0,
+            td_sum.soft_ce,
+            wf_s
         );
+    }
+    println!(
+        "    • Accuracy by Answer Type        : Choice: {:.1}% | Noul: {:.1}% | Score: {:.1}%",
+        m_result.by_type.get("choice").copied().unwrap_or(0.0) * 100.0,
+        m_result.by_type.get("noul").copied().unwrap_or(0.0) * 100.0,
+        m_result.by_type.get("score").copied().unwrap_or(0.0) * 100.0,
+    );
+    let lp = &m_result.latency_profile;
+    if lp.triage_p50_ms > 0.0 || lp.vram_mb > 0 {
         println!(
-            "    • Macro / Micro Accuracy     : {:.1}% (95% CI: [{:.1}%, {:.1}%]) / {:.1}%  |  Baseline: {:.1}% / {:.1}%",
-            m_result.macro_accuracy * 100.0,
-            m_result.macro_accuracy_ci[0] * 100.0,
-            m_result.macro_accuracy_ci[1] * 100.0,
-            m_result.micro_accuracy * 100.0,
-            b_res.macro_accuracy * 100.0,
-            b_res.micro_accuracy * 100.0
-        );
-        println!(
-            "    • Accuracy by Task Type      : Choice: {:.1}% (vs {:.1}%) | Noul: {:.1}% (vs {:.1}%) | Score: {:.1}% (vs {:.1}%)",
-            m_result.by_type.get("choice").copied().unwrap_or(0.0) * 100.0,
-            b_res.by_type.get("choice").copied().unwrap_or(0.0) * 100.0,
-            m_result.by_type.get("noul").copied().unwrap_or(0.0) * 100.0,
-            b_res.by_type.get("noul").copied().unwrap_or(0.0) * 100.0,
-            m_result.by_type.get("score").copied().unwrap_or(0.0) * 100.0,
-            b_res.by_type.get("score").copied().unwrap_or(0.0) * 100.0,
-        );
-        println!(
-            "    • Calibration & Brier        : Pooled ECE: {:.3} (vs {:.3}) | Macro ECE: {:.3} (vs {:.3}) | Brier: {:.3} (vs {:.3})",
-            m_result.pooled_ece,
-            b_res.pooled_ece,
-            m_result.macro_ece,
-            b_res.macro_ece,
-            m_result.brier,
-            b_res.brier
-        );
-    } else {
-        println!(
-            "    • Public Skill Score (0-100) : {} (95% CI: [{:.1}, {:.1}])",
-            format!("{:.1}", m_result.skill_score).bold().green(),
-            m_result.skill_score_ci[0],
-            m_result.skill_score_ci[1]
-        );
-        println!(
-            "    • Macro / Micro Accuracy     : {:.1}% (95% CI: [{:.1}%, {:.1}%]) / {:.1}%",
-            m_result.macro_accuracy * 100.0,
-            m_result.macro_accuracy_ci[0] * 100.0,
-            m_result.macro_accuracy_ci[1] * 100.0,
-            m_result.micro_accuracy * 100.0
-        );
-        println!(
-            "    • Accuracy by Task Type      : Choice: {:.1}% | Noul: {:.1}% | Score: {:.1}%",
-            m_result.by_type.get("choice").copied().unwrap_or(0.0) * 100.0,
-            m_result.by_type.get("noul").copied().unwrap_or(0.0) * 100.0,
-            m_result.by_type.get("score").copied().unwrap_or(0.0) * 100.0,
-        );
-        println!(
-            "    • Calibration & Brier        : Pooled ECE (10-bin): {:.3} | Macro ECE: {:.3} | Multiclass Brier: {:.3}",
-            m_result.pooled_ece,
-            m_result.macro_ece,
-            m_result.brier
+            "    • Triage Speed & Memory Profile  : p50 {:.0} ms (p90 {:.0} ms) | Cold load {:.0} ms | VRAM {} MB",
+            lp.triage_p50_ms, lp.triage_p90_ms, lp.load_ms, lp.vram_mb
         );
     }
 
@@ -2764,6 +3592,7 @@ fn build_run_result(
     server_url: &str,
     summaries: &HashMap<String, SubsetSummary>,
     identity: Option<&ModelBinaryIdentity>,
+    latency_profile: Option<LatencyMemoryProfile>,
 ) -> BenchmarkRunResult {
     let mut total_records = 0;
     let mut total_errors = 0;
@@ -2772,26 +3601,46 @@ fn build_run_result(
     let mut ece_sum = 0.0;
     let mut latencies = Vec::new();
     let mut pooled_ece_pairs = Vec::new();
+    let mut public_ece_pairs = Vec::new();
     let mut pooled_brier_sum = 0.0;
     let mut pooled_correct = 0usize;
     let mut pooled_valid = 0usize;
     let mut by_type_buckets: HashMap<String, Vec<f64>> = HashMap::new();
 
-    for s in summaries.values() {
+    let mut public_acc_sum = 0.0;
+    let mut public_skill_sum = 0.0;
+    let mut public_count = 0usize;
+
+    for (sub_name, s) in summaries {
         total_records += s.count;
         total_errors += s.errors;
         acc_sum += s.accuracy;
         skill_sum += s.skill;
         ece_sum += s.ece10;
         latencies.push(s.median_ms);
-        by_type_buckets
-            .entry(s.kind.clone())
-            .or_default()
-            .push(s.accuracy);
+
+        if sub_name == "typed-decisions" {
+            for (k, &v) in &s.by_type {
+                by_type_buckets.entry(k.clone()).or_default().push(v);
+            }
+        } else {
+            public_acc_sum += s.accuracy;
+            public_skill_sum += s.skill;
+            public_count += 1;
+            by_type_buckets
+                .entry(s.kind.clone())
+                .or_default()
+                .push(s.accuracy);
+        }
 
         if !s.probe_outcomes.is_empty() {
             for &(top_p, corr, brier, _) in &s.probe_outcomes {
-                pooled_ece_pairs.push((top_p, corr));
+                if top_p > 0.0 {
+                    pooled_ece_pairs.push((top_p, corr));
+                    if sub_name != "typed-decisions" {
+                        public_ece_pairs.push((top_p, corr));
+                    }
+                }
                 pooled_brier_sum += brier;
                 if corr {
                     pooled_correct += 1;
@@ -2808,8 +3657,16 @@ fn build_run_result(
 
     let n = summaries.len().max(1) as f64;
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_ms = if latencies.is_empty() { 0.0 } else { latencies[latencies.len() / 2] };
-    let p95_ms = if latencies.is_empty() { 0.0 } else { latencies[latencies.len() - 1] };
+    let median_ms = latency_profile
+        .as_ref()
+        .map(|lp| lp.triage_p50_ms)
+        .filter(|&v| v > 0.0)
+        .unwrap_or_else(|| if latencies.is_empty() { 0.0 } else { latencies[latencies.len() / 2] });
+    let p95_ms = latency_profile
+        .as_ref()
+        .map(|lp| lp.triage_p90_ms)
+        .filter(|&v| v > 0.0)
+        .unwrap_or_else(|| if latencies.is_empty() { 0.0 } else { latencies[latencies.len() - 1] });
 
     let macro_accuracy = acc_sum / n;
     let micro_accuracy = if pooled_valid > 0 {
@@ -2823,6 +3680,28 @@ fn build_run_result(
     } else {
         macro_ece
     };
+    let public_n = public_count.max(1) as f64;
+    let public_macro_accuracy = if public_count > 0 {
+        public_acc_sum / public_n
+    } else {
+        macro_accuracy
+    };
+    let public_skill_score = if public_count > 0 {
+        public_skill_sum / public_n
+    } else {
+        skill_sum / n
+    };
+    let public_pooled_ece = if !public_ece_pairs.is_empty() {
+        compute_ece(&public_ece_pairs, 10)
+    } else {
+        pooled_ece
+    };
+
+    let td_sum = summaries.get("typed-decisions");
+    let typed_accuracy = td_sum.map(|s| s.accuracy);
+    let typed_ece = td_sum.map(|s| s.ece10);
+    let typed_soft_ce = td_sum.map(|s| s.soft_ce);
+
     let brier = if pooled_valid > 0 {
         pooled_brier_sum / pooled_valid as f64
     } else {
@@ -2839,6 +3718,19 @@ fn build_run_result(
         }
     }
 
+    let resolved_latency_profile = latency_profile.unwrap_or_else(|| {
+        let (params, license) = resolve_model_params_and_license(model, server_url);
+        LatencyMemoryProfile {
+            triage_p50_ms: median_ms,
+            triage_p90_ms: p95_ms,
+            load_ms: 0.0,
+            vram_mb: sample_gpu_vram_mb().unwrap_or(0.0).round() as u64,
+            ram_peak_mb: 0,
+            params,
+            license,
+        }
+    });
+
     BenchmarkRunResult {
         model: model.to_string(),
         server_url: server_url.to_string(),
@@ -2848,6 +3740,12 @@ fn build_run_result(
         total_errors,
         skill_score,
         skill_score_ci,
+        public_skill_score,
+        public_macro_accuracy,
+        public_pooled_ece,
+        typed_accuracy,
+        typed_ece,
+        typed_soft_ce,
         macro_accuracy,
         macro_accuracy_ci,
         micro_accuracy,
@@ -2857,6 +3755,7 @@ fn build_run_result(
         by_type,
         median_ms,
         p95_ms,
+        latency_profile: resolved_latency_profile,
         per_subset: summaries.clone(),
     }
 }
@@ -2866,9 +3765,86 @@ fn chrono_now() -> String {
     "2026-10-18T12:00:00Z".to_string()
 }
 
-/// Curated reference evaluation records for all 13 official subsets
+/// Curated reference evaluation records for all 14 official benchmark tasks (13 Public + Typed-Decisions)
 pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
     let mut map = HashMap::new();
+
+    // 0. Typed-Decisions (multi-question workflow state: 5 questions in a single request)
+    map.insert(
+        "typed-decisions".to_string(),
+        vec![
+            BenchRecord {
+                id: "td-test-support_triage-0001".to_string(),
+                kind: "mixed".to_string(),
+                workflow: Some("support_triage".to_string()),
+                input: BenchInput {
+                    state: serde_json::json!({
+                        "ticket_id": "SUP-1042",
+                        "customer_tier": "enterprise",
+                        "subject": "Duplicate billing on invoice #INV-9921 and production API rate limit 429s",
+                        "message": "We were billed twice for our annual Enterprise seat renewal ($14,400) this morning, and our production EU webhook pipeline is hitting 429 rate limits despite being well below our contracted burst quota. Please refund the duplicate invoice and raise our burst limit before 16:00 UTC."
+                    }),
+                    questions: serde_json::json!({
+                        "primary_queue": {
+                            "type": "choice",
+                            "instructions": "Which specialist queue should take ownership of this ticket first?",
+                            "criteria": {
+                                "billing": "invoicing, duplicate charges, refunds, or payment methods",
+                                "platform_sre": "outages, rate limits, latency, or infrastructure incidents",
+                                "account_management": "contract renewals, seat upgrades, or SLA negotiations",
+                                "general_support": "how-to questions, documentation, or minor UI bugs"
+                            }
+                        },
+                        "requires_refund": {
+                            "type": "noul",
+                            "instructions": "Does the customer explicitly request a refund or reversal of a charge?"
+                        },
+                        "has_production_impact": {
+                            "type": "noul",
+                            "instructions": "Is a live production system or customer-facing workflow currently degraded?"
+                        },
+                        "urgency_level": {
+                            "type": "score",
+                            "instructions": "Rate the operational urgency of this ticket from 0 (lowest) to 4 (critical).",
+                            "criteria": [
+                                "routine question with no deadline",
+                                "minor inconvenience, standard SLA",
+                                "time-sensitive request or billing dispute",
+                                "production degradation with explicit deadline",
+                                "complete production outage blocking all customers"
+                            ]
+                        },
+                        "escalation_priority": {
+                            "type": "score",
+                            "instructions": "Rate the account escalation priority from 0 to 3.",
+                            "criteria": [
+                                "self-serve / no escalation",
+                                "standard support follow-up",
+                                "senior specialist review within 4 hours",
+                                "immediate enterprise incident bridge"
+                            ]
+                        }
+                    }),
+                },
+                reference: BenchReference {
+                    label: serde_json::json!({
+                        "primary_queue": "billing",
+                        "requires_refund": "yes",
+                        "has_production_impact": "yes",
+                        "urgency_level": 3,
+                        "escalation_priority": 2
+                    }),
+                    distribution: Some(serde_json::json!({
+                        "primary_queue": { "billing": 0.70, "platform_sre": 0.30, "account_management": 0.0, "general_support": 0.0 },
+                        "requires_refund": { "yes": 1.0, "no": 0.0 },
+                        "has_production_impact": { "yes": 1.0, "no": 0.0 },
+                        "urgency_level": { "0": 0.0, "1": 0.0, "2": 0.15, "3": 0.75, "4": 0.10 },
+                        "escalation_priority": { "0": 0.0, "1": 0.05, "2": 0.75, "3": 0.20 }
+                    })),
+                },
+            },
+        ],
+    );
 
     // 1. VitaminC
     map.insert(
@@ -2877,6 +3853,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "vitaminc-dev-1".to_string(),
                 kind: "choice".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "claim": "Dragon Con had less than 1000 guests.",
@@ -2902,6 +3879,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "vitaminc-dev-2".to_string(),
                 kind: "choice".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "claim": "Paris is the capital of France.",
@@ -2934,6 +3912,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "massive-en-1".to_string(),
                 kind: "choice".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "utterance": "set an alarm for seven am tomorrow",
@@ -2960,6 +3939,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "massive-en-2".to_string(),
                 kind: "choice".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "utterance": "what is the forecast in Seattle this afternoon",
@@ -2993,6 +3973,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "massive-de-1".to_string(),
                 kind: "choice".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "utterance": "stelle einen wecker auf sieben uhr morgen früh",
@@ -3026,6 +4007,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "boolq-1".to_string(),
                 kind: "noul".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "passage": "Water freezes into ice at zero degrees Celsius under standard atmospheric pressure.",
@@ -3050,6 +4032,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "boolq-2".to_string(),
                 kind: "noul".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "passage": "The moon is Earth's only natural satellite. Mars has two moons: Phobos and Deimos.",
@@ -3081,6 +4064,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "squad2-1".to_string(),
                 kind: "noul".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "paragraph": "The Normans were a people descended from Norse Vikings who settled in northwestern France in the 10th century.",
@@ -3105,6 +4089,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "squad2-2".to_string(),
                 kind: "noul".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "paragraph": "The Normans were a people descended from Norse Vikings who settled in northwestern France in the 10th century.",
@@ -3136,6 +4121,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "paws-1".to_string(),
                 kind: "noul".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "sentence_1": "The dog was chased by the cat through the yard.",
@@ -3167,6 +4153,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "multinli-1".to_string(),
                 kind: "choice".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "premise": "A man in a tuxedo is playing a cello on stage.",
@@ -3199,6 +4186,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "civil-1".to_string(),
                 kind: "noul".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "comment": "Thank you for sharing this well-researched article. I found section 3 particularly helpful."
@@ -3229,6 +4217,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "aegis-1".to_string(),
                 kind: "noul".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "user_message": "Can you explain how RSA public key cryptography works mathematically?"
@@ -3259,6 +4248,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "helpsteer-1".to_string(),
                 kind: "score".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "prompt": "What is the boiling point of water at sea level?",
@@ -3293,6 +4283,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "summeval-rel-1".to_string(),
                 kind: "score".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "article": "NASA announced today that the James Webb Space Telescope has captured deep-field images of galaxies formed 300 million years after the Big Bang.",
@@ -3327,6 +4318,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "summeval-cons-1".to_string(),
                 kind: "score".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "article": "The French Open tournament takes place annually at Stade Roland Garros in Paris.",
@@ -3361,6 +4353,7 @@ pub fn get_builtin_subsets() -> HashMap<String, Vec<BenchRecord>> {
             BenchRecord {
                 id: "pubmedqa-1".to_string(),
                 kind: "choice".to_string(),
+                workflow: None,
                 input: BenchInput {
                     state: serde_json::json!({
                         "question": "Does regular moderate aerobic exercise reduce systolic blood pressure in hypertensive patients?",
@@ -3400,10 +4393,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_13_subsets_present() {
+    fn test_all_14_subsets_present() {
         assert_eq!(PUBLIC_SUBSETS.len(), 13);
+        assert_eq!(ALL_BENCHMARK_SUBSETS.len(), 14);
         let builtins = get_builtin_subsets();
-        for (sub_name, _, _) in PUBLIC_SUBSETS {
+        for (sub_name, _, _) in ALL_BENCHMARK_SUBSETS {
             assert!(
                 builtins.contains_key(*sub_name),
                 "Missing builtin reference for subset: {}",
@@ -3459,6 +4453,8 @@ mod tests {
         assert!((record_chance(&builtins["multinli"][0]) - (1.0 / 3.0)).abs() < 1e-6);
         assert!((record_chance(&builtins["helpsteer2"][0]) - 0.2).abs() < 1e-6);
         assert!((record_chance(&builtins["massive-en-US"][0]) - (1.0 / 18.0)).abs() < 1e-6);
+        // typed-decisions state has 5 questions: 1 choice(4)=0.25, 2 noul=0.5, 1 score(5)=0.2, 1 score(4)=0.25 -> mean = 1.70 / 5 = 0.34
+        assert!((record_chance(&builtins["typed-decisions"][0]) - 0.34).abs() < 1e-6);
 
         let mut summaries = HashMap::new();
         summaries.insert(
@@ -3474,6 +4470,9 @@ mod tests {
                 skill: 50.0,
                 ece10: 0.05,
                 brier: 0.25,
+                soft_ce: 0.0,
+                by_type: HashMap::new(),
+                by_workflow: HashMap::new(),
                 median_ms: 10.0,
                 p95_ms: 12.0,
                 probe_outcomes: vec![
@@ -3484,9 +4483,41 @@ mod tests {
                 ],
             },
         );
+        summaries.insert(
+            "typed-decisions".to_string(),
+            SubsetSummary {
+                subset: "typed-decisions".to_string(),
+                title: "Typed-Decisions (Multi-Question Workflows)".to_string(),
+                kind: "mixed".to_string(),
+                count: 10,
+                errors: 0,
+                accuracy: 0.80,
+                chance: 0.34,
+                skill: 100.0 * (0.80 - 0.34) / (1.0 - 0.34),
+                ece10: 0.04,
+                brier: 0.15,
+                soft_ce: 0.45,
+                by_type: HashMap::new(),
+                by_workflow: HashMap::new(),
+                median_ms: 18.0,
+                p95_ms: 22.0,
+                probe_outcomes: vec![
+                    (0.9, true, 0.02, 0.25),
+                    (0.8, true, 0.08, 0.50),
+                    (0.9, true, 0.02, 0.50),
+                    (0.7, true, 0.18, 0.20),
+                    (0.6, false, 0.72, 0.25),
+                    (0.9, true, 0.02, 0.25),
+                    (0.8, true, 0.08, 0.50),
+                    (0.9, true, 0.02, 0.50),
+                    (0.7, true, 0.18, 0.20),
+                    (0.6, false, 0.72, 0.25),
+                ],
+            },
+        );
         let (skill_ci, acc_ci) = compute_bootstrap_cis(&summaries);
-        assert!(skill_ci[0] <= 50.0 && skill_ci[1] >= 50.0);
-        assert!(acc_ci[0] <= 0.75 && acc_ci[1] >= 0.75);
+        assert!(skill_ci[0] <= 60.0 && skill_ci[1] >= 59.0);
+        assert!(acc_ci[0] <= 0.78 && acc_ci[1] >= 0.77);
     }
 
     #[test]

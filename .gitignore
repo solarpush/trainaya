@@ -11,3 +11,4 @@ __pycache__/
 *.safetensors
 *.gguf
 *.quarantine.jsonl
+/Makefile
