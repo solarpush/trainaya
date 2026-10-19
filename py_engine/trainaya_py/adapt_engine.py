@@ -70,8 +70,36 @@ KNOWN_GGUF_REPOS = {
         "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf",
     ),
     "ministral-14b": (
-        "mistralai/Ministral-3-14B-Reasoning-2512-GGUF",
-        "Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf",
+        "mistralai/Ministral-3-14B-Instruct-2512-GGUF",
+        "Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",
+    ),
+    "ministral:14b": (
+        "mistralai/Ministral-3-14B-Instruct-2512-GGUF",
+        "Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",
+    ),
+    "gemma4-26b": (
+        "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+    ),
+    "gemma4:26b": (
+        "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+    ),
+    "gemma-4-26b-a4b-it": (
+        "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+    ),
+    "google/gemma-4-26b-a4b-it": (
+        "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+    ),
+    "gemma4-e4b": (
+        "unsloth/gemma-4-E4B-it-GGUF",
+        "gemma-4-E4B-it-UD-Q4_K_M.gguf",
+    ),
+    "gemma4:e4b": (
+        "unsloth/gemma-4-E4B-it-GGUF",
+        "gemma-4-E4B-it-UD-Q4_K_M.gguf",
     ),
     "phi4": (
         "bartowski/microsoft_Phi-4-mini-instruct-GGUF",
@@ -177,7 +205,9 @@ def _render_jinja_template(chat_template: str, system_msg: str, user_msg: str) -
             )
     except Exception:
         if "<|turn>" in chat_template:
-            return f"<|turn>system\n{system_msg}<turn|>\n<|turn>user\n{user_msg}<turn|>\n<|turn>model\n<|thought\n<thought|>"
+            if "<|channel>thought" in chat_template:
+                return f"<|turn>system\n{system_msg}<turn|>\n<|turn>user\n{user_msg}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+            return f"<|turn>system\n{system_msg}<turn|>\n<|turn>user\n{user_msg}<turn|>\n<|turn>model\n"
         if "<start_of_turn>" in chat_template:
             return f"<start_of_turn>user\n{system_msg}\n\n{user_msg}<end_of_turn>\n<start_of_turn>model\n"
         if "[SYSTEM_PROMPT]" in chat_template:
@@ -585,6 +615,7 @@ def _adapt_gguf_llm_logits(
     }
     head_epochs = max(180, epochs * 36)
     head_lr = 4.0e-4
+    softcap_val = float(meta.get(f"{arch}.final_logit_softcapping", 0.0) or 0.0)
     train_metrics = train_gguf_decision_head(
         gguf_path=Path(dst_gguf),
         tensor_info=tensors_layout["output.weight"],
@@ -599,12 +630,19 @@ def _adapt_gguf_llm_logits(
         n_threads=12,
         add_bos=add_bos,
         yes_no_token_ids=yes_no_ids,
+        final_logit_softcap=softcap_val,
         emit=_emit_step,
     )
     temperatures = train_metrics["temperatures"]
 
     gguf_sha = sha256_file(dst_gguf)
     family_name = target_tag.split(":")[0] if ":" in target_tag else target_tag
+    base_fn = os.path.basename(gguf_file)
+    quant_str = "Q4_K_M"
+    for q_cand in ("Q3_K_M", "Q3_K_L", "Q3_K_S", "IQ4_XS", "IQ4_NL", "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q6_K", "Q8_0", "BF16", "F16"):
+        if q_cand.lower() in base_fn.lower():
+            quant_str = q_cand
+            break
     decision = {
         "engine": "llama",
         "family": family_name,
@@ -622,14 +660,14 @@ def _adapt_gguf_llm_logits(
         "gguf": {
             "repo": name,
             "revision": "local",
-            "path": os.path.basename(gguf_file),
+            "path": base_fn,
             "sha256": gguf_sha,
             "size": os.path.getsize(dst_gguf),
-            "quantization": "Q4_K_M",
+            "quantization": quant_str,
             "architecture": arch,
         },
         "llama": {
-            "n_ctx": 8192,
+            "n_ctx": 4096 if (arch.lower().startswith("gemma") or os.path.getsize(dst_gguf) > 10 * (1024 ** 3)) else 8192,
             "swa_full": arch.lower().startswith("gemma"),
             "plan": "prefix",
         },

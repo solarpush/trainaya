@@ -136,6 +136,24 @@ def _parse_questions_dict(
     return out
 
 
+def _canonicalize_wanli_probs(options_raw: Any, target: List[float]) -> Optional[List[float]]:
+    """Map per-row shuffled wanli-decisions-v1 options to canonical [p_Neu, p_Neg, p_Pos]."""
+    if not isinstance(options_raw, list) or len(options_raw) != 3 or len(target) != 3:
+        return None
+    p_neu = p_neg = p_pos = None
+    for opt, pv in zip(options_raw, target):
+        opt_l = str(opt).lower()
+        if "undetermined" in opt_l or "neutral" in opt_l:
+            p_neu = float(pv)
+        elif "contradict" in opt_l:
+            p_neg = float(pv)
+        elif "support" in opt_l or "entail" in opt_l:
+            p_pos = float(pv)
+    if p_neu is None or p_neg is None or p_pos is None:
+        return None
+    return [p_neu, p_neg, p_pos]
+
+
 def _parse_jev_distill_row(obj: Dict[str, Any], idx: int) -> Optional[NormalizedDecisionRecord]:
     """Parse a row from SargeDev/jev-distill-corpus-v3 or ZefanCai/Open-Jev-v1.1."""
     kind = str(obj.get("kind", "choice")).lower()
@@ -175,7 +193,12 @@ def _parse_jev_distill_row(obj: Dict[str, Any], idx: int) -> Optional[Normalized
         k = min(26, len(probs))
         probs = probs[:k]
         src_name = str(obj.get("source") or obj.get("domain") or "jev")
-        if src_name == "wanli-decisions-v1" and k == 3 and isinstance(state, dict) and "premise" in state and "claim" in state:
+        w_probs = (
+            _canonicalize_wanli_probs(options_raw, probs)
+            if src_name == "wanli-decisions-v1" and k == 3
+            else None
+        )
+        if w_probs is not None and isinstance(state, dict) and "premise" in state and "claim" in state:
             if idx % 3 == 1:
                 # Nimble NLI option order: [entailment (2), neutral (0), contradiction (1)]
                 state = {"premise": state["premise"], "hypothesis": state["claim"]}
@@ -186,7 +209,7 @@ def _parse_jev_distill_row(obj: Dict[str, Any], idx: int) -> Optional[Normalized
                     "contradiction": "If the premise is true, the hypothesis cannot be true.",
                 }
                 option_keys = ["entailment", "neutral", "contradiction"]
-                probs = [probs[2], probs[0], probs[1]]
+                probs = [w_probs[2], w_probs[0], w_probs[1]]
                 gold_idx = int(max(range(3), key=lambda i: probs[i]))
             elif idx % 3 == 2:
                 # Nimble Fact-Verification option order: [SUPPORTS (2), REFUTES (1), NOT ENOUGH INFO (0)]
@@ -198,7 +221,7 @@ def _parse_jev_distill_row(obj: Dict[str, Any], idx: int) -> Optional[Normalized
                     "NOT ENOUGH INFO": "The evidence neither establishes nor contradicts the claim. Settling it would need a fact the evidence does not supply.",
                 }
                 option_keys = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
-                probs = [probs[2], probs[1], probs[0]]
+                probs = [w_probs[2], w_probs[1], w_probs[0]]
                 gold_idx = int(max(range(3), key=lambda i: probs[i]))
             else:
                 option_keys = [str(o) for o in options_raw[:k]]
@@ -998,10 +1021,11 @@ def load_hf_jev_adaptation_corpus(
                 if obj.get("source") == "wanli-decisions-v1":
                     st = obj.get("state", {})
                     t = obj.get("target", [])
-                    if isinstance(st, dict) and "premise" in st and "claim" in st and len(t) == 3:
-                        g_sem = int(max(range(3), key=lambda k: float(t[k])))
-                        if float(max(t)) >= 0.70:
-                            wanli_by_sem[g_sem].append((str(st["premise"]), str(st["claim"]), [float(x) for x in t]))
+                    w_probs = _canonicalize_wanli_probs(obj.get("options"), t)
+                    if isinstance(st, dict) and "premise" in st and "claim" in st and w_probs is not None:
+                        g_sem = int(max(range(3), key=lambda k: float(w_probs[k])))
+                        if float(max(w_probs)) >= 0.70:
+                            wanli_by_sem[g_sem].append((str(st["premise"]), str(st["claim"]), w_probs))
                     continue
                 rec = _parse_jev_distill_row(obj, 20000 + idx)
                 if rec is not None and (len(str(rec.state)) + len(str(rec.instructions))) <= 2400:

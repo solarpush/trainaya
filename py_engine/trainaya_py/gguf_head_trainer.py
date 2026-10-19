@@ -60,7 +60,15 @@ GGML_QUANT_SPECS: Dict[int, Tuple[int, int, Optional[str], Optional[str]]] = {
     12: (256, 144, "dequantize_row_q4_K", "quantize_row_q4_K_ref"),
     13: (256, 176, "dequantize_row_q5_K", "quantize_row_q5_K_ref"),
     14: (256, 210, "dequantize_row_q6_K", "quantize_row_q6_K_ref"),
+    15: (256, 292, "dequantize_row_q8_K", "quantize_row_q8_K_ref"),
+    18: (256, 98, "dequantize_row_iq3_xxs", "quantize_row_iq3_xxs_ref"),
+    20: (32, 18, "dequantize_row_iq4_nl", "quantize_row_iq4_nl_ref"),
+    21: (256, 110, "dequantize_row_iq3_s", "quantize_row_iq3_s_ref"),
+    22: (256, 82, "dequantize_row_iq2_s", "quantize_row_iq2_s_ref"),
+    23: (256, 136, "dequantize_row_iq4_xs", "quantize_row_iq4_xs_ref"),
     30: (1, 2, "ggml_bf16_to_fp32_row", "ggml_fp32_to_bf16_row_ref"),
+    39: (32, 17, "dequantize_row_mxfp4", "quantize_row_mxfp4_ref"),
+    40: (64, 36, "dequantize_row_nvfp4", "quantize_row_nvfp4_ref"),
 }
 
 
@@ -535,9 +543,13 @@ class LlamaCppHiddenExtractor:
         cparams = self.lib.llama_context_default_params()
         struct.pack_into("<I", cparams.data, 0x00, n_ctx)  # n_ctx
         struct.pack_into("<I", cparams.data, 0x04, 2048)   # n_batch
-        struct.pack_into("<I", cparams.data, 0x08, 2048)   # n_ubatch
+        struct.pack_into("<I", cparams.data, 0x08, 512)    # n_ubatch (physical microbatch)
 
         self.ctx = self.lib.llama_init_from_model(self.model, cparams)
+        if not self.ctx:
+            struct.pack_into("<I", cparams.data, 0x00, 2048)
+            struct.pack_into("<I", cparams.data, 0x08, 256)
+            self.ctx = self.lib.llama_init_from_model(self.model, cparams)
         if not self.ctx:
             self.lib.llama_model_free(self.model)
             raise RuntimeError(f"llama_init_from_model failed for {gguf_path}")
@@ -1163,6 +1175,7 @@ def train_gguf_decision_head(
     n_threads: int = 12,
     add_bos: bool = True,
     yes_no_token_ids: Optional[List[int]] = None,
+    final_logit_softcap: float = 0.0,
     emit: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """Extract hidden states from `gguf_path`, solve the Full-Dimension (`d_model`) Cyclic 3x3 ABC
@@ -1336,7 +1349,7 @@ def train_gguf_decision_head(
     # Measure natural logit spread of this backbone (e.g. ~1.5 on Ministral vs ~5.4 on Gemma-3)
     raw_c_spread = float(np.std(hidden_mat @ w_choice_np[:3].T, axis=1).mean())
     raw_s_spread = float(np.std(hidden_mat @ w_score_np[:5].T, axis=1).mean())
-    is_high_spread_arch = raw_c_spread > 2.5
+    is_high_spread_arch = raw_c_spread > 3.5 and raw_s_spread > 2.0
 
     # 1. Full-Rank Biorthogonal 5-Level (0..4) Score Head Calibration:
     # Preserves the full-rank pretrained score vectors w_score_np[0..4] and calibrates the
@@ -1424,7 +1437,7 @@ def train_gguf_decision_head(
     # On tied-embedding models (e.g. Gemma-3), inject the choice-orthogonal "Yes" vs "No" token contrast
     # into rows A and B so binary noul tasks benefit from the model's strong Yes/No semantics without
     # perturbing multi-way choice tasks.
-    if is_high_spread_arch and yes_no_token_ids and len(yes_no_token_ids) >= 2:
+    if (is_high_spread_arch or raw_c_spread > 2.5) and yes_no_token_ids and len(yes_no_token_ids) >= 2:
         try:
             w_yn_np = quantizer.read_tensor_rows(gguf_path, tensor_info, list(yes_no_token_ids[:2])).astype(
                 np.float32
@@ -1436,9 +1449,12 @@ def train_gguf_decision_head(
                 delta_yn = 0.65 * (diff_yn_0 - diff_ab_0)
                 _, _, vt_choice_all = np.linalg.svd(hidden_mat[choice_all_idxs], full_matrices=False)
                 vt_c24 = vt_choice_all[: min(24, len(vt_choice_all))]
-                delta_yn_orth = delta_yn - (delta_yn @ vt_c24.T) @ vt_c24
-                wc_base[0] += delta_yn_orth
-                wc_base[1] -= delta_yn_orth
+                delta_yn_orth = delta_yn - (delta_yn @ vt_choice_all[: min(24, len(vt_choice_all))].T) @ vt_c24
+                wc_cand = wc_base.copy()
+                wc_cand[0] += delta_yn_orth
+                wc_cand[1] -= delta_yn_orth
+                if _eval_acc_np(wc_cand, w_score_np)["noul"] >= _eval_acc_np(wc_base, w_score_np)["noul"]:
+                    wc_base = wc_cand
         except Exception:
             pass
 
@@ -1758,16 +1774,21 @@ def train_gguf_decision_head(
         )
     )
 
-    if is_high_spread_arch:
-        post_c_spread = float(np.std(hidden_mat @ w_choice_quant_dequant[:3].T, axis=1).mean())
-        post_s_spread = float(np.std(hidden_mat @ w_score_quant_dequant[:5].T, axis=1).mean())
-        post_n_spread = float(np.std(hidden_mat @ w_choice_quant_dequant[:2].T, axis=1).mean())
-        t_c = round(max(1.0, post_c_spread / 1.35), 4)
-        t_s = round(max(1.0, post_s_spread / 0.90), 4)
-        t_n = round(max(1.0, post_n_spread / 1.15), 4)
-        temperatures = [t_c, t_s, t_n]
-    else:
-        temperatures = [1.0, 1.0, 1.0]
+    def _apply_softcap(logits_arr: np.ndarray) -> np.ndarray:
+        if final_logit_softcap > 0.0:
+            return final_logit_softcap * np.tanh(logits_arr / final_logit_softcap)
+        return logits_arr
+
+    post_c_logits = _apply_softcap(hidden_mat @ w_choice_quant_dequant[:3].T)
+    post_s_logits = _apply_softcap(hidden_mat @ w_score_quant_dequant[:5].T)
+    post_n_logits = _apply_softcap(hidden_mat @ w_choice_quant_dequant[:2].T)
+    post_c_spread = float(np.std(post_c_logits, axis=1).mean())
+    post_s_spread = float(np.std(post_s_logits, axis=1).mean())
+    post_n_spread = float(np.std(post_n_logits, axis=1).mean())
+    t_c = round(max(1.0, post_c_spread / 1.35), 4)
+    t_s = round(max(1.0, post_s_spread / 0.90), 4)
+    t_n = round(max(1.0, post_n_spread / 1.15), 4)
+    temperatures = [t_c, t_s, t_n]
 
     if emit:
         emit(
