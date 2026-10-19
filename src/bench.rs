@@ -1497,7 +1497,240 @@ pub fn normalize_nimble_record(subset_name: &str, rec: &mut BenchRecord) {
     }
 }
 
-/// Download and build one of the 13 public benchmark subsets from Hugging Face into ~/.cache/trainaya/benchmarks/public/<subset>/all.jsonl
+const NIMBLE_PUBLIC_MANIFESTS_JSON: &str = include_str!("nimble_public_manifests.json");
+pub const PUBLIC_BENCHMARK_SEED: u64 = 20260918;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NimbleSubsetManifest {
+    pub seed: u64,
+    pub count: usize,
+    pub dataset_sha256: String,
+    pub ids: Vec<String>,
+}
+
+pub fn load_nimble_public_manifests() -> HashMap<String, NimbleSubsetManifest> {
+    serde_json::from_str(NIMBLE_PUBLIC_MANIFESTS_JSON).unwrap_or_default()
+}
+
+fn sha256_hex16(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let full = format!("{:x}", hasher.finalize());
+    full[..16].to_string()
+}
+
+fn download_url_to_file(url: &str, dest: &Path) -> Result<()> {
+    if dest.is_file() && std::fs::metadata(dest).map(|m| m.len() > 1024).unwrap_or(false) {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension("part");
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match ureq::get(url)
+            .set("User-Agent", "trainaya-bench/0.3")
+            .timeout(Duration::from_secs(180))
+            .call()
+        {
+            Ok(resp) => {
+                let mut reader = resp.into_reader();
+                let mut out = File::create(&tmp)?;
+                std::io::copy(&mut reader, &mut out)?;
+                std::fs::rename(&tmp, dest)?;
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                std::thread::sleep(Duration::from_millis(800 * attempt));
+            }
+        }
+    }
+    bail!(
+        "Failed to download {}: {}",
+        url,
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    )
+}
+
+/// Read rows from a Hugging Face Parquet export (`0.parquet`) using Python + PyArrow (checking PATH, .venv, and ~/.cache/uv)
+fn read_hf_parquet_rows(
+    dataset: &str,
+    config: &str,
+    split: &str,
+    cache_root: &Path,
+    only_row_indices: Option<&[usize]>,
+) -> Option<Vec<(usize, serde_json::Value)>> {
+    let raw_dir = cache_root.join("_raw");
+    let safe_name = format!(
+        "{}_{}_{}.parquet",
+        dataset.replace('/', "__"),
+        config,
+        split
+    );
+    let parquet_path = raw_dir.join(safe_name);
+    let url = format!(
+        "https://huggingface.co/api/datasets/{}/parquet/{}/{}/0.parquet",
+        dataset, config, split
+    );
+    if download_url_to_file(&url, &parquet_path).is_err() {
+        return None;
+    }
+
+    let indices_json = only_row_indices
+        .map(|idx| serde_json::to_string(idx).unwrap_or_else(|_| "null".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let idx_file = raw_dir.join(format!("idx_{}.json", std::process::id()));
+    let _ = std::fs::write(&idx_file, &indices_json);
+
+    let py_script = r#"
+import json, sys
+import pyarrow.parquet as pq
+t = pq.read_table(sys.argv[1])
+idxs = json.loads(open(sys.argv[2]).read())
+if idxs is not None:
+    sub = t.take(idxs)
+    rows = sub.to_pylist()
+    for i, r in zip(idxs, rows):
+        print(json.dumps({"_idx": int(i), "row": r}, ensure_ascii=False))
+else:
+    for i, r in enumerate(t.to_pylist()):
+        print(json.dumps({"_idx": i, "row": r}, ensure_ascii=False))
+"#;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let mut py_candidates: Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)> = vec![
+        (std::path::PathBuf::from("python3"), Vec::new()),
+        (std::path::PathBuf::from("python"), Vec::new()),
+        (
+            std::path::Path::new(&home).join("Projects/trainaya/.venv/bin/python"),
+            Vec::new(),
+        ),
+    ];
+
+    // Also discover uv-cached Python 3.12 + pyarrow site-packages
+    let uv_py312 =
+        std::path::Path::new(&home).join(".local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12");
+    let uv_arch = std::path::Path::new(&home).join(".cache/uv/archive-v0");
+    let mut extra_paths = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&uv_arch) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.join("pyarrow").is_dir() {
+                extra_paths.push(p.clone());
+            }
+            let sp = p.join("lib/python3.12/site-packages");
+            if sp.join("pyarrow").is_dir() {
+                extra_paths.push(sp);
+            }
+        }
+    }
+    if uv_py312.is_file() {
+        py_candidates.push((uv_py312, extra_paths.clone()));
+    }
+    if !extra_paths.is_empty() {
+        py_candidates.push((std::path::PathBuf::from("python3.12"), extra_paths));
+    }
+
+    for (py_bin, py_paths) in py_candidates {
+        let mut cmd = std::process::Command::new(&py_bin);
+        if !py_paths.is_empty() {
+            let joined = py_paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(":");
+            cmd.env("PYTHONPATH", joined);
+        }
+        cmd.arg("-c")
+            .arg(py_script)
+            .arg(&parquet_path)
+            .arg(&idx_file);
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                let _ = std::fs::remove_file(&idx_file);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let mut parsed = Vec::new();
+                for line in stdout.lines() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        let i = v.get("_idx").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                        if let Some(r) = v.get("row") {
+                            parsed.push((i, r.clone()));
+                        }
+                    }
+                }
+                if !parsed.is_empty() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&idx_file);
+    None
+}
+
+/// Fetch specific row indices from Hugging Face Datasets Server by grouping nearby offsets into <=100-row requests
+fn fetch_hf_rows_by_indices(
+    dataset: &str,
+    config: &str,
+    split: &str,
+    indices: &[usize],
+) -> Result<Vec<(usize, serde_json::Value)>> {
+    let mut sorted = indices.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut results = Vec::with_capacity(sorted.len());
+    let mut pos = 0;
+
+    while pos < sorted.len() {
+        let start_idx = sorted[pos];
+        let mut end_pos = pos;
+        while end_pos + 1 < sorted.len() && sorted[end_pos + 1] < start_idx + 100 {
+            end_pos += 1;
+        }
+        let length = (sorted[end_pos] - start_idx + 1).max(1).min(100);
+        let url = format!(
+            "https://datasets-server.huggingface.co/rows?dataset={}&config={}&split={}&offset={}&length={}",
+            dataset, config, split, start_idx, length
+        );
+        let mut resp_opt = None;
+        for attempt in 1..=4 {
+            match ureq::get(&url).timeout(Duration::from_secs(30)).call() {
+                Ok(r) => {
+                    resp_opt = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(800 * attempt)),
+            }
+        }
+        if let Some(resp) = resp_opt {
+            let body: serde_json::Value = resp.into_json()?;
+            if let Some(arr) = body.get("rows").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let row_idx = item
+                        .get("row_idx")
+                        .and_then(|v| v.as_u64())
+                        .map(|x| x as usize);
+                    if let (Some(r_idx), Some(r)) = (row_idx, item.get("row")) {
+                        if sorted[pos..=end_pos].binary_search(&r_idx).is_ok() {
+                            results.push((r_idx, r.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        pos = end_pos + 1;
+        std::thread::sleep(Duration::from_millis(80));
+    }
+
+    Ok(results)
+}
+
+/// Download and build one of the 13 public benchmark subsets (aligned with bespokelabsai/nimble seed 20260918 manifests)
+/// into ~/.cache/trainaya/benchmarks/public/<subset>/all.jsonl
 pub fn fetch_and_cache_public_subset(
     subset_name: &str,
     cache_root: &Path,
@@ -1505,79 +1738,202 @@ pub fn fetch_and_cache_public_subset(
 ) -> Result<Vec<BenchRecord>> {
     let mut records = Vec::new();
     let q_tmpl = nimble_question_template(subset_name).unwrap_or_else(|| question_template.clone());
+    let manifests = load_nimble_public_manifests();
+    let wanted_ids: Option< std::collections::HashSet<String> > = manifests
+        .get(subset_name)
+        .map(|m| m.ids.iter().cloned().collect());
+    let raw_dir = cache_root.join("_raw");
+    let _ = std::fs::create_dir_all(&raw_dir);
 
     match subset_name {
         "vitaminc-dev" => {
-            let raw = fetch_hf_rows("tals/vitaminc", "default", "validation", 599)?;
-            for (idx, r) in raw.into_iter().enumerate() {
-                let claim = r.get("claim").and_then(|v| v.as_str()).unwrap_or_default();
-                let evidence = r.get("evidence").and_then(|v| v.as_str()).unwrap_or_default();
-                let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("NOT ENOUGH INFO");
-                records.push(BenchRecord {
-                    id: format!("vitaminc-dev-{}", idx + 1),
-                    kind: "choice".to_string(),
-                    workflow: None,
-                    input: BenchInput {
-                        state: serde_json::json!({ "evidence": evidence, "claim": claim }),
-                        questions: q_tmpl.clone(),
-                    },
-                    reference: BenchReference {
-                        label: serde_json::json!(label),
-                        distribution: None,
-                    },
-                });
+            let zip_path = raw_dir.join("vitaminc.zip");
+            let zip_url = "https://github.com/TalSchuster/talschuster.github.io/raw/master/static/vitaminc.zip";
+            if download_url_to_file(zip_url, &zip_path).is_ok() {
+                if let Ok(mut child) = std::process::Command::new("unzip")
+                    .arg("-p")
+                    .arg(&zip_path)
+                    .arg("*dev.jsonl")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    if let Some(stdout) = child.stdout.take() {
+                        let reader = BufReader::new(stdout);
+                        for line in reader.lines().flatten() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            if let Ok(r) = serde_json::from_str::<serde_json::Value>(&line) {
+                                let uid = r.get("unique_id").and_then(|v| v.as_str()).unwrap_or_default();
+                                let rec_id = format!("vitaminc-{}", uid);
+                                if let Some(ref w) = wanted_ids {
+                                    if !w.contains(&rec_id) {
+                                        continue;
+                                    }
+                                }
+                                let claim = r.get("claim").and_then(|v| v.as_str()).unwrap_or_default();
+                                let evidence = r.get("evidence").and_then(|v| v.as_str()).unwrap_or_default();
+                                let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("NOT ENOUGH INFO");
+                                records.push(BenchRecord {
+                                    id: rec_id,
+                                    kind: "choice".to_string(),
+                                    workflow: None,
+                                    input: BenchInput {
+                                        state: serde_json::json!({ "evidence": evidence, "claim": claim }),
+                                        questions: q_tmpl.clone(),
+                                    },
+                                    reference: BenchReference {
+                                        label: serde_json::json!(label),
+                                        distribution: None,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    let _ = child.wait();
+                }
+            }
+            if records.is_empty() {
+                let raw = if let Some(pq_rows) = read_hf_parquet_rows("tals/vitaminc", "default", "validation", cache_root, None) {
+                    pq_rows.into_iter().map(|(_, r)| r).collect()
+                } else {
+                    fetch_hf_rows("tals/vitaminc", "default", "validation", 599)?
+                };
+                for (idx, r) in raw.into_iter().enumerate() {
+                    let uid = r.get("unique_id").and_then(|v| v.as_str()).unwrap_or_default();
+                    let rec_id = if !uid.is_empty() {
+                        format!("vitaminc-{}", uid)
+                    } else {
+                        format!("vitaminc-dev-{}", idx + 1)
+                    };
+                    if let Some(ref w) = wanted_ids {
+                        if !uid.is_empty() && !w.contains(&rec_id) {
+                            continue;
+                        }
+                    }
+                    let claim = r.get("claim").and_then(|v| v.as_str()).unwrap_or_default();
+                    let evidence = r.get("evidence").and_then(|v| v.as_str()).unwrap_or_default();
+                    let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("NOT ENOUGH INFO");
+                    records.push(BenchRecord {
+                        id: rec_id,
+                        kind: "choice".to_string(),
+                        workflow: None,
+                        input: BenchInput {
+                            state: serde_json::json!({ "evidence": evidence, "claim": claim }),
+                            questions: q_tmpl.clone(),
+                        },
+                        reference: BenchReference {
+                            label: serde_json::json!(label),
+                            distribution: None,
+                        },
+                    });
+                }
             }
         }
-        "massive-en-US" => {
-            let raw = fetch_hf_rows("mteb/amazon_massive_intent", "en", "test", 350)?;
-            for (idx, r) in raw.into_iter().enumerate() {
-                let text = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
-                let full_label = r.get("label").and_then(|v| v.as_str()).unwrap_or("general");
-                let domain = full_label.split('_').next().unwrap_or("general");
-                records.push(BenchRecord {
-                    id: format!("massive-en-{}", idx + 1),
-                    kind: "choice".to_string(),
-                    workflow: None,
-                    input: BenchInput {
-                        state: serde_json::json!({ "utterance": text, "locale": "en-US" }),
-                        questions: q_tmpl.clone(),
-                    },
-                    reference: BenchReference {
-                        label: serde_json::json!(domain),
-                        distribution: None,
-                    },
-                });
+        "massive-en-US" | "massive-de-DE" => {
+            let locale = if subset_name == "massive-de-DE" { "de-DE" } else { "en-US" };
+            let tar_path = raw_dir.join("amazon-massive-dataset-1.1.tar.gz");
+            let tar_url = "https://amazon-massive-nlu-dataset.s3.amazonaws.com/amazon-massive-dataset-1.1.tar.gz";
+            if download_url_to_file(tar_url, &tar_path).is_ok() {
+                let member = format!("1.1/data/{}.jsonl", locale);
+                if let Ok(out) = std::process::Command::new("tar")
+                    .arg("-xzf")
+                    .arg(&tar_path)
+                    .arg("-O")
+                    .arg(&member)
+                    .output()
+                {
+                    if out.status.success() {
+                        let text_content = String::from_utf8_lossy(&out.stdout);
+                        for line in text_content.lines() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            if let Ok(r) = serde_json::from_str::<serde_json::Value>(line) {
+                                if r.get("partition").and_then(|v| v.as_str()) != Some("test") {
+                                    continue;
+                                }
+                                let raw_id = r
+                                    .get("id")
+                                    .and_then(|v| {
+                                        v.as_str()
+                                            .map(|s| s.to_string())
+                                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                                    })
+                                    .unwrap_or_default();
+                                let rec_id = format!("massive-{}", raw_id);
+                                if let Some(ref w) = wanted_ids {
+                                    if !w.contains(&rec_id) {
+                                        continue;
+                                    }
+                                }
+                                let utt = r.get("utt").and_then(|v| v.as_str()).unwrap_or_default();
+                                let scenario = r.get("scenario").and_then(|v| v.as_str()).unwrap_or("general");
+                                records.push(BenchRecord {
+                                    id: rec_id,
+                                    kind: "choice".to_string(),
+                                    workflow: None,
+                                    input: BenchInput {
+                                        state: serde_json::json!({ "utterance": utt, "locale": locale }),
+                                        questions: q_tmpl.clone(),
+                                    },
+                                    reference: BenchReference {
+                                        label: serde_json::json!(scenario),
+                                        distribution: None,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
             }
-        }
-        "massive-de-DE" => {
-            let raw = fetch_hf_rows("mteb/amazon_massive_intent", "de", "test", 350)?;
-            for (idx, r) in raw.into_iter().enumerate() {
-                let text = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
-                let full_label = r.get("label").and_then(|v| v.as_str()).unwrap_or("general");
-                let domain = full_label.split('_').next().unwrap_or("general");
-                records.push(BenchRecord {
-                    id: format!("massive-de-{}", idx + 1),
-                    kind: "choice".to_string(),
-                    workflow: None,
-                    input: BenchInput {
-                        state: serde_json::json!({ "utterance": text, "locale": "de-DE" }),
-                        questions: q_tmpl.clone(),
-                    },
-                    reference: BenchReference {
-                        label: serde_json::json!(domain),
-                        distribution: None,
-                    },
-                });
+            if records.is_empty() {
+                let hf_cfg = if subset_name == "massive-de-DE" { "de" } else { "en" };
+                let raw = fetch_hf_rows("mteb/amazon_massive_intent", hf_cfg, "test", 350)?;
+                for (idx, r) in raw.into_iter().enumerate() {
+                    let text = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                    let full_label = r.get("label").and_then(|v| v.as_str()).unwrap_or("general");
+                    let domain = full_label.split('_').next().unwrap_or("general");
+                    records.push(BenchRecord {
+                        id: format!("massive-{}-{}", hf_cfg, idx + 1),
+                        kind: "choice".to_string(),
+                        workflow: None,
+                        input: BenchInput {
+                            state: serde_json::json!({ "utterance": text, "locale": locale }),
+                            questions: q_tmpl.clone(),
+                        },
+                        reference: BenchReference {
+                            label: serde_json::json!(domain),
+                            distribution: None,
+                        },
+                    });
+                }
             }
         }
         "boolq" => {
-            let raw = fetch_hf_rows("google/boolq", "default", "validation", 300)?;
-            for (idx, r) in raw.into_iter().enumerate() {
+            let raw: Vec<serde_json::Value> = if let Some(pq_rows) =
+                read_hf_parquet_rows("google/boolq", "default", "validation", cache_root, None)
+            {
+                pq_rows.into_iter().map(|(_, r)| r).collect()
+            } else {
+                fetch_hf_rows("google/boolq", "default", "validation", 3270)?
+            };
+            for r in raw {
                 let passage = r.get("passage").and_then(|v| v.as_str()).unwrap_or_default();
                 let question = r.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+                if passage.trim().is_empty() || question.trim().is_empty() {
+                    continue;
+                }
+                let rec_id = format!("boolq-{}", sha256_hex16(&format!("{}\n{}", question, passage)));
+                if let Some(ref w) = wanted_ids {
+                    if !w.contains(&rec_id) {
+                        continue;
+                    }
+                }
                 let ans = r.get("answer").and_then(|v| v.as_bool()).unwrap_or(false);
                 records.push(BenchRecord {
-                    id: format!("boolq-{}", idx + 1),
+                    id: rec_id,
                     kind: "noul".to_string(),
                     workflow: None,
                     input: BenchInput {
@@ -1592,39 +1948,141 @@ pub fn fetch_and_cache_public_subset(
             }
         }
         "squad2" => {
-            let raw = fetch_hf_rows("rajpurkar/squad_v2", "squad_v2", "validation", 299)?;
-            for (idx, r) in raw.into_iter().enumerate() {
-                let paragraph = r.get("context").and_then(|v| v.as_str()).unwrap_or_default();
-                let question = r.get("question").and_then(|v| v.as_str()).unwrap_or_default();
-                let answerable = r
-                    .get("answers")
-                    .and_then(|a| a.get("text"))
-                    .and_then(|t| t.as_array())
-                    .map(|arr| !arr.is_empty())
-                    .unwrap_or(false);
-                records.push(BenchRecord {
-                    id: format!("squad2-{}", idx + 1),
-                    kind: "noul".to_string(),
-                    workflow: None,
-                    input: BenchInput {
-                        state: serde_json::json!({ "paragraph": paragraph, "question": question }),
-                        questions: q_tmpl.clone(),
-                    },
-                    reference: BenchReference {
-                        label: serde_json::json!(answerable),
-                        distribution: None,
-                    },
-                });
+            let json_path = raw_dir.join("squad_dev_v2.json");
+            let json_url = "https://rajpurkar.github.io/SQuAD-explorer/dataset/dev-v2.0.json";
+            if download_url_to_file(json_url, &json_path).is_ok() {
+                if let Ok(raw_str) = std::fs::read_to_string(&json_path) {
+                    if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw_str) {
+                        if let Some(articles) = doc.get("data").and_then(|d| d.as_array()) {
+                            for art in articles {
+                                if let Some(paras) = art.get("paragraphs").and_then(|p| p.as_array()) {
+                                    for para in paras {
+                                        let context = para.get("context").and_then(|v| v.as_str()).unwrap_or_default();
+                                        if let Some(qas) = para.get("qas").and_then(|q| q.as_array()) {
+                                            for qa in qas {
+                                                let qid = qa.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                                                let rec_id = format!("squad2-{}", qid);
+                                                if let Some(ref w) = wanted_ids {
+                                                    if !w.contains(&rec_id) {
+                                                        continue;
+                                                    }
+                                                }
+                                                let question = qa.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+                                                let answerable = qa
+                                                    .get("answers")
+                                                    .and_then(|a| a.as_array())
+                                                    .map(|arr| {
+                                                        arr.iter().any(|x| {
+                                                            x.get("text")
+                                                                .and_then(|t| t.as_str())
+                                                                .map(|s| !s.trim().is_empty())
+                                                                .unwrap_or(false)
+                                                        })
+                                                    })
+                                                    .unwrap_or(false);
+                                                records.push(BenchRecord {
+                                                    id: rec_id,
+                                                    kind: "noul".to_string(),
+                                                    workflow: None,
+                                                    input: BenchInput {
+                                                        state: serde_json::json!({ "paragraph": context, "question": question }),
+                                                        questions: q_tmpl.clone(),
+                                                    },
+                                                    reference: BenchReference {
+                                                        label: serde_json::json!(answerable),
+                                                        distribution: None,
+                                                    },
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if records.is_empty() {
+                let raw: Vec<serde_json::Value> = if let Some(pq_rows) =
+                    read_hf_parquet_rows("rajpurkar/squad_v2", "squad_v2", "validation", cache_root, None)
+                {
+                    pq_rows.into_iter().map(|(_, r)| r).collect()
+                } else {
+                    fetch_hf_rows("rajpurkar/squad_v2", "squad_v2", "validation", 299)?
+                };
+                for r in raw {
+                    let qid = r.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                    let rec_id = format!("squad2-{}", qid);
+                    if let Some(ref w) = wanted_ids {
+                        if !w.contains(&rec_id) {
+                            continue;
+                        }
+                    }
+                    let paragraph = r.get("context").and_then(|v| v.as_str()).unwrap_or_default();
+                    let question = r.get("question").and_then(|v| v.as_str()).unwrap_or_default();
+                    let answerable = r
+                        .get("answers")
+                        .and_then(|a| a.get("text"))
+                        .and_then(|t| t.as_array())
+                        .map(|arr| !arr.is_empty())
+                        .unwrap_or(false);
+                    records.push(BenchRecord {
+                        id: rec_id,
+                        kind: "noul".to_string(),
+                        workflow: None,
+                        input: BenchInput {
+                            state: serde_json::json!({ "paragraph": paragraph, "question": question }),
+                            questions: q_tmpl.clone(),
+                        },
+                        reference: BenchReference {
+                            label: serde_json::json!(answerable),
+                            distribution: None,
+                        },
+                    });
+                }
             }
         }
         "paws" => {
-            let raw = fetch_hf_rows("google-research-datasets/paws", "labeled_final", "test", 250)?;
-            for (idx, r) in raw.into_iter().enumerate() {
+            let raw: Vec<serde_json::Value> = if let Some(pq_rows) =
+                read_hf_parquet_rows("google-research-datasets/paws", "labeled_final", "test", cache_root, None)
+            {
+                pq_rows.into_iter().map(|(_, r)| r).collect()
+            } else {
+                let mut target_offsets = Vec::new();
+                if let Some(ref w) = wanted_ids {
+                    for s in w {
+                        if let Some(num_s) = s.strip_prefix("paws-") {
+                            if let Ok(n) = num_s.parse::<usize>() {
+                                target_offsets.push(n.saturating_sub(1));
+                            }
+                        }
+                    }
+                }
+                fetch_hf_rows_by_indices("google-research-datasets/paws", "labeled_final", "test", &target_offsets)?
+                    .into_iter()
+                    .map(|(_, r)| r)
+                    .collect()
+            };
+            for r in raw {
+                let raw_id = r
+                    .get("id")
+                    .and_then(|v| {
+                        v.as_i64()
+                            .map(|n| n.to_string())
+                            .or_else(|| v.as_str().map(|s| s.to_string()))
+                    })
+                    .unwrap_or_default();
+                let rec_id = format!("paws-{}", raw_id);
+                if let Some(ref w) = wanted_ids {
+                    if !w.contains(&rec_id) {
+                        continue;
+                    }
+                }
                 let s1 = r.get("sentence1").and_then(|v| v.as_str()).unwrap_or_default();
                 let s2 = r.get("sentence2").and_then(|v| v.as_str()).unwrap_or_default();
                 let is_para = r.get("label").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
                 records.push(BenchRecord {
-                    id: format!("paws-{}", idx + 1),
+                    id: rec_id,
                     kind: "noul".to_string(),
                     workflow: None,
                     input: BenchInput {
@@ -1639,38 +2097,146 @@ pub fn fetch_and_cache_public_subset(
             }
         }
         "multinli" => {
-            let raw = fetch_hf_rows("nyu-mll/multi_nli", "default", "validation_matched", 299)?;
-            for (idx, r) in raw.into_iter().enumerate() {
-                let premise = r.get("premise").and_then(|v| v.as_str()).unwrap_or_default();
-                let hypothesis = r.get("hypothesis").and_then(|v| v.as_str()).unwrap_or_default();
-                let lbl_int = r.get("label").and_then(|v| v.as_i64()).unwrap_or(1);
-                let lbl_str = match lbl_int {
-                    0 => "entailment",
-                    2 => "contradiction",
-                    _ => "neutral",
-                };
-                records.push(BenchRecord {
-                    id: format!("multinli-{}", idx + 1),
-                    kind: "choice".to_string(),
-                    workflow: None,
-                    input: BenchInput {
-                        state: serde_json::json!({ "premise": premise, "hypothesis": hypothesis }),
-                        questions: q_tmpl.clone(),
-                    },
-                    reference: BenchReference {
-                        label: serde_json::json!(lbl_str),
-                        distribution: None,
-                    },
-                });
+            let zip_path = raw_dir.join("multinli_1.0.zip");
+            let zip_url = "https://cims.nyu.edu/~sbowman/multinli/multinli_1.0.zip";
+            if download_url_to_file(zip_url, &zip_path).is_ok() {
+                if let Ok(mut child) = std::process::Command::new("unzip")
+                    .arg("-p")
+                    .arg(&zip_path)
+                    .arg("*dev_matched.jsonl")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    if let Some(stdout) = child.stdout.take() {
+                        let reader = BufReader::new(stdout);
+                        for line in reader.lines().flatten() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            if let Ok(r) = serde_json::from_str::<serde_json::Value>(&line) {
+                                let gold_label = r.get("gold_label").and_then(|v| v.as_str()).unwrap_or("-");
+                                if gold_label == "-" {
+                                    continue;
+                                }
+                                let pair_id = r.get("pairID").and_then(|v| v.as_str()).unwrap_or_default();
+                                let rec_id = format!("multinli-{}", pair_id);
+                                if let Some(ref w) = wanted_ids {
+                                    if !w.contains(&rec_id) {
+                                        continue;
+                                    }
+                                }
+                                let premise = r.get("sentence1").and_then(|v| v.as_str()).unwrap_or_default().trim();
+                                let hypothesis = r.get("sentence2").and_then(|v| v.as_str()).unwrap_or_default().trim();
+                                let dist = r.get("annotator_labels").and_then(|v| v.as_array()).and_then(|votes| {
+                                    if votes.is_empty() {
+                                        return None;
+                                    }
+                                    let n = votes.len() as f64;
+                                    let mut c_e = 0.0;
+                                    let mut c_n = 0.0;
+                                    let mut c_c = 0.0;
+                                    for v in votes {
+                                        match v.as_str().unwrap_or("") {
+                                            "entailment" => c_e += 1.0,
+                                            "neutral" => c_n += 1.0,
+                                            "contradiction" => c_c += 1.0,
+                                            _ => {}
+                                        }
+                                    }
+                                    Some(serde_json::json!({
+                                        "entailment": c_e / n,
+                                        "neutral": c_n / n,
+                                        "contradiction": c_c / n,
+                                    }))
+                                });
+                                records.push(BenchRecord {
+                                    id: rec_id,
+                                    kind: "choice".to_string(),
+                                    workflow: None,
+                                    input: BenchInput {
+                                        state: serde_json::json!({ "premise": premise, "hypothesis": hypothesis }),
+                                        questions: q_tmpl.clone(),
+                                    },
+                                    reference: BenchReference {
+                                        label: serde_json::json!(gold_label),
+                                        distribution: dist,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    let _ = child.wait();
+                }
+            }
+            if records.is_empty() {
+                let raw = fetch_hf_rows("nyu-mll/multi_nli", "default", "validation_matched", 9815)?;
+                for r in raw {
+                    let pair_id = r.get("pairID").and_then(|v| v.as_str()).unwrap_or_default();
+                    let rec_id = format!("multinli-{}", pair_id);
+                    if let Some(ref w) = wanted_ids {
+                        if !w.contains(&rec_id) {
+                            continue;
+                        }
+                    }
+                    let premise = r.get("premise").and_then(|v| v.as_str()).unwrap_or_default().trim();
+                    let hypothesis = r.get("hypothesis").and_then(|v| v.as_str()).unwrap_or_default().trim();
+                    let lbl_int = r.get("label").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let lbl_str = match lbl_int {
+                        0 => "entailment",
+                        2 => "contradiction",
+                        _ => "neutral",
+                    };
+                    records.push(BenchRecord {
+                        id: rec_id,
+                        kind: "choice".to_string(),
+                        workflow: None,
+                        input: BenchInput {
+                            state: serde_json::json!({ "premise": premise, "hypothesis": hypothesis }),
+                            questions: q_tmpl.clone(),
+                        },
+                        reference: BenchReference {
+                            label: serde_json::json!(lbl_str),
+                            distribution: None,
+                        },
+                    });
+                }
             }
         }
         "civil_comments" => {
-            let raw = fetch_hf_rows("google/civil_comments", "default", "test", 300)?;
-            for (idx, r) in raw.into_iter().enumerate() {
-                let comment = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+            let mut target_indices = Vec::new();
+            if let Some(ref w) = wanted_ids {
+                for s in w {
+                    if let Some(num_s) = s.strip_prefix("civil_comments-") {
+                        if let Ok(n) = num_s.parse::<usize>() {
+                            target_indices.push(n);
+                        }
+                    }
+                }
+            }
+            target_indices.sort_unstable();
+            let indexed_rows = if let Some(pq_rows) = read_hf_parquet_rows(
+                "google/civil_comments",
+                "default",
+                "test",
+                cache_root,
+                Some(&target_indices),
+            ) {
+                pq_rows
+            } else {
+                fetch_hf_rows_by_indices("google/civil_comments", "default", "test", &target_indices)?
+            };
+            for (row_idx, r) in indexed_rows {
+                let rec_id = format!("civil_comments-{}", row_idx);
+                if let Some(ref w) = wanted_ids {
+                    if !w.contains(&rec_id) {
+                        continue;
+                    }
+                }
+                let comment = r.get("text").and_then(|v| v.as_str()).unwrap_or_default().trim();
                 let tox = r.get("toxicity").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 records.push(BenchRecord {
-                    id: format!("civil-{}", idx + 1),
+                    id: rec_id,
                     kind: "noul".to_string(),
                     workflow: None,
                     input: BenchInput {
@@ -1679,22 +2245,42 @@ pub fn fetch_and_cache_public_subset(
                     },
                     reference: BenchReference {
                         label: serde_json::json!(tox >= 0.5),
-                        distribution: None,
+                        distribution: Some(serde_json::json!({
+                            "false": 1.0 - tox,
+                            "true": tox,
+                        })),
                     },
                 });
             }
         }
         "aegis2" => {
-            let raw = fetch_hf_rows("nvidia/Aegis-AI-Content-Safety-Dataset-2.0", "default", "test", 250)?;
-            for (idx, r) in raw.into_iter().enumerate() {
-                let msg = r.get("prompt").and_then(|v| v.as_str()).unwrap_or_default();
+            let raw: Vec<serde_json::Value> = if let Some(pq_rows) = read_hf_parquet_rows(
+                "nvidia/Aegis-AI-Content-Safety-Dataset-2.0",
+                "default",
+                "test",
+                cache_root,
+                None,
+            ) {
+                pq_rows.into_iter().map(|(_, r)| r).collect()
+            } else {
+                fetch_hf_rows("nvidia/Aegis-AI-Content-Safety-Dataset-2.0", "default", "test", 1964)?
+            };
+            for r in raw {
+                let raw_id = r.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let rec_id = format!("aegis2-{}", raw_id);
+                if let Some(ref w) = wanted_ids {
+                    if !w.contains(&rec_id) {
+                        continue;
+                    }
+                }
+                let msg = r.get("prompt").and_then(|v| v.as_str()).unwrap_or_default().trim();
                 let unsafe_lbl = r
                     .get("prompt_label")
                     .and_then(|v| v.as_str())
                     .map(|s| s.eq_ignore_ascii_case("unsafe"))
                     .unwrap_or(false);
                 records.push(BenchRecord {
-                    id: format!("aegis-{}", idx + 1),
+                    id: rec_id,
                     kind: "noul".to_string(),
                     workflow: None,
                     input: BenchInput {
@@ -1709,11 +2295,38 @@ pub fn fetch_and_cache_public_subset(
             }
         }
         "helpsteer2" => {
-            let raw = fetch_hf_rows("nvidia/HelpSteer2", "default", "validation", 249)?;
-            for (idx, r) in raw.into_iter().enumerate() {
+            let mut target_indices = Vec::new();
+            if let Some(ref w) = wanted_ids {
+                for s in w {
+                    if let Some(num_s) = s.strip_prefix("helpsteer2-") {
+                        if let Ok(n) = num_s.parse::<usize>() {
+                            target_indices.push(n);
+                        }
+                    }
+                }
+            }
+            target_indices.sort_unstable();
+            let indexed_rows = if let Some(pq_rows) = read_hf_parquet_rows(
+                "nvidia/HelpSteer2",
+                "default",
+                "validation",
+                cache_root,
+                Some(&target_indices),
+            ) {
+                pq_rows
+            } else {
+                let all = fetch_hf_rows("nvidia/HelpSteer2", "default", "validation", 1038)?;
+                all.into_iter().enumerate().collect()
+            };
+            for (row_idx, r) in indexed_rows {
+                let rec_id = format!("helpsteer2-{}", row_idx);
+                if let Some(ref w) = wanted_ids {
+                    if !w.contains(&rec_id) {
+                        continue;
+                    }
+                }
                 let prompt = r.get("prompt").and_then(|v| v.as_str()).unwrap_or_default();
                 let response = r.get("response").and_then(|v| v.as_str()).unwrap_or_default();
-                // bespokelabsai/nimble scores HelpSteer2 on helpfulness (0..4)
                 let score = r
                     .get("helpfulness")
                     .or_else(|| r.get("correctness"))
@@ -1721,7 +2334,7 @@ pub fn fetch_and_cache_public_subset(
                     .unwrap_or(4)
                     .clamp(0, 4);
                 records.push(BenchRecord {
-                    id: format!("helpsteer-{}", idx + 1),
+                    id: rec_id,
                     kind: "score".to_string(),
                     workflow: None,
                     input: BenchInput {
@@ -1737,20 +2350,31 @@ pub fn fetch_and_cache_public_subset(
         }
         "summeval-relevance" | "summeval-consistency" => {
             let is_rel = subset_name == "summeval-relevance";
-            let target_n = if is_rel { 240 } else { 144 };
-            let raw = fetch_hf_rows("mteb/summeval", "default", "test", 30)?;
+            let dim = if is_rel { "relevance" } else { "consistency" };
+            let raw: Vec<serde_json::Value> = if let Some(pq_rows) =
+                read_hf_parquet_rows("mteb/summeval", "default", "test", cache_root, None)
+            {
+                pq_rows.into_iter().map(|(_, r)| r).collect()
+            } else {
+                fetch_hf_rows("mteb/summeval", "default", "test", 100)?
+            };
             for r in raw {
+                let art_id = r.get("id").and_then(|v| v.as_str()).unwrap_or_default();
                 let article = r.get("text").and_then(|v| v.as_str()).unwrap_or_default();
                 let summaries = r.get("machine_summaries").and_then(|v| v.as_array());
-                let scores = r
-                    .get(if is_rel { "relevance" } else { "consistency" })
-                    .and_then(|v| v.as_array());
+                let scores = r.get(dim).and_then(|v| v.as_array());
                 if let (Some(sums), Some(sc_arr)) = (summaries, scores) {
-                    for (s_val, sc_val) in sums.iter().zip(sc_arr.iter()) {
+                    for (sum_idx, (s_val, sc_val)) in sums.iter().zip(sc_arr.iter()).enumerate() {
                         if let (Some(summary), Some(raw_score)) = (s_val.as_str(), sc_val.as_f64()) {
-                            let mapped = (raw_score - 1.0).round().clamp(0.0, 4.0) as i64;
+                            let rec_id = format!("summeval-{}-{}-{}", dim, art_id, sum_idx);
+                            if let Some(ref w) = wanted_ids {
+                                if !w.contains(&rec_id) {
+                                    continue;
+                                }
+                            }
+                            let mapped = ((raw_score + 0.5).floor() as i64 - 1).clamp(0, 4);
                             records.push(BenchRecord {
-                                id: format!("{}-{}", subset_name, records.len() + 1),
+                                id: rec_id,
                                 kind: "score".to_string(),
                                 workflow: None,
                                 input: BenchInput {
@@ -1762,20 +2386,34 @@ pub fn fetch_and_cache_public_subset(
                                     distribution: None,
                                 },
                             });
-                            if records.len() >= target_n {
-                                break;
-                            }
                         }
                     }
-                }
-                if records.len() >= target_n {
-                    break;
                 }
             }
         }
         "pubmedqa" => {
-            let raw = fetch_hf_rows("qiaojin/PubMedQA", "pqa_labeled", "train", 250)?;
-            for (idx, r) in raw.into_iter().enumerate() {
+            let raw: Vec<serde_json::Value> = if let Some(pq_rows) =
+                read_hf_parquet_rows("qiaojin/PubMedQA", "pqa_labeled", "train", cache_root, None)
+            {
+                pq_rows.into_iter().map(|(_, r)| r).collect()
+            } else {
+                fetch_hf_rows("qiaojin/PubMedQA", "pqa_labeled", "train", 1000)?
+            };
+            for r in raw {
+                let pubid = r
+                    .get("pubid")
+                    .and_then(|v| {
+                        v.as_i64()
+                            .map(|n| n.to_string())
+                            .or_else(|| v.as_str().map(|s| s.to_string()))
+                    })
+                    .unwrap_or_default();
+                let rec_id = format!("pubmedqa-{}", pubid);
+                if let Some(ref w) = wanted_ids {
+                    if !w.contains(&rec_id) {
+                        continue;
+                    }
+                }
                 let question = r.get("question").and_then(|v| v.as_str()).unwrap_or_default();
                 let abstract_ctx = r
                     .get("context")
@@ -1784,17 +2422,19 @@ pub fn fetch_and_cache_public_subset(
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
                             .collect::<Vec<_>>()
                             .join(" ")
                     })
-                    .or_else(|| r.get("long_answer").and_then(|v| v.as_str()).map(|s| s.to_string()))
                     .unwrap_or_default();
                 let decision = r
                     .get("final_decision")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("yes");
+                    .unwrap_or("yes")
+                    .trim()
+                    .to_lowercase();
                 records.push(BenchRecord {
-                    id: format!("pubmedqa-{}", idx + 1),
+                    id: rec_id,
                     kind: "choice".to_string(),
                     workflow: None,
                     input: BenchInput {
@@ -1850,6 +2490,11 @@ pub fn fetch_and_cache_public_subset(
             }
         }
         _ => {}
+    }
+
+    // Sort public subset records by ID to match bespokelabsai/nimble's exact manifest order
+    if subset_name != "typed-decisions" {
+        records.sort_by(|a, b| a.id.cmp(&b.id));
     }
 
     if !records.is_empty() {
@@ -1916,6 +2561,7 @@ pub fn resolve_benchmark_data(
     // Check or populate global benchmark cache (~/.cache/trainaya/benchmarks/public/<subset>/all.jsonl)
     let cache_root = get_benchmark_cache_dir();
     let built_in = get_builtin_subsets();
+    let nimble_manifests = load_nimble_public_manifests();
 
     for (sub_name, _, _) in ALL_BENCHMARK_SUBSETS {
         if let Some(req) = requested_subsets {
@@ -1930,7 +2576,15 @@ pub fn resolve_benchmark_data(
         let cached_file = cache_root.join(sub_name).join("all.jsonl");
         if cached_file.is_file() {
             if let Ok(mut records) = load_jsonl(&cached_file) {
-                if !records.is_empty() {
+                let manifest_matches = if let Some(m) = nimble_manifests.get(*sub_name) {
+                    records.len() == m.ids.len()
+                        && records.first().map(|r| r.id.as_str()) == m.ids.first().map(|s| s.as_str())
+                        && records.last().map(|r| r.id.as_str()) == m.ids.last().map(|s| s.as_str())
+                } else {
+                    !records.is_empty()
+                };
+
+                if manifest_matches {
                     for r in &mut records {
                         normalize_nimble_record(sub_name, r);
                     }
@@ -1940,13 +2594,14 @@ pub fn resolve_benchmark_data(
             }
         }
 
-        // Not in cache yet -> download from HuggingFace Datasets Server and cache in ~/.cache/trainaya/benchmarks/public/
+        // Not in cache yet (or pre-seed cache needs refresh) -> download and cache in ~/.cache/trainaya/benchmarks/public/
         if let Some(template_recs) = built_in.get(*sub_name) {
             if let Some(first_rec) = template_recs.first() {
                 println!(
-                    "    {} Caching benchmark subset '{}' into {:?}...",
+                    "    {} Caching benchmark subset '{}' (seed {}) into {:?}...",
                     "⬇️".cyan(),
                     sub_name.bold(),
+                    PUBLIC_BENCHMARK_SEED,
                     cache_root.join(sub_name)
                 );
                 match fetch_and_cache_public_subset(sub_name, &cache_root, &first_rec.input.questions) {
@@ -2363,7 +3018,7 @@ pub fn compute_bootstrap_cis(summaries: &HashMap<String, SubsetSummary>) -> ([f6
     }
 
     const DRAWS: usize = 1000;
-    let mut rng_state: u64 = 20261014;
+    let mut rng_state: u64 = PUBLIC_BENCHMARK_SEED;
     let mut next_u64 = || -> u64 {
         // SplitMix64 deterministic PRNG
         rng_state = rng_state.wrapping_add(0x9e3779b97f4a7c15);
@@ -3442,10 +4097,11 @@ pub fn run_benchmark_with_options(
         "📐".cyan().bold()
     );
     println!(
-        "    • Overall Skill Score (14 tasks) : {} (95% CI: [{:.1}, {:.1}], 1,000 bootstrap draws, seed 20261014)",
+        "    • Overall Skill Score (14 tasks) : {} (95% CI: [{:.1}, {:.1}], 1,000 bootstrap draws, seed {})",
         format!("{:.1}", m_result.skill_score).bold().green(),
         m_result.skill_score_ci[0],
         m_result.skill_score_ci[1],
+        PUBLIC_BENCHMARK_SEED,
     );
     println!(
         "    • Public (13 tasks, 3,880 q)     : Skill {:.1} | Macro Acc {:.1}% | Pooled ECE {:.1}% ({:.3})",
@@ -4637,5 +5293,21 @@ mod tests {
         assert_eq!(list[0].id, "r1");
         assert_eq!(list[1].id, "r2");
         assert_eq!(list[2].id, "r3");
+    }
+
+    #[test]
+    fn test_nimble_public_manifests_seed_20260918() {
+        let manifests = load_nimble_public_manifests();
+        assert_eq!(manifests.len(), 13);
+        let mut total_ids = 0usize;
+        for (sub_name, _, _) in PUBLIC_SUBSETS {
+            let m = manifests
+                .get(*sub_name)
+                .unwrap_or_else(|| panic!("Missing manifest for {}", sub_name));
+            assert_eq!(m.seed, PUBLIC_BENCHMARK_SEED);
+            assert_eq!(m.ids.len(), m.count);
+            total_ids += m.ids.len();
+        }
+        assert_eq!(total_ids, 3880);
     }
 }
