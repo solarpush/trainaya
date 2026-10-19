@@ -40,6 +40,8 @@ from .dataset_loader import (
     load_hf_jev_adaptation_corpus,
 )
 from .gguf_head_trainer import (
+    build_llm_logits_prompt_and_targets,
+    compute_decision_kl_brier_rps_loss,
     ensure_untied_output_weight,
     train_gguf_decision_head,
 )
@@ -708,6 +710,45 @@ def _format_llm_logits_prompt(pre: str, mid: str, post: str, rec) -> str:
     return f"{SYSTEM_PROMPT}\n\n{user_body}{post}"
 
 
+def _strip_multimodal_vision_modules(model: Any, emit: Callable[[Dict[str, Any]], None]) -> Any:
+    """Generically strip dead vision encoders/projectors from multimodal checkpoints in text-only mode."""
+    vision_attrs = ("vision_tower", "vision_model", "multi_modal_projector", "visual", "aligner")
+    removed = []
+
+    # If the wrapper exposes a standalone CausalLM as `language_model` (with its own `lm_head`), unwrap it directly
+    lang_model = getattr(model, "language_model", None) or getattr(getattr(model, "model", None), "language_model", None)
+    if lang_model is not None and hasattr(lang_model, "lm_head") and hasattr(lang_model, "save_pretrained"):
+        emit({"event": "status", "message": "Unwrapping standalone text language_model from multimodal checkpoint..."})
+        return lang_model
+
+    for container in (model, getattr(model, "model", None)):
+        if container is None:
+            continue
+        for attr in vision_attrs:
+            if getattr(container, attr, None) is not None:
+                try:
+                    delattr(container, attr)
+                    removed.append(attr)
+                except Exception:
+                    setattr(container, attr, None)
+                    removed.append(attr)
+
+    if removed:
+        import gc
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        emit(
+            {
+                "event": "status",
+                "message": f"Purged unused multimodal vision modules ({', '.join(sorted(set(removed)))}) for text-only decision inference.",
+            }
+        )
+    return model
+
+
 def _adapt_hf_causal_to_llm_logits(
     source: str,
     output_dir: str,
@@ -733,87 +774,169 @@ def _adapt_hf_causal_to_llm_logits(
     labels = _resolve_hf_label_table(tok)
 
     temps = [1.0, 1.0, 1.0]
-    model = AutoModelForCausalLM.from_pretrained(source, torch_dtype=torch.float32).to(dev)
+    model = AutoModelForCausalLM.from_pretrained(source, torch_dtype=torch.float32)
+    model = _strip_multimodal_vision_modules(model, emit).to(dev)
 
     if data_path and os.path.exists(data_path):
+        import torch.nn as nn
+        from .hf_trainer import LoRALinear
+
         records = load_decision_records(data_path, include_anchor_replay=False)
+        chat_template_cfg = {
+            "pre": pre,
+            "mid": mid,
+            "post": post,
+            "system": SYSTEM_PROMPT,
+            "assistant_prefix": "",
+        }
+        prepared = [
+            s
+            for s in (build_llm_logits_prompt_and_targets(r, chat_template_cfg) for r in records)
+            if s is not None
+        ]
         emit(
             {
                 "event": "status",
-                "message": f"Running Decision Alignment fine-tuning on {len(records)} samples ({epochs} epochs)...",
+                "message": (
+                    f"Running Last-2-Layer LoRA + Decision Head fine-tuning (KL + Brier + RPS) "
+                    f"on {len(prepared)} samples ({epochs} epochs)..."
+                ),
             }
         )
-        # Freeze all except lm_head and last 2 transformer layers for fast, low-memory decision alignment
+
         for p in model.parameters():
             p.requires_grad = False
-        trainable = []
-        if hasattr(model, "lm_head"):
+
+        trainable: List[Any] = []
+        lora_replacements: List[Tuple[Any, str, Any]] = []
+
+        # 1. Inject LoRA (r=16, alpha=32) into the last 2 Transformer layers (Attention + SwiGLU MLP)
+        target_proj_names = (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "qkv_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "gate_up_proj",
+            "fc1",
+            "fc2",
+        )
+        backbone = getattr(model, "model", model)
+        layers = getattr(backbone, "layers", None)
+        if layers is not None and len(layers) > 0:
+            for layer in layers[-min(2, len(layers)) :]:
+                for sub_name, sub_mod in list(layer.named_modules()):
+                    if not sub_name:
+                        continue
+                    leaf = sub_name.split(".")[-1]
+                    if isinstance(sub_mod, nn.Linear) and leaf in target_proj_names:
+                        parent = layer
+                        parts = sub_name.split(".")
+                        for part in parts[:-1]:
+                            parent = getattr(parent, part)
+                        lora_mod = LoRALinear(sub_mod, r=16, alpha=32.0, dropout=0.05).to(dev)
+                        setattr(parent, parts[-1], lora_mod)
+                        lora_replacements.append((parent, parts[-1], lora_mod))
+                        trainable.extend([lora_mod.lora_a, lora_mod.lora_b])
+                for norm_attr in ("input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm"):
+                    norm_mod = getattr(layer, norm_attr, None)
+                    if norm_mod is not None:
+                        for p in norm_mod.parameters():
+                            p.requires_grad = True
+                            trainable.append(p)
+
+        final_norm = getattr(backbone, "norm", None)
+        if final_norm is not None:
+            for p in final_norm.parameters():
+                p.requires_grad = True
+                trainable.append(p)
+
+        # 2. Unfreeze lm_head (`output.weight`) with L2-SP anchor snapshot on decision rows
+        orig_head_choice = None
+        orig_head_score = None
+        choice_ids_t = torch.tensor(labels["choice"]["ids"], dtype=torch.long, device=dev)
+        score_ids_t = torch.tensor(labels["score"]["ids"], dtype=torch.long, device=dev)
+        if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+            orig_head_choice = model.lm_head.weight.data[choice_ids_t].detach().clone()
+            orig_head_score = model.lm_head.weight.data[score_ids_t].detach().clone()
             for p in model.lm_head.parameters():
                 p.requires_grad = True
                 trainable.append(p)
-        layers = getattr(getattr(model, "model", model), "layers", None)
-        if layers is not None and len(layers) > 0:
-            for layer in layers[-min(2, len(layers)) :]:
-                for p in layer.parameters():
-                    p.requires_grad = True
-                    trainable.append(p)
 
         opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.01)
         model.train()
         for ep in range(1, epochs + 1):
             total_loss = 0.0
             correct = 0
-            for rec in records:
-                prompt = _format_llm_logits_prompt(pre, mid, post, rec)
-                ids = tok.encode(prompt, add_special_tokens=True, truncation=True, max_length=1024)
+            valid_step_count = 0
+            for s in prepared:
+                ids = tok.encode(s.prompt, add_special_tokens=True, truncation=True, max_length=1024)
                 x = torch.tensor([ids], dtype=torch.long, device=dev)
-                tbl = labels["score"] if rec.qtype == "score" else labels["choice"]
-                k = min(len(rec.option_keys), len(tbl["ids"]))
+                tbl = labels["score"] if s.qtype == "score" else labels["choice"]
+                k = min(s.num_options, len(tbl["ids"]))
                 if k < 2:
                     continue
                 cand_ids = tbl["ids"][:k]
                 out = model(input_ids=x).logits[0, -1, cand_ids]
-                y = torch.tensor([min(rec.gold_index, k - 1)], dtype=torch.long, device=dev)
-                loss = F.cross_entropy(out.unsqueeze(0), y)
+                p_gold = torch.tensor(s.target_probs[:k], dtype=torch.float32, device=dev)
+                loss = compute_decision_kl_brier_rps_loss(
+                    out.unsqueeze(0),
+                    p_gold.unsqueeze(0),
+                    is_score=(s.qtype == "score"),
+                ).mean()
+                if orig_head_choice is not None and orig_head_score is not None:
+                    l2_sp = torch.mean((model.lm_head.weight[choice_ids_t] - orig_head_choice) ** 2) + torch.mean(
+                        (model.lm_head.weight[score_ids_t] - orig_head_score) ** 2
+                    )
+                    loss = loss + 0.008 * l2_sp
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 opt.step()
                 total_loss += float(loss.item())
-                if int(torch.argmax(out).item()) == int(y.item()):
+                valid_step_count += 1
+                if int(torch.argmax(out).item()) == int(min(s.gold_index, k - 1)):
                     correct += 1
 
-            acc = correct / max(1, len(records))
+            acc = correct / max(1, valid_step_count)
             emit(
                 {
                     "event": "epoch",
                     "epoch": ep,
                     "total_epochs": epochs,
-                    "train_loss": round(total_loss / max(1, len(records)), 4),
+                    "train_loss": round(total_loss / max(1, valid_step_count), 4),
                     "train_acc": round(acc, 4),
-                    "eval_loss": round(total_loss / max(1, len(records)), 4),
+                    "eval_loss": round(total_loss / max(1, valid_step_count), 4),
                     "eval_acc": round(acc, 4),
                 }
             )
+
+        # Merge Top-Layer LoRA weights cleanly back into standard nn.Linear modules before serialization
+        for parent, attr_name, lora_mod in lora_replacements:
+            merged_w = lora_mod.merge_weight()
+            lora_mod.base.weight.data.copy_(merged_w)
+            setattr(parent, attr_name, lora_mod.base)
 
         # Calibrate temperatures
         model.eval()
         all_logits, all_labels, all_qtypes = [], [], []
         qmap = {"choice": 0, "score": 1, "noul": 2}
         with torch.no_grad():
-            for rec in records:
-                prompt = _format_llm_logits_prompt(pre, mid, post, rec)
-                ids = tok.encode(prompt, add_special_tokens=True, truncation=True, max_length=1024)
+            for s in prepared:
+                ids = tok.encode(s.prompt, add_special_tokens=True, truncation=True, max_length=1024)
                 x = torch.tensor([ids], dtype=torch.long, device=dev)
-                tbl = labels["score"] if rec.qtype == "score" else labels["choice"]
-                k = min(len(rec.option_keys), len(tbl["ids"]))
+                tbl = labels["score"] if s.qtype == "score" else labels["choice"]
+                k = min(s.num_options, len(tbl["ids"]))
                 if k < 2:
                     continue
                 cand_ids = tbl["ids"][:k]
                 out = model(input_ids=x).logits[0, -1, cand_ids].cpu().numpy()
                 all_logits.append(out)
-                all_labels.append(min(rec.gold_index, k - 1))
-                all_qtypes.append(qmap.get(rec.qtype, 0))
+                all_labels.append(min(s.gold_index, k - 1))
+                all_qtypes.append(qmap.get(s.qtype, 0))
         cal_res = fit_per_qtype_temperatures(all_logits, all_labels, all_qtypes)
         temps = cal_res["temperature"]
 

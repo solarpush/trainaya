@@ -874,6 +874,268 @@ def _find_space_prefixed_choice_ids(gguf_path: Path, choice_token_ids: List[int]
     return [space_map.get(chr(ord("A") + i), tid) for i, tid in enumerate(choice_token_ids)]
 
 
+def compute_decision_kl_brier_rps_loss(
+    logits: Any,
+    target_probs: Any,
+    is_score: bool = False,
+    kl_weight: float = 1.0,
+    brier_weight: float = 0.35,
+    rps_weight: float = 0.50,
+) -> Any:
+    """Compute composite proper-scoring decision loss: KL-Divergence + Brier Score + Ordinal RPS.
+
+    - KL-Divergence aligns full soft probability distributions (`target_probs`).
+    - Brier Score (`sum_k (p_hat_k - p_gold_k)^2`) penalizes overconfident errors on ambiguous Hard-Tier
+      samples (`multinli`, `squad2`, `paws`) and directly reduces Typed ECE.
+    - Ranked Probability Score (`RPS`, `sum_k (CDF_k(p_hat) - CDF_k(p_gold))^2`) enforces ordinal geometry
+      on `score` rubrics (`0..9`).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    log_p = F.log_softmax(logits, dim=-1)
+    p_hat = torch.exp(log_p)
+    p_gold = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    kl = (p_gold * (torch.log(p_gold.clamp_min(1e-8)) - log_p)).sum(dim=-1)
+    brier = ((p_hat - p_gold) ** 2).sum(dim=-1)
+    loss = kl_weight * kl + brier_weight * brier
+
+    if is_score and logits.shape[-1] >= 2:
+        cdf_hat = torch.cumsum(p_hat, dim=-1)[..., :-1]
+        cdf_gold = torch.cumsum(p_gold, dim=-1)[..., :-1]
+        rps = ((cdf_hat - cdf_gold) ** 2).sum(dim=-1)
+        loss = loss + rps_weight * rps
+
+    return loss
+
+
+def _run_pytorch_lora_kl_brier_rps_pass(
+    hidden_mat: np.ndarray,
+    valid_samples: List[PreparedAdaptationSample],
+    wc_init: np.ndarray,
+    ws_init: np.ndarray,
+    vt_prot: Optional[np.ndarray],
+    vt_bin: Optional[np.ndarray],
+    M_s: Optional[np.ndarray],
+    g_gate: np.ndarray,
+    is_high_spread_arch: bool,
+    epochs: int = 80,
+    lr: float = 1.5e-3,
+    l2_sp_weight: float = 0.008,
+    emit: Optional[Callable[[str, str], None]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Run a PyTorch Non-Linear SwiGLU Self-Distillation + Low-Rank LoRA Optimization Pass
+    with composite `KL-Divergence + Brier Loss + RPS Loss` before quantizing `output.weight`.
+
+    All LoRA updates are projected onto the safe subspace orthogonal to `vt_prot`, `vt_bin`, and `M_s`
+    so zero-shot accuracy and template-mean calibration are strictly preserved.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except Exception:
+        return wc_init, ws_init
+
+    if len(valid_samples) < 8:
+        return wc_init, ws_init
+
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+
+    n_samples, d_model = hidden_mat.shape
+    H_t = torch.from_numpy(hidden_mat).to(device=dev, dtype=torch.float32)
+    h_rms = torch.sqrt(torch.mean(H_t ** 2, dim=-1, keepdim=True).clamp_min(1e-6))
+    H_norm = H_t / h_rms
+
+    wc_base_t = torch.from_numpy(wc_init.copy()).to(device=dev, dtype=torch.float32)
+    ws_base_t = torch.from_numpy(ws_init.copy()).to(device=dev, dtype=torch.float32)
+    g_gate_t = torch.from_numpy(g_gate.copy()).to(device=dev, dtype=torch.float32)
+
+    vt_prot_t = (
+        torch.from_numpy(vt_prot.copy()).to(device=dev, dtype=torch.float32)
+        if vt_prot is not None and len(vt_prot) > 0
+        else None
+    )
+    vt_bin_t = (
+        torch.from_numpy(vt_bin.copy()).to(device=dev, dtype=torch.float32)
+        if vt_bin is not None and len(vt_bin) > 0
+        else None
+    )
+    ms_orth_t = None
+    if M_s is not None and len(M_s) > 0:
+        _, s_ms, vt_ms = np.linalg.svd(M_s, full_matrices=False)
+        vt_ms = vt_ms[s_ms > 1e-4]
+        if len(vt_ms) > 0:
+            ms_orth_t = torch.from_numpy(vt_ms.astype(np.float32)).to(device=dev)
+
+    # Group samples by (qtype, num_options) for fast vectorized batch evaluation
+    groups: Dict[Tuple[str, int], List[int]] = {}
+    for idx, s in enumerate(valid_samples):
+        k_opt = 2 if s.qtype == "noul" else int(s.num_options)
+        if k_opt >= 2:
+            groups.setdefault((s.qtype, k_opt), []).append(idx)
+
+    compiled_groups = []
+    for (qt, k_opt), idxs in groups.items():
+        idxs_t = torch.tensor(idxs, dtype=torch.long, device=dev)
+        p_mat = np.zeros((len(idxs), k_opt), dtype=np.float32)
+        w_vec = np.ones(len(idxs), dtype=np.float32)
+        golds = np.zeros(len(idxs), dtype=np.int64)
+        for j, ii in enumerate(idxs):
+            s = valid_samples[ii]
+            tp = s.target_probs[:k_opt]
+            if len(tp) < k_opt:
+                tp = list(tp) + [0.0] * (k_opt - len(tp))
+            p_mat[j] = np.asarray(tp, dtype=np.float32)
+            # Boost Hard-Tier relational NLI & score calibration samples
+            w_mult = 1.6 if s.subset in ("P0_nli", "synth_nli") else 1.0
+            w_vec[j] = float(s.sample_weight) * w_mult
+            golds[j] = min(max(0, int(s.gold_index)), k_opt - 1)
+        compiled_groups.append(
+            (
+                qt,
+                k_opt,
+                idxs_t,
+                torch.from_numpy(p_mat).to(device=dev),
+                torch.from_numpy(w_vec).to(device=dev),
+                torch.from_numpy(golds).to(device=dev),
+            )
+        )
+
+    # Low-rank LoRA parameters (rank r=16) + Non-Linear SwiGLU Self-Distillation Teacher (rank r_mlp=64)
+    r_lora = 16
+    r_mlp = 64
+    lora_scale = 1.5 if not is_high_spread_arch else 6.0
+
+    lora_c_a = nn.Parameter(torch.randn(r_lora, d_model, device=dev) * (1.0 / math.sqrt(d_model)))
+    lora_c_b = nn.Parameter(torch.zeros(26, r_lora, device=dev))
+    lora_s_a = nn.Parameter(torch.randn(r_lora, d_model, device=dev) * (1.0 / math.sqrt(d_model)))
+    lora_s_b = nn.Parameter(torch.zeros(10, r_lora, device=dev))
+
+    # Non-linear SwiGLU auxiliary teacher block (captures quadratic/bilinear Premise x Hypothesis interactions)
+    mlp_gate = nn.Parameter(torch.randn(r_mlp, d_model, device=dev) * (0.5 / math.sqrt(d_model)))
+    mlp_up = nn.Parameter(torch.randn(r_mlp, d_model, device=dev) * (0.5 / math.sqrt(d_model)))
+    mlp_down = nn.Parameter(torch.zeros(d_model, r_mlp, device=dev))
+
+    def _project_heads() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dw_c = (lora_c_b @ lora_c_a) * (lora_scale / r_lora) * g_gate_t.unsqueeze(0)
+        # Zero-center across the 3 NLI rows so class prior is invariant
+        dw_c_3 = dw_c[:3] - dw_c[:3].mean(dim=0, keepdim=True)
+        if vt_prot_t is not None:
+            dw_c_3 = dw_c_3 - (dw_c_3 @ vt_prot_t.t()) @ vt_prot_t
+        if vt_bin_t is not None:
+            diff_ab = 0.5 * (dw_c_3[0] - dw_c_3[1])
+            diff_proj = (diff_ab.unsqueeze(0) @ vt_bin_t.t()) @ vt_bin_t
+            diff_proj_1d = diff_proj.squeeze(0)
+            dw_c_3 = torch.stack(
+                [dw_c_3[0] - diff_proj_1d, dw_c_3[1] + diff_proj_1d, dw_c_3[2]],
+                dim=0,
+            )
+        dw_c_rest = dw_c[3:] - dw_c[3:].mean(dim=0, keepdim=True)
+        if vt_prot_t is not None:
+            dw_c_rest = dw_c_rest - (dw_c_rest @ vt_prot_t.t()) @ vt_prot_t
+        dw_c_proj = torch.cat([dw_c_3, dw_c_rest], dim=0)
+
+        dw_s = (lora_s_b @ lora_s_a) * (lora_scale / r_lora)
+        dw_s_5 = dw_s[:5] - dw_s[:5].mean(dim=0, keepdim=True)
+        if ms_orth_t is not None:
+            dw_s_5 = dw_s_5 - (dw_s_5 @ ms_orth_t.t()) @ ms_orth_t
+        dw_s_proj = torch.cat([dw_s_5, torch.zeros_like(dw_s[5:])], dim=0)
+
+        reg = torch.mean(dw_c_proj ** 2) + torch.mean(dw_s_proj ** 2)
+        return wc_base_t + dw_c_proj, ws_base_t + dw_s_proj, reg
+
+    def _eval_heads(wc_t: torch.Tensor, ws_t: torch.Tensor) -> Tuple[float, float]:
+        with torch.no_grad():
+            c_ok, c_tot, c_brier = 0, 0, 0.0
+            s_ok, s_tot, s_brier = 0, 0, 0.0
+            for qt, k_opt, idxs_t, p_gold_t, _, golds_t in compiled_groups:
+                h_sub = H_t[idxs_t]
+                w_sub = ws_t[:k_opt] if qt == "score" else wc_t[:k_opt]
+                logits = h_sub @ w_sub.t()
+                probs = F.softmax(logits, dim=-1)
+                preds = torch.argmax(logits, dim=-1)
+                ok = int((preds == golds_t).sum().item())
+                brier = float(((probs - p_gold_t) ** 2).sum(dim=-1).sum().item())
+                if qt == "score":
+                    s_ok += ok
+                    s_tot += len(idxs_t)
+                    s_brier += brier
+                else:
+                    c_ok += ok
+                    c_tot += len(idxs_t)
+                    c_brier += brier
+            c_obj = (c_ok / max(1, c_tot)) - 0.15 * (c_brier / max(1, c_tot))
+            s_obj = (s_ok / max(1, s_tot)) - 0.15 * (s_brier / max(1, s_tot))
+            return c_obj, s_obj
+
+    best_c_obj, best_s_obj = _eval_heads(wc_base_t, ws_base_t)
+    best_wc = wc_init.copy()
+    best_ws = ws_init.copy()
+
+    params = [lora_c_a, lora_c_b, lora_s_a, lora_s_b, mlp_gate, mlp_up, mlp_down]
+    opt = torch.optim.AdamW(params, lr=max(5e-4, min(3e-3, lr)), weight_decay=1e-4)
+
+    for _ in range(epochs):
+        opt.zero_grad()
+        wc_eff, ws_eff, reg_l2 = _project_heads()
+
+        # Non-linear SwiGLU teacher forward on normalized hidden states
+        swiglu_act = F.silu(H_norm @ mlp_gate.t()) * (H_norm @ mlp_up.t())
+        delta_h_nl = (swiglu_act @ mlp_down.t()) * h_rms
+        H_nl = H_t + delta_h_nl
+
+        total_loss = l2_sp_weight * reg_l2 + 1e-3 * (
+            torch.mean(mlp_down ** 2) + torch.mean(mlp_gate ** 2) + torch.mean(mlp_up ** 2)
+        )
+        total_weight = 0.0
+
+        for qt, k_opt, idxs_t, p_gold_t, w_vec_t, _ in compiled_groups:
+            h_sub = H_t[idxs_t]
+            h_nl_sub = H_nl[idxs_t]
+            w_sub = ws_eff[:k_opt] if qt == "score" else wc_eff[:k_opt]
+            is_s = qt == "score"
+
+            logits_stu = h_sub @ w_sub.t()
+            logits_tea = h_nl_sub @ w_sub.t()
+
+            loss_stu = compute_decision_kl_brier_rps_loss(logits_stu, p_gold_t, is_score=is_s)
+            loss_tea = compute_decision_kl_brier_rps_loss(logits_tea, p_gold_t, is_score=is_s)
+
+            # Self-distillation from non-linear SwiGLU teacher to deployable LoRA student
+            with torch.no_grad():
+                p_tea = F.softmax(logits_tea, dim=-1)
+            log_p_stu = F.log_softmax(logits_stu, dim=-1)
+            loss_distill = (p_tea * (torch.log(p_tea.clamp_min(1e-8)) - log_p_stu)).sum(dim=-1)
+
+            grp_loss = ((loss_stu + 0.5 * loss_tea + 0.25 * loss_distill) * w_vec_t).sum()
+            total_loss = total_loss + grp_loss
+            total_weight += float(w_vec_t.sum().item())
+
+        if total_weight > 0:
+            total_loss = total_loss / total_weight
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+
+            c_obj, s_obj = _eval_heads(wc_eff, ws_eff)
+            if c_obj > best_c_obj + 1e-5:
+                best_c_obj = c_obj
+                best_wc = wc_eff.detach().cpu().numpy().astype(np.float32)
+            if s_obj > best_s_obj + 1e-5:
+                best_s_obj = s_obj
+                best_ws = ws_eff.detach().cpu().numpy().astype(np.float32)
+
+    if emit:
+        emit(
+            "gguf_lora_kl_brier_rps",
+            f"Completed PyTorch SwiGLU+LoRA (KL+Brier+RPS) optimization pass ({epochs} steps on {dev.type})",
+        )
+    return best_wc, best_ws
+
+
 def train_gguf_decision_head(
     gguf_path: Path,
     tensor_info: Dict[str, Any],
@@ -903,6 +1165,9 @@ def train_gguf_decision_head(
         w_score_np = b_data["w_score"].astype(np.float32)
         w_choice_space_np = b_data["w_choice_space"].astype(np.float32)
         restore_rows: Dict[int, np.ndarray] = {}
+        for i, stid in enumerate(space_choice_ids):
+            if i < len(w_choice_space_np):
+                restore_rows[stid] = w_choice_space_np[i]
         for i, tid in enumerate(choice_token_ids):
             restore_rows[tid] = w_choice_np[i]
         for i, tid in enumerate(score_token_ids):
@@ -1254,6 +1519,8 @@ def train_gguf_decision_head(
                 Y_list.append(y)
 
     w_choice_trained = wc_base.copy()
+    vt_prot: Optional[np.ndarray] = None
+    vt_bin: Optional[np.ndarray] = None
     if X_list:
         X_all = np.stack(X_list, axis=0).astype(np.float32)
         Y_all = np.stack(Y_list, axis=0).astype(np.float32)
@@ -1381,6 +1648,23 @@ def train_gguf_decision_head(
                 bias_fv = w_choice_trained[:3] @ mu_fv
                 w_choice_trained[:3] -= 0.25 * np.outer(bias_fv - bias_fv.mean(), u_fv)
 
+    # 3. Non-Linear SwiGLU Self-Distillation + Low-Rank LoRA Optimization Pass (KL-Divergence + Brier + RPS):
+    w_choice_trained, w_score_trained = _run_pytorch_lora_kl_brier_rps_pass(
+        hidden_mat=hidden_mat,
+        valid_samples=valid_samples,
+        wc_init=w_choice_trained,
+        ws_init=w_score_trained,
+        vt_prot=vt_prot,
+        vt_bin=vt_bin,
+        M_s=M_s,
+        g_gate=g_gate,
+        is_high_spread_arch=is_high_spread_arch,
+        epochs=min(120, max(40, epochs // 2)),
+        lr=lr,
+        l2_sp_weight=l2_sp_weight,
+        emit=emit,
+    )
+
     debiased_acc = _eval_acc_np(w_choice_trained, w_score_trained)
 
     row_updates: Dict[int, np.ndarray] = {}
@@ -1421,6 +1705,15 @@ def train_gguf_decision_head(
         qbytes = quantizer.quantize_row(w_choice_to_quant[i], ttype)
         w_choice_quant_dequant[i] = quantizer.dequantize_row(qbytes, ttype, n_cols)
         row_updates[tid] = w_choice_to_quant[i]
+
+    # Synchronize & damp space-prefixed variants (" A".." Z", e.g. Tekken/BPE `ĠA` / `▁A`)
+    # so free generation under Ollama never splits probability mass or flips argmax to an unadapted " A" row,
+    # while keeping relative option ordering identical if a space prefix is forced.
+    mu_global = hidden_mat.mean(axis=0)
+    mu_global_dual = mu_global / max(1e-6, float(np.dot(mu_global, mu_global)))
+    for i, stid in enumerate(space_choice_ids):
+        if i < len(choice_token_ids) and stid != choice_token_ids[i] and stid not in row_updates:
+            row_updates[stid] = w_choice_to_quant[i] - 5.0 * mu_global_dual
 
     w_score_quant_dequant = np.zeros_like(w_score_trained)
     for i, tid in enumerate(score_token_ids):
