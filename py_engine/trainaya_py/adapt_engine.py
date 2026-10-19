@@ -604,7 +604,7 @@ def _adapt_gguf_llm_logits(
         emit({"event": "status", "message": f"Loading custom adaptation dataset from {data_path}..."})
         records = build_ollaya_preset_anchors() + load_decision_records(data_path, max_samples=200)
     else:
-        records = load_hf_jev_adaptation_corpus(max_samples=3000, emit=emit)
+        records = load_hf_jev_adaptation_corpus(max_samples=4000, emit=emit)
 
     chat_template_cfg = {
         "pre": pre,
@@ -634,6 +634,7 @@ def _adapt_gguf_llm_logits(
         emit=_emit_step,
     )
     temperatures = train_metrics["temperatures"]
+    temp_by_opts = train_metrics.get("temperature_by_options", {})
 
     gguf_sha = sha256_file(dst_gguf)
     family_name = target_tag.split(":")[0] if ":" in target_tag else target_tag
@@ -674,7 +675,7 @@ def _adapt_gguf_llm_logits(
     }
     calibration = {
         "temperature": temperatures,
-        "temperature_by_options": {},
+        "temperature_by_options": temp_by_opts,
         "baseline_accuracy": train_metrics["baseline_accuracy"],
         "post_quant_accuracy": train_metrics["post_quant_accuracy"],
         "trained_samples": train_metrics["n_samples"],

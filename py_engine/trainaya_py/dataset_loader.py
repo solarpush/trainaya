@@ -955,7 +955,7 @@ def _cached_hf_download(repo_id: str, filename: str, repo_type: str = "dataset")
 
 
 def load_hf_jev_adaptation_corpus(
-    max_samples: int = 3000,
+    max_samples: int = 4000,
     emit: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[NormalizedDecisionRecord]:
     """Download and stratify official generalist Jev / Open-Jev datasets from HuggingFace + Cyclic 3x3 ABC Permutations (zero test-set leakage)."""
@@ -990,7 +990,7 @@ def load_hf_jev_adaptation_corpus(
                     if rec.qtype == "score" and len(rec.option_keys) != 5:
                         continue
                     bkey = (rec.subset, rec.qtype, rec.gold_index)
-                    if bucket_counts.get(bkey, 0) < 35:
+                    if bucket_counts.get(bkey, 0) < 50:
                         bucket_counts[bkey] = bucket_counts.get(bkey, 0) + 1
                         by_kind[rec.qtype].append(rec)
     except Exception as e:
@@ -1031,11 +1031,13 @@ def load_hf_jev_adaptation_corpus(
                 if rec is not None and (len(str(rec.state)) + len(str(rec.instructions))) <= 2400:
                     if rec.qtype == "score" and len(rec.option_keys) != 5:
                         continue
-                    # Cap synthetic 16-option ID puzzles from community-diversity-v2
-                    if rec.qtype == "choice" and len(rec.option_keys) >= 6:
-                        cap = 4
+                    # Cap synthetic 16-option ID puzzles from community-diversity-v2 while allowing 6..11 option workflows
+                    if rec.qtype == "choice" and len(rec.option_keys) >= 12:
+                        cap = 6
+                    elif rec.qtype == "choice" and len(rec.option_keys) >= 6:
+                        cap = 25
                     else:
-                        cap = 35
+                        cap = 50
                     bkey = (rec.subset, rec.qtype, rec.gold_index)
                     if bucket_counts.get(bkey, 0) < cap:
                         bucket_counts[bkey] = bucket_counts.get(bkey, 0) + 1
@@ -1044,7 +1046,7 @@ def load_hf_jev_adaptation_corpus(
         pass
 
     # Build Cyclic 3x3 ABC Permutation Matrix samples (P0_nli, P1_fv, P1_qa3, P2_cyc) + paws_gen & squad_gen from WANLI
-    n_cyc_per_sem = min(45, min((len(wanli_by_sem[g]) for g in range(3)), default=0))
+    n_cyc_per_sem = min(65, min((len(wanli_by_sem[g]) for g in range(3)), default=0))
     for g_sem in range(3):
         for i in range(n_cyc_per_sem):
             prem, clm, p_raw = wanli_by_sem[g_sem][i]
@@ -1130,14 +1132,18 @@ def load_hf_jev_adaptation_corpus(
             )
 
         # Also add generalist Paraphrase (paws_gen) & Answerability (squad_gen) noul templates from WANLI
-        for i in range(n_cyc_per_sem, min(n_cyc_per_sem + 30, len(wanli_by_sem[g_sem]))):
+        # Keep indices 45..74 (matching cached prompts) and extend to 65..115
+        noul_indices = list(range(45, min(75, len(wanli_by_sem[g_sem])))) + list(
+            range(max(75, n_cyc_per_sem), min(max(75, n_cyc_per_sem) + 30, len(wanli_by_sem[g_sem])))
+        )
+        for j_nl, i in enumerate(noul_indices):
             prem, clm, p_raw = wanli_by_sem[g_sem][i]
             is_pos = g_sem == 2
             # NormalizedDecisionRecord noul uses option_keys=["false", "true"], target_probs=[P(false), P(true)]
             p_true = float(p_raw[2]) if is_pos else float(p_raw[0] + p_raw[1]) * 0.1
             t_noul = [1.0 - p_true, p_true]
             g_noul = 1 if is_pos else 0
-            if i < n_cyc_per_sem + 15:
+            if (i < 60) or (i >= 75 and j_nl % 2 == 0):
                 records.append(
                     NormalizedDecisionRecord(
                         record_id=f"wanli-paws-{g_sem}-{i}",

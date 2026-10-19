@@ -1346,15 +1346,35 @@ def train_gguf_decision_head(
 
     baseline_acc = _eval_acc_np(w_choice_np, w_score_np)
 
-    # Measure natural logit spread of this backbone (e.g. ~1.5 on Ministral vs ~5.4 on Gemma-3)
+    # Measure natural logit spread of this backbone (e.g. ~1.5 on Ministral vs ~5.4–7.1 on Gemma-3/4)
     raw_c_spread = float(np.std(hidden_mat @ w_choice_np[:3].T, axis=1).mean())
     raw_s_spread = float(np.std(hidden_mat @ w_score_np[:5].T, axis=1).mean())
     is_high_spread_arch = raw_c_spread > 3.5 and raw_s_spread > 2.0
 
-    # 1. Full-Rank Biorthogonal 5-Level (0..4) Score Head Calibration:
-    # Preserves the full-rank pretrained score vectors w_score_np[0..4] and calibrates the
-    # level-4 vs level-3 decision boundary along the biorthogonal rubric basis U_s.
+    # 1. Generalizable 5-Level (0..4) Score Head Adaptation:
+    # Detect empirically whether token "4" has a collapsed ordinal slope (E[z_4 - z_3 | gold=4] <= 0,
+    # as in Gemma-3 4B) vs a healthy ordinal slope (e.g. +7.35 on Gemma-4 26B, +0.23 on Ministral-14B).
     w_score_trained = w_score_np.copy()
+    score5_all_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "score" and s.num_options == 5]
+    if score5_all_idxs:
+        s5_golds_all = np.array([valid_samples[i].gold_index for i in score5_all_idxs])
+        s5_logits_base = hidden_mat[score5_all_idxs] @ w_score_np[:5].T
+        if np.any(s5_golds_all == 4):
+            margin_4_3 = float(
+                (s5_logits_base[s5_golds_all == 4, 4] - s5_logits_base[s5_golds_all == 4, 3]).mean()
+            )
+        else:
+            margin_4_3 = 1.0
+    else:
+        margin_4_3 = 1.0
+
+    if margin_4_3 <= 0.0:
+        w_score_trained[4] = (
+            0.30 * w_score_np[4]
+            + 0.90 * w_score_np[3]
+            - 0.20 * (0.5 * w_score_np[0] + 0.5 * w_score_np[1])
+        )
+
     s5_cons = sorted(
         [
             i
@@ -1381,6 +1401,7 @@ def train_gguf_decision_head(
     )
     M_s = None
     U_s = None
+    vt_ms = None
     if s5_cons and s5_rel and s5_help:
         s_groups = {"cons": s5_cons, "rel": s5_rel, "help": s5_help}
         s_keys = ["cons", "rel", "help"]
@@ -1393,16 +1414,9 @@ def train_gguf_decision_head(
             axis=0,
         ).astype(np.float32)
         U_s = np.linalg.solve(M_s @ M_s.T + 1e-4 * np.eye(3, dtype=np.float32), M_s)
-        if is_high_spread_arch:
-            # On tied-embedding models (like Gemma-3), token "3" carries the high-score ordinal
-            # slope while token "4" is flat across quality levels, and tokens "0"/"1" carry a
-            # large template bias on consistency rubrics. Construct level-4 from level-3 plus
-            # high-vs-low contrast, then remove the 5-level template mean bias along U_s.
-            w_score_trained[4] = (
-                0.30 * w_score_np[4]
-                + 0.90 * w_score_np[3]
-                - 0.20 * (0.5 * w_score_np[0] + 0.5 * w_score_np[1])
-            )
+        _, _, vt_ms = np.linalg.svd(M_s, full_matrices=False)
+
+        if margin_4_3 <= 0.0:
             ws_snap = w_score_trained[:5].copy()
             for ki, k in enumerate(s_keys):
                 idxs_s = s_groups[k]
@@ -1419,24 +1433,65 @@ def train_gguf_decision_head(
                     delta_bias = (mean_k - mean_k.mean()) - target_bias
                     w_score_trained[:5] -= np.outer(delta_bias, u_k)
         else:
+            ws_cand_u = w_score_trained.copy()
             u_cons = U_s[0] / max(1e-6, float(np.linalg.norm(hidden_mat[s5_cons].mean(axis=0))))
-            l_cons = hidden_mat[s5_cons] @ w_score_trained[:5].T
+            l_cons = hidden_mat[s5_cons] @ ws_cand_u[:5].T
             gap_cons = float(l_cons[:, 4].mean() - l_cons[:, 0].mean())
             if gap_cons < 1.35:
                 shift_cons = 1.45 - gap_cons
-                w_score_trained[4] += 0.65 * shift_cons * u_cons
-                w_score_trained[0] -= 0.35 * shift_cons * u_cons
-                w_score_trained[1] -= 0.30 * shift_cons * u_cons
+                ws_cand_u[4] += 0.65 * shift_cons * u_cons
+                ws_cand_u[0] -= 0.35 * shift_cons * u_cons
+                ws_cand_u[1] -= 0.30 * shift_cons * u_cons
             u_help = U_s[2] / max(1e-6, float(np.linalg.norm(hidden_mat[s5_help].mean(axis=0))))
-            w_score_trained[4] += 1.15 * u_help
-            w_score_trained[3] -= 1.15 * u_help
+            ws_cand_u[4] += 1.15 * u_help
+            ws_cand_u[3] -= 1.15 * u_help
+            if _eval_acc_np(w_choice_np, ws_cand_u)["score"] >= _eval_acc_np(w_choice_np, w_score_trained)["score"]:
+                w_score_trained = ws_cand_u
 
-    # 2. Full-Dimension (d_model) Biorthogonal Dual Template Basis (U) + Fisher ARD Kernel Option-Pointer Matrix:
-    wc_base = (0.75 * w_choice_np + 0.25 * w_choice_space_np).astype(np.float32)
+    # Rubric-orthogonal Ordinal Kernel Ridge on generalist 5-level score samples
+    jev_s_idxs = [
+        i
+        for i in score5_all_idxs
+        if not valid_samples[i].record_id.startswith("synth-rubric5-")
+    ]
+    if len(jev_s_idxs) >= 15:
+        H_s = hidden_mat[jev_s_idxs]
+        Gs_jev = np.array([valid_samples[i].gold_index for i in jev_s_idxs])
+        Ys = np.zeros((len(jev_s_idxs), 5), dtype=np.float32)
+        for j, g in enumerate(Gs_jev):
+            for k in range(5):
+                Ys[j, k] = math.exp(-0.8 * abs(k - int(g)))
+            Ys[j] -= Ys[j].mean()
+        lam_s = 20.0 * float(np.mean(np.sum(H_s ** 2, axis=1))) / 50.0
+        K_s = H_s @ H_s.T + lam_s * np.eye(len(jev_s_idxs), dtype=np.float32)
+        dW_s = (np.linalg.solve(K_s, Ys)).T @ H_s
+        if vt_ms is not None:
+            dW_s = dW_s - (dW_s @ vt_ms.T) @ vt_ms
+        s_ratio = float(np.linalg.norm(w_score_trained[:5], axis=1).mean()) / max(
+            1e-6, float(np.linalg.norm(dW_s, axis=1).mean()) * 10.0
+        )
+        best_ws_ridge = w_score_trained.copy()
+        best_s_acc = _eval_acc_np(w_choice_np, best_ws_ridge)["score"]
+        for alpha_s in (0.5, 1.0, 1.5, 2.0, 2.5):
+            ws_try = w_score_trained.copy()
+            ws_try[:5] += alpha_s * s_ratio * dW_s
+            acc_try = _eval_acc_np(w_choice_np, ws_try)["score"]
+            if acc_try > best_s_acc:
+                best_s_acc = acc_try
+                best_ws_ridge = ws_try
+        w_score_trained = best_ws_ridge
 
-    # On tied-embedding models (e.g. Gemma-3), inject the choice-orthogonal "Yes" vs "No" token contrast
-    # into rows A and B so binary noul tasks benefit from the model's strong Yes/No semantics without
-    # perturbing multi-way choice tasks.
+    # 2. Full-Dimension (d_model) Biorthogonal Dual Template Basis (U) + Multi-Subspace Option-Pointer Matrix:
+    wc_base = w_choice_np.copy()
+    best_base_tot = _eval_acc_np(wc_base, w_score_trained)["total"]
+    for gamma_sp in (0.15, 0.25):
+        wc_sp = ((1.0 - gamma_sp) * w_choice_np + gamma_sp * w_choice_space_np).astype(np.float32)
+        acc_sp = _eval_acc_np(wc_sp, w_score_trained)
+        if acc_sp["total"] >= best_base_tot and acc_sp["noul"] >= _eval_acc_np(wc_base, w_score_trained)["noul"]:
+            wc_base = wc_sp
+            best_base_tot = acc_sp["total"]
+
+    # Inject choice-orthogonal "Yes" vs "No" token contrast into rows A and B when it improves binary noul
     if (is_high_spread_arch or raw_c_spread > 2.5) and yes_no_token_ids and len(yes_no_token_ids) >= 2:
         try:
             w_yn_np = quantizer.read_tensor_rows(gguf_path, tensor_info, list(yes_no_token_ids[:2])).astype(
@@ -1446,22 +1501,29 @@ def train_gguf_decision_head(
             if len(choice_all_idxs) >= 24:
                 diff_ab_0 = 0.5 * (wc_base[0] - wc_base[1])
                 diff_yn_0 = 0.5 * (w_yn_np[0] - w_yn_np[1])
-                delta_yn = 0.65 * (diff_yn_0 - diff_ab_0)
                 _, _, vt_choice_all = np.linalg.svd(hidden_mat[choice_all_idxs], full_matrices=False)
                 vt_c24 = vt_choice_all[: min(24, len(vt_choice_all))]
-                delta_yn_orth = delta_yn - (delta_yn @ vt_choice_all[: min(24, len(vt_choice_all))].T) @ vt_c24
-                wc_cand = wc_base.copy()
-                wc_cand[0] += delta_yn_orth
-                wc_cand[1] -= delta_yn_orth
-                if _eval_acc_np(wc_cand, w_score_np)["noul"] >= _eval_acc_np(wc_base, w_score_np)["noul"]:
-                    wc_base = wc_cand
+                raw_yn = diff_yn_0 - diff_ab_0
+                raw_yn_orth = raw_yn - (raw_yn @ vt_c24.T) @ vt_c24
+                best_yn_wc = wc_base.copy()
+                best_yn_noul = _eval_acc_np(best_yn_wc, w_score_trained)["noul"]
+                for gamma_yn in (0.35, 0.65):
+                    wc_cand = wc_base.copy()
+                    wc_cand[0] += gamma_yn * raw_yn_orth
+                    wc_cand[1] -= gamma_yn * raw_yn_orth
+                    if _eval_acc_np(wc_cand, w_score_trained)["noul"] >= best_yn_noul:
+                        best_yn_noul = _eval_acc_np(wc_cand, w_score_trained)["noul"]
+                        best_yn_wc = wc_cand
+                wc_base = best_yn_wc
         except Exception:
             pass
 
     t_groups_raw = {
         "rc": [i for i, s in enumerate(valid_samples) if s.subset == "synth_rc"],
+        "squad_gen": [i for i, s in enumerate(valid_samples) if s.subset == "squad_gen"],
         "boolq": [i for i, s in enumerate(valid_samples) if s.subset == "synth_boolq"],
         "paws_adv": [i for i, s in enumerate(valid_samples) if s.subset == "synth_paws_adv"],
+        "paws_gen": [i for i, s in enumerate(valid_samples) if s.subset == "paws_gen"],
         "noul_jev": [
             i
             for i, s in enumerate(valid_samples)
@@ -1484,9 +1546,6 @@ def train_gguf_decision_head(
         "qa3": [i for i, s in enumerate(valid_samples) if s.subset == "P1_qa3"],
         "multi": [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and s.num_options >= 4],
     }
-    if not is_high_spread_arch:
-        t_groups_raw["squad_gen"] = [i for i, s in enumerate(valid_samples) if s.subset == "squad_gen"]
-        t_groups_raw["paws_gen"] = [i for i, s in enumerate(valid_samples) if s.subset == "paws_gen"]
 
     t_groups = {k: v for k, v in t_groups_raw.items() if len(v) > 0}
     keys = list(t_groups.keys())
@@ -1528,8 +1587,7 @@ def train_gguf_decision_head(
     else:
         g_gate = np.ones(d_model, dtype=np.float32)
 
-    # Solve 3-way NLI dW on P0_nli + synth_nli (A=entailment, B=neutral, C=contradiction)
-    # Decoupled from P1_fv/P1_qa3 (A=Pos, B=Neg, C=Neu) so B and C never cancel out!
+    # 2a. Solve 3-way NLI dW on P0_nli + synth_nli (A=entailment, B=neutral, C=contradiction)
     X_list: List[np.ndarray] = []
     Y_list: List[np.ndarray] = []
     for p_name, w_grp in [("P0_nli", 1.0), ("synth_nli", 1.5)]:
@@ -1543,7 +1601,6 @@ def train_gguf_decision_head(
                 X_list.append(X_g_c[j] * math.sqrt(w_grp))
                 Y_list.append(y)
 
-    # Fallback if custom dataset was provided without cyclic WANLI subsets: use all 3-option choice samples
     if not X_list:
         c3_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and s.num_options == 3]
         if len(c3_idxs) >= 3:
@@ -1565,7 +1622,6 @@ def train_gguf_decision_head(
         K_mat = X_all @ X_all.T + 40.0 * ridge_scale * np.eye(len(X_all), dtype=np.float32)
         dW = ((np.linalg.solve(K_mat, Y_all)).T @ X_all) * g_gate
 
-        # Project dW orthogonal to all non-NLI template means + top 8 centered PCs of qa3
         prot_keys = [
             k
             for k in (
@@ -1590,7 +1646,7 @@ def train_gguf_decision_head(
                 _, _, vt_qa = np.linalg.svd(Hc_qa, full_matrices=False)
                 for r in range(min(8, len(vt_qa))):
                     prot_all.append(vt_qa[r])
-            if is_high_spread_arch and "fv" in t_groups and len(t_groups["fv"]) >= 2:
+            if "fv" in t_groups and len(t_groups["fv"]) >= 2:
                 Hc_fv = hidden_mat[t_groups["fv"]] - hidden_mat[t_groups["fv"]].mean(axis=0, keepdims=True)
                 _, _, vt_fv = np.linalg.svd(Hc_fv, full_matrices=False)
                 for r in range(min(4, len(vt_fv))):
@@ -1598,7 +1654,6 @@ def train_gguf_decision_head(
             _, _, vt_prot = np.linalg.svd(np.stack(prot_all, axis=0), full_matrices=False)
             dW = dW - (dW @ vt_prot.T) @ vt_prot
 
-            # Project the A-B contrast of dW orthogonal to the exact span of binary noul anchors
             bin_vecs = list(prot_all)
             for bk in ("rc", "squad_gen", "boolq", "paws_adv", "paws_gen", "tox", "safe"):
                 for ii in t_groups.get(bk, []):
@@ -1610,80 +1665,119 @@ def train_gguf_decision_head(
             dW[0] -= diff_proj
             dW[1] += diff_proj
 
-        # Scale dW relative to pretrained choice row norm (3.31 ratio on Ministral-3B -> alpha=1.50;
-        # ~15.3 ratio on Gemma-3 -> alpha=21.5)
         c_norm_ratio = float(np.linalg.norm(w_choice_np[:3], axis=1).mean()) / max(
             1e-6, float(np.linalg.norm(dW, axis=1).mean()) * 3.31
         )
-        max_alpha = 24.0 if is_high_spread_arch else 2.2
-        alpha = float(np.clip(1.45 * c_norm_ratio, 1.2, max_alpha))
-        w_choice_trained[:3] += alpha * dW
+        max_alpha = 24.0 if is_high_spread_arch else 2.5
+        base_alpha = float(np.clip(1.45 * c_norm_ratio, 1.0, max_alpha))
+        best_wc_3 = w_choice_trained.copy()
+        best_c3_acc = _eval_acc_np(best_wc_3, w_score_trained)["choice"]
+        for mult_3 in (0.5, 0.75, 1.0, 1.25):
+            wc_try = w_choice_trained.copy()
+            wc_try[:3] += (mult_3 * base_alpha) * dW
+            acc_try = _eval_acc_np(wc_try, w_score_trained)
+            if acc_try["choice"] >= best_c3_acc and acc_try["noul"] >= _eval_acc_np(w_choice_trained, w_score_trained)["noul"] - 0.001:
+                best_c3_acc = acc_try["choice"]
+                best_wc_3 = wc_try
+        w_choice_trained = best_wc_3
 
-        if U is not None:
-            if is_high_spread_arch:
-                # Remove tied-embedding letter-frequency bias along biorthogonal template directions
-                wc_snap = w_choice_trained.copy()
-                for tk, strength in [
-                    ("rc", 0.95),
-                    ("paws_adv", 0.95),
-                    ("tox", 0.95),
-                    ("safe", 0.95),
-                    ("nli", 0.90),
-                    ("fv", 0.85),
-                    ("qa3", 0.95),
-                ]:
-                    if tk not in t_groups:
-                        continue
-                    idxs_tk = t_groups[tk]
-                    k_opt = 2 if tk in ("rc", "paws_adv", "tox", "safe") else 3
-                    u_tk = U[keys.index(tk)] / max(1e-6, float(np.linalg.norm(hidden_mat[idxs_tk].mean(axis=0))))
-                    logits_tk = hidden_mat[idxs_tk] @ wc_snap[:k_opt].T
-                    golds_tk = np.array([valid_samples[i].gold_index for i in idxs_tk])
-                    c_means = [
-                        logits_tk[golds_tk == g].mean(axis=0)
-                        for g in range(k_opt)
-                        if np.any(golds_tk == g)
-                    ]
-                    if c_means:
-                        bias_tk = np.mean(c_means, axis=0)
-                        target_b = (
-                            np.array([2.2, 0.3, -2.5], dtype=np.float32)
-                            if tk == "qa3"
-                            else np.zeros(k_opt, dtype=np.float32)
-                        )
-                        w_choice_trained[:k_opt] -= strength * np.outer((bias_tk - bias_tk.mean()) - target_b, u_tk)
+    # 2b. Multi-Option Choice Kernel Ridge (4..8 options, e.g. Typed-Decisions workflows & tool routing)
+    # Rows 0..2 are projected orthogonal to the 2- and 3-option subspace while rows 3..7 (D..H) update freely.
+    c4_8_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and 4 <= s.num_options <= 8]
+    c2_3_idxs = [i for i, s in enumerate(valid_samples) if s.qtype in ("noul", "choice") and s.num_options <= 3]
+    if len(c4_8_idxs) >= 16 and len(w_choice_trained) >= 8:
+        H_48 = hidden_mat[c4_8_idxs]
+        Y_48 = np.zeros((len(c4_8_idxs), 8), dtype=np.float32)
+        for j, ii in enumerate(c4_8_idxs):
+            k = valid_samples[ii].num_options
+            Y_48[j, :k] = -1.0 / max(1, k - 1)
+            Y_48[j, min(k - 1, valid_samples[ii].gold_index)] = 1.0
+        lam_48 = 25.0 * float(np.mean(np.sum(H_48 ** 2, axis=1))) / 50.0
+        K_48 = H_48 @ H_48.T + lam_48 * np.eye(len(c4_8_idxs), dtype=np.float32)
+        dW_48 = (np.linalg.solve(K_48, Y_48)).T @ H_48
+        if len(c2_3_idxs) >= 8:
+            _, _, vt_23 = np.linalg.svd(hidden_mat[c2_3_idxs], full_matrices=False)
+            vt_23 = vt_23[: min(32, len(vt_23))]
+            dW_48[:3] = dW_48[:3] - (dW_48[:3] @ vt_23.T) @ vt_23
+        c48_ratio = float(np.linalg.norm(w_choice_trained[:8], axis=1).mean()) / max(
+            1e-6, float(np.linalg.norm(dW_48, axis=1).mean()) * 10.0
+        )
+        best_wc_48 = w_choice_trained.copy()
+        best_c48_acc = _eval_acc_np(best_wc_48, w_score_trained)["choice"]
+        for alpha_48 in (0.5, 1.0, 1.5, 2.0):
+            wc_try = w_choice_trained.copy()
+            wc_try[:8] += alpha_48 * c48_ratio * dW_48
+            acc_try = _eval_acc_np(wc_try, w_score_trained)
+            if acc_try["choice"] > best_c48_acc and acc_try["noul"] >= _eval_acc_np(w_choice_trained, w_score_trained)["noul"]:
+                best_c48_acc = acc_try["choice"]
+                best_wc_48 = wc_try
+        w_choice_trained = best_wc_48
 
-                # Also debias D..Z (options 3..25) along the biorthogonal multi-choice direction
-                if "multi" in t_groups:
-                    c4_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and s.num_options == 4]
-                    p16_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and s.num_options == 16]
-                    if c4_idxs and p16_idxs:
-                        u_multi = U[keys.index("multi")] / max(
-                            1e-6, float(np.linalg.norm(hidden_mat[t_groups["multi"]].mean(axis=0)))
-                        )
-                        l4 = hidden_mat[c4_idxs] @ w_choice_trained[:4].T
-                        g4 = np.array([valid_samples[i].gold_index for i in c4_idxs])
-                        b4 = np.stack([l4[g4 == g].mean(axis=0) for g in range(4) if np.any(g4 == g)], axis=0).mean(
-                            axis=0
-                        )
-                        b4 = b4 - b4.mean()
-                        l16 = hidden_mat[p16_idxs] @ w_choice_trained[:16].T
-                        g16 = np.array([valid_samples[i].gold_index for i in p16_idxs])
-                        b16 = np.stack(
-                            [l16[g16 == g].mean(axis=0) for g in range(16) if np.any(g16 == g)], axis=0
-                        ).mean(axis=0)
-                        b16 = b16 - b16[:4].mean() + b4.mean()
-                        bias_26 = np.zeros(26, dtype=np.float32)
-                        bias_26[:4] = b4
-                        bias_26[4:16] = b16[4:16]
-                        bias_26[16:] = float(b16[10:16].mean())
-                        w_choice_trained[:26] -= 0.80 * np.outer(bias_26, u_multi)
-            elif "fv" in t_groups:
-                # Gentle biorthogonal Fact-Verification mean debiasing along u_fv
-                u_fv = U[keys.index("fv")] / max(1e-6, float(np.linalg.norm(hidden_mat[t_groups["fv"]].mean(axis=0))))
-                mu_fv = hidden_mat[t_groups["fv"]].mean(axis=0)
-                bias_fv = w_choice_trained[:3] @ mu_fv
-                w_choice_trained[:3] -= 0.25 * np.outer(bias_fv - bias_fv.mean(), u_fv)
+    # 2c. Binary Noul Kernel Ridge (orthogonal to multi-way choice K>=3)
+    noul_all_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "noul"]
+    c3p_idxs = [i for i, s in enumerate(valid_samples) if s.qtype == "choice" and s.num_options >= 3]
+    if len(noul_all_idxs) >= 20 and len(c3p_idxs) >= 20:
+        _, _, vt_c3p = np.linalg.svd(hidden_mat[c3p_idxs], full_matrices=False)
+        vt_c3p = vt_c3p[: min(32, len(vt_c3p))]
+        H_nl = hidden_mat[noul_all_idxs]
+        Y_nl = np.array([1.0 if valid_samples[i].gold_index == 0 else -1.0 for i in noul_all_idxs], dtype=np.float32)
+        lam_nl = 25.0 * float(np.mean(np.sum(H_nl ** 2, axis=1))) / 50.0
+        K_nl = H_nl @ H_nl.T + lam_nl * np.eye(len(noul_all_idxs), dtype=np.float32)
+        dw_nl_1d = (np.linalg.solve(K_nl, Y_nl)) @ H_nl
+        dw_nl_1d = dw_nl_1d - (dw_nl_1d @ vt_c3p.T) @ vt_c3p
+        nl_ratio = float(np.linalg.norm(w_choice_trained[:2], axis=1).mean()) / max(
+            1e-6, float(np.linalg.norm(dw_nl_1d)) * 10.0
+        )
+        best_wc_nl = w_choice_trained.copy()
+        best_nl_acc = _eval_acc_np(best_wc_nl, w_score_trained)["noul"]
+        for alpha_nl in (0.3, 0.6, 1.0, 1.4):
+            wc_try = w_choice_trained.copy()
+            wc_try[0] += alpha_nl * nl_ratio * dw_nl_1d
+            wc_try[1] -= alpha_nl * nl_ratio * dw_nl_1d
+            acc_try = _eval_acc_np(wc_try, w_score_trained)
+            if acc_try["noul"] > best_nl_acc and acc_try["choice"] >= _eval_acc_np(w_choice_trained, w_score_trained)["choice"] - 0.001:
+                best_nl_acc = acc_try["noul"]
+                best_wc_nl = wc_try
+        w_choice_trained = best_wc_nl
+
+    # 2d. Non-Regressive Biorthogonal Template Threshold Calibration along U
+    if U is not None:
+        wc_snap = w_choice_trained.copy()
+        for tk in ("rc", "squad_gen", "boolq", "paws_adv", "paws_gen", "tox", "safe", "nli", "fv", "qa3"):
+            if tk not in t_groups:
+                continue
+            idxs_tk = t_groups[tk]
+            k_opt = 2 if tk in ("rc", "squad_gen", "boolq", "paws_adv", "paws_gen", "tox", "safe") else 3
+            u_tk = U[keys.index(tk)] / max(1e-6, float(np.linalg.norm(hidden_mat[idxs_tk].mean(axis=0))))
+            logits_tk = hidden_mat[idxs_tk] @ wc_snap[:k_opt].T
+            golds_tk = np.array([valid_samples[i].gold_index for i in idxs_tk])
+            c_means = [
+                logits_tk[golds_tk == g].mean(axis=0)
+                for g in range(k_opt)
+                if np.any(golds_tk == g)
+            ]
+            if len(c_means) == k_opt:
+                bias_tk = np.mean(c_means, axis=0)
+                bias_zero = bias_tk - bias_tk.mean()
+                base_preds_tk = np.argmax(logits_tk, axis=1)
+                best_b_acc = float(
+                    np.mean([(base_preds_tk[golds_tk == g] == g).mean() for g in range(k_opt)])
+                )
+                best_raw_acc = float((base_preds_tk == golds_tk).mean())
+                best_beta = 0.0
+                for beta in (0.25, 0.50, 0.75, 0.95):
+                    preds_b = np.argmax(logits_tk - beta * bias_zero, axis=1)
+                    b_acc = float(np.mean([(preds_b[golds_tk == g] == g).mean() for g in range(k_opt)]))
+                    raw_acc = float((preds_b == golds_tk).mean())
+                    if b_acc > best_b_acc + 1e-4 or (abs(b_acc - best_b_acc) <= 1e-4 and raw_acc > best_raw_acc):
+                        best_b_acc = b_acc
+                        best_raw_acc = raw_acc
+                        best_beta = beta
+                if best_beta > 0.0:
+                    wc_try = w_choice_trained.copy()
+                    wc_try[:k_opt] -= best_beta * np.outer(bias_zero, u_tk)
+                    if _eval_acc_np(wc_try, w_score_trained)["total"] >= _eval_acc_np(w_choice_trained, w_score_trained)["total"]:
+                        w_choice_trained = wc_try
 
     # 3. Non-Linear SwiGLU Self-Distillation + Low-Rank LoRA Optimization Pass (KL-Divergence + Brier + RPS):
     w_choice_trained, w_score_trained = _run_pytorch_lora_kl_brier_rps_pass(
@@ -1712,7 +1806,7 @@ def train_gguf_decision_head(
     # never introduces random template-mean logit drift on binary, 3-way choice, or 5-level score rows
     w_choice_to_quant = w_choice_trained.copy()
     if M is not None and U is not None and ttype not in (0, 1):
-        n_q_rows = 26 if is_high_spread_arch else 3
+        n_q_rows = min(len(w_choice_to_quant), 26 if is_high_spread_arch else 8)
         for _ in range(4):
             wc_q_step = np.stack(
                 [
@@ -1744,8 +1838,6 @@ def train_gguf_decision_head(
         row_updates[tid] = w_choice_to_quant[i]
 
     # Synchronize & damp space-prefixed variants (" A".." Z", e.g. Tekken/BPE `ĠA` / `▁A`)
-    # so free generation under Ollama never splits probability mass or flips argmax to an unadapted " A" row,
-    # while keeping relative option ordering identical if a space prefix is forced.
     mu_global = hidden_mat.mean(axis=0)
     mu_global_dual = mu_global / max(1e-6, float(np.dot(mu_global, mu_global)))
     for i, stid in enumerate(space_choice_ids):
@@ -1779,16 +1871,92 @@ def train_gguf_decision_head(
             return final_logit_softcap * np.tanh(logits_arr / final_logit_softcap)
         return logits_arr
 
-    post_c_logits = _apply_softcap(hidden_mat @ w_choice_quant_dequant[:3].T)
-    post_s_logits = _apply_softcap(hidden_mat @ w_score_quant_dequant[:5].T)
-    post_n_logits = _apply_softcap(hidden_mat @ w_choice_quant_dequant[:2].T)
-    post_c_spread = float(np.std(post_c_logits, axis=1).mean())
-    post_s_spread = float(np.std(post_s_logits, axis=1).mean())
-    post_n_spread = float(np.std(post_n_logits, axis=1).mean())
-    t_c = round(max(1.0, post_c_spread / 1.35), 4)
-    t_s = round(max(1.0, post_s_spread / 0.90), 4)
-    t_n = round(max(1.0, post_n_spread / 1.15), 4)
+    def _fit_optimal_temperature(sample_indices: List[int], fallback_t: float = 1.5) -> float:
+        if len(sample_indices) < 8:
+            return fallback_t
+        raw_logits_list: List[np.ndarray] = []
+        tp_list: List[np.ndarray] = []
+        gold_list: List[int] = []
+        for ii in sample_indices:
+            s = valid_samples[ii]
+            w = (
+                w_score_quant_dequant[: s.num_options]
+                if s.qtype == "score"
+                else (w_choice_quant_dequant[:2] if s.qtype == "noul" else w_choice_quant_dequant[: s.num_options])
+            )
+            z = _apply_softcap(hidden_mat[ii] @ w.T)
+            tp = np.asarray(s.target_probs[: len(z)], dtype=np.float64)
+            tp_sum = float(tp.sum())
+            if tp_sum > 0:
+                tp = tp / tp_sum
+            else:
+                tp = np.full(len(z), 1.0 / len(z), dtype=np.float64)
+            raw_logits_list.append(z.astype(np.float64))
+            tp_list.append(tp)
+            gold_list.append(int(s.gold_index))
+
+        golds_arr = np.array(gold_list, dtype=np.int64)
+        edges = np.linspace(0.0, 1.0, 11)
+        n_sub = len(sample_indices)
+
+        best_t = fallback_t
+        best_obj = float("inf")
+        for t_cand in np.linspace(0.5, 12.0, 231):
+            t_val = float(t_cand)
+            confs = np.empty(n_sub, dtype=np.float64)
+            hits = np.empty(n_sub, dtype=np.float64)
+            ce_sum = 0.0
+            brier_sum = 0.0
+            for j in range(n_sub):
+                z_scaled = raw_logits_list[j] / t_val
+                z_scaled = z_scaled - np.max(z_scaled)
+                e_z = np.exp(z_scaled)
+                p = e_z / np.sum(e_z)
+                pred = int(np.argmax(p))
+                confs[j] = float(p[pred])
+                hits[j] = 1.0 if pred == golds_arr[j] else 0.0
+                tp = tp_list[j]
+                ce_sum -= float(np.sum(tp * np.log(np.clip(p, 1e-12, 1.0))))
+                brier_sum += float(np.sum((p - tp) ** 2))
+            ece = 0.0
+            for b_idx in range(10):
+                lo, hi = edges[b_idx], edges[b_idx + 1]
+                mask = (confs >= lo) & (confs <= hi if b_idx == 9 else confs < hi)
+                if np.any(mask):
+                    ece += (float(np.sum(mask)) / n_sub) * abs(
+                        float(np.mean(hits[mask])) - float(np.mean(confs[mask]))
+                    )
+            obj = (ce_sum / n_sub) + 0.5 * (brier_sum / n_sub) + 1.5 * ece
+            if obj < best_obj:
+                best_obj = obj
+                best_t = t_val
+        return round(best_t, 4)
+
+    c_idxs_all = [i for i, s in enumerate(valid_samples) if s.qtype == "choice"]
+    s_idxs_all = [i for i, s in enumerate(valid_samples) if s.qtype == "score"]
+    n_idxs_all = [i for i, s in enumerate(valid_samples) if s.qtype == "noul"]
+
+    t_c = _fit_optimal_temperature(c_idxs_all, fallback_t=1.5)
+    t_s = _fit_optimal_temperature(s_idxs_all, fallback_t=1.2)
+    t_n = _fit_optimal_temperature(n_idxs_all, fallback_t=1.5)
     temperatures = [t_c, t_s, t_n]
+
+    # Populate Ollaya's fine-grained `temperature_by_options` buckets ("<choice|score|noul>:<2|3-5|6-10|11+>")
+    temperature_by_options: Dict[str, float] = {
+        "noul:2": t_n,
+        "score:3-5": t_s,
+    }
+    for bucket_name, lo_k, hi_k in [
+        ("choice:2", 2, 2),
+        ("choice:3-5", 3, 5),
+        ("choice:6-10", 6, 10),
+        ("choice:11+", 11, 64),
+    ]:
+        b_idxs = [i for i in c_idxs_all if lo_k <= valid_samples[i].num_options <= hi_k]
+        if len(b_idxs) >= 12:
+            temperature_by_options[bucket_name] = _fit_optimal_temperature(b_idxs, fallback_t=t_c)
+        else:
+            temperature_by_options[bucket_name] = t_c
 
     if emit:
         emit(
@@ -1797,7 +1965,7 @@ def train_gguf_decision_head(
             f"cos_choice={cos_c:.3f}, cos_score={cos_s:.3f}) to {gguf_path.name} — "
             f"post-quant accuracy={post_quant_acc['total']*100:.1f}% "
             f"(noul={post_quant_acc['noul']*100:.1f}%, choice={post_quant_acc['choice']*100:.1f}%, score={post_quant_acc['score']*100:.1f}%), "
-            f"temperatures={temperatures}",
+            f"temperatures={temperatures}, by_options={temperature_by_options}",
         )
 
     return {
@@ -1810,4 +1978,6 @@ def train_gguf_decision_head(
         "cos_choice": round(cos_c, 4),
         "cos_score": round(cos_s, 4),
         "temperatures": temperatures,
+        "temperature_by_options": temperature_by_options,
     }
+
