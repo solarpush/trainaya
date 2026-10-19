@@ -676,7 +676,9 @@ def _adapt_gguf_llm_logits(
     calibration = {
         "temperature": temperatures,
         "temperature_by_options": temp_by_opts,
+        "temperature_range": train_metrics.get("temperature_range", [0.25, 16.0]),
         "baseline_accuracy": train_metrics["baseline_accuracy"],
+        "oof_accuracy": train_metrics.get("oof_accuracy", {}),
         "post_quant_accuracy": train_metrics["post_quant_accuracy"],
         "trained_samples": train_metrics["n_samples"],
         "source": f"Trainaya PyTorch Decision Head (KL+RPS+L2-SP) adapted from {os.path.basename(gguf_file)}",

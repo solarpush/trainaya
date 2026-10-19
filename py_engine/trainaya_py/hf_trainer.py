@@ -9,20 +9,31 @@ import struct
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from safetensors.torch import load_file, save_file
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+except Exception:
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    F = None  # type: ignore
+
+try:
+    from safetensors.torch import load_file, save_file
+except Exception:
+    load_file = None  # type: ignore
+    save_file = None  # type: ignore
 
 from .adapt_engine import adapt_model_to_ollaya
 from .calibration import fit_per_qtype_temperatures
 from .dataset_loader import load_decision_records
 
 
-class LoRALinear(nn.Module):
+class LoRALinear(nn.Module if nn is not None else object):  # type: ignore
     """Lightweight PyTorch LoRA wrapper around nn.Linear."""
 
-    def __init__(self, base_linear: nn.Linear, r: int = 16, alpha: float = 32.0, dropout: float = 0.05):
+    def __init__(self, base_linear: Any, r: int = 16, alpha: float = 32.0, dropout: float = 0.05):
         super().__init__()
         self.base = base_linear
         for p in self.base.parameters():
@@ -38,22 +49,46 @@ class LoRALinear(nn.Module):
         self.lora_a = nn.Parameter(torch.randn(r, in_f, device=dev, dtype=dt) * (1.0 / math.sqrt(in_f)))
         self.lora_b = nn.Parameter(torch.zeros(out_f, r, device=dev, dtype=dt))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Any) -> Any:
         base_out = self.base(x)
         lora_out = (self.dropout(x.float()) @ self.lora_a.t()) @ self.lora_b.t() * self.scaling
         return base_out + lora_out.to(base_out.dtype)
 
-    def merge_weight(self) -> torch.Tensor:
+    def merge_weight(self) -> Any:
         with torch.no_grad():
             delta = (self.lora_b @ self.lora_a) * self.scaling
             return (self.base.weight.float() + delta).to(self.base.weight.dtype)
 
 
+def _is_gguf_target(base_model: str, models_dir: Optional[str] = None) -> bool:
+    if base_model.endswith(".gguf"):
+        return True
+    if os.path.isdir(base_model) and os.path.exists(os.path.join(base_model, "model.gguf")):
+        return True
+    tag_safe = base_model.replace(":", "_")
+    if os.path.isdir(os.path.join("output", tag_safe)) and os.path.exists(
+        os.path.join("output", tag_safe, "model.gguf")
+    ):
+        return True
+    root = _find_ollaya_models_dir(models_dir)
+    fam, tag = base_model.split(":", 1) if ":" in base_model else (base_model, "latest")
+    mpath = os.path.join(root, "manifests", "ollaya.dev", "library", fam, tag)
+    if os.path.exists(mpath):
+        try:
+            manifest = json.load(open(mpath, "r", encoding="utf-8"))
+            for layer in manifest.get("layers", []):
+                if layer.get("mediaType") == "application/vnd.ollaya.weights.gguf":
+                    return True
+        except Exception:
+            pass
+    return base_model.startswith("winnow") or base_model.startswith("push_")
+
+
 def run_generic_training_job(job: Dict[str, Any], emit: Callable[[Dict[str, Any]], None]) -> None:
-    """Train a HuggingFace encoder/decoder or GGUF model via PyTorch."""
+    """Train a HuggingFace encoder/decoder or GGUF model via PyTorch / Multi-Stage GGUF Trainer."""
     base_model = job["base_model"]
     output_dir = job["output_dir"]
-    data_path = job["data_path"]
+    data_path = job.get("data_path") or "auto"
     epochs = int(job.get("epochs", 5))
     batch_size = int(job.get("batch_size", 8))
     lr = float(job.get("lr", 2e-4))
@@ -61,8 +96,8 @@ def run_generic_training_job(job: Dict[str, Any], emit: Callable[[Dict[str, Any]
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Check if base_model is an Ollaya GGUF model (e.g. winnow:e4b) or .gguf file
-    if base_model.startswith("winnow") or base_model.endswith(".gguf"):
+    # Check if base_model is an Ollaya GGUF model, adapted GGUF bundle, or .gguf file
+    if _is_gguf_target(base_model, job.get("models_dir")):
         _run_gguf_calibration_and_adapter_job(job, emit)
         return
 
@@ -96,21 +131,63 @@ def _find_ollaya_models_dir(custom_dir: Optional[str] = None) -> str:
 def _run_gguf_calibration_and_adapter_job(
     job: Dict[str, Any], emit: Callable[[Dict[str, Any]], None]
 ) -> None:
-    """Train/calibrate an Ollaya GGUF model (`winnow:*` or `.gguf`) using PyTorch on the GGUF output projection."""
+    """Train and calibrate a GGUF decision model using the full Multi-Stage GGUF Decision Trainer."""
+    from pathlib import Path
+    from .adapt_engine import SYSTEM_PROMPT, read_gguf_metadata, sha256_file
+    from .dataset_loader import build_ollaya_preset_anchors, load_hf_jev_adaptation_corpus
+    from .gguf_head_trainer import ensure_untied_output_weight, parse_gguf_layout, train_gguf_decision_head
+
     base_model = job["base_model"]
     output_dir = job["output_dir"]
-    data_path = job["data_path"]
-    epochs = int(job.get("epochs", 5))
-    lr = float(job.get("lr", 1e-4))
+    data_path = str(job.get("data_path") or "auto")
+    epochs = int(job.get("epochs", 12))
+    lr = float(job.get("lr", 4e-4))
+
+    bundle_dir: Optional[str] = None
+    if os.path.isdir(base_model) and os.path.exists(os.path.join(base_model, "model.gguf")):
+        bundle_dir = base_model
+    else:
+        tag_safe = base_model.replace(":", "_")
+        cand_dir = os.path.join("output", tag_safe)
+        if os.path.isdir(cand_dir) and os.path.exists(os.path.join(cand_dir, "model.gguf")):
+            bundle_dir = cand_dir
+
+    # If the user did not specify a custom output_dir (it defaulted to ./output_adapter) and we found an existing bundle_dir, train in-place in bundle_dir
+    if bundle_dir and os.path.normpath(output_dir) == os.path.normpath("./output_adapter"):
+        output_dir = bundle_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     gguf_path = base_model
     decision_data = None
+    ollaya_cfg_data = None
+
+    if bundle_dir:
+        gguf_path = os.path.join(bundle_dir, "model.gguf")
+        dec_file = os.path.join(bundle_dir, "decision.json")
+        if os.path.exists(dec_file):
+            decision_data = json.load(open(dec_file, "r", encoding="utf-8"))
+        cfg_file = os.path.join(bundle_dir, "ollaya_config.json")
+        if os.path.exists(cfg_file):
+            ollaya_cfg_data = json.load(open(cfg_file, "r", encoding="utf-8"))
+        # Copy cache/backup files if training into a different output_dir
+        if os.path.abspath(bundle_dir) != os.path.abspath(output_dir):
+            for aux in ("hidden_states_cache.npz", "orig_head_backup.npz", "ollaya_config.json"):
+                src_aux = os.path.join(bundle_dir, aux)
+                dst_aux = os.path.join(output_dir, aux)
+                if os.path.exists(src_aux) and not os.path.exists(dst_aux):
+                    shutil.copy2(src_aux, dst_aux)
+
     if not os.path.exists(gguf_path):
         root = _find_ollaya_models_dir(job.get("models_dir"))
         fam, tag = base_model.split(":", 1) if ":" in base_model else (base_model, "latest")
         mpath = os.path.join(root, "manifests", "ollaya.dev", "library", fam, tag)
         if os.path.exists(mpath):
             manifest = json.load(open(mpath, "r", encoding="utf-8"))
+            cfg_digest = manifest.get("config", {}).get("digest", "")
+            if cfg_digest:
+                cpath = os.path.join(root, "blobs", cfg_digest.replace(":", "-"))
+                if os.path.exists(cpath):
+                    ollaya_cfg_data = json.load(open(cpath, "r", encoding="utf-8"))
             for layer in manifest.get("layers", []):
                 mt = layer.get("mediaType", "")
                 bpath = os.path.join(root, "blobs", layer["digest"].replace(":", "-"))
@@ -119,100 +196,126 @@ def _run_gguf_calibration_and_adapter_job(
                 elif mt == "application/vnd.ollaya.decision" and os.path.exists(bpath):
                     decision_data = json.load(open(bpath, "r", encoding="utf-8"))
 
-    records = load_decision_records(data_path, include_anchor_replay=False)
+    if not os.path.exists(gguf_path) or not decision_data:
+        # Delegate full initial GGUF adaptation + training to adapt_model_to_ollaya
+        adapt_model_to_ollaya(
+            source=base_model,
+            output_dir=output_dir,
+            target_tag=job.get("family") or (base_model if ":" in base_model else "custom:v1"),
+            layout="llm-logits-v1",
+            data_path=data_path,
+            epochs=epochs,
+            lr=lr,
+            batch_size=int(job.get("batch_size", 8)),
+            device=str(job.get("device", "auto")),
+            emit=emit,
+        )
+        return
+
+    dst_gguf = os.path.join(output_dir, "model.gguf")
+    def _emit_step(stage: str, msg: str) -> None:
+        emit({"event": "status", "stage": stage, "message": msg})
+
+    if os.path.abspath(gguf_path) != os.path.abspath(dst_gguf):
+        _, tensors_layout = ensure_untied_output_weight(
+            Path(os.path.realpath(gguf_path)),
+            Path(dst_gguf),
+            emit=_emit_step,
+        )
+    else:
+        _, tensors_layout, _ = parse_gguf_layout(Path(dst_gguf))
+
+    meta = read_gguf_metadata(dst_gguf)
+    arch = str(meta.get("general.architecture", decision_data.get("gguf", {}).get("architecture", "llama")))
+    softcap_val = float(meta.get(f"{arch}.final_logit_softcapping", 0.0) or 0.0)
+
+    if data_path and data_path not in ("auto", "hf:jev", "hf:jev-v3", "hf:open-jev") and os.path.exists(data_path):
+        records = build_ollaya_preset_anchors() + load_decision_records(data_path)
+    else:
+        records = load_hf_jev_adaptation_corpus(max_samples=4000, emit=emit)
+
+    tpl = decision_data.get("template", {})
+    chat_template_cfg = {
+        "pre": tpl.get("pre", "<|im_start|>system\n"),
+        "mid": tpl.get("mid", "<|im_end|>\n<|im_start|>user\n"),
+        "post": tpl.get("post", "<|im_end|>\n<|im_start|>assistant\n"),
+        "system": decision_data.get("system", SYSTEM_PROMPT),
+        "assistant_prefix": decision_data.get("assistant_prefix", ""),
+    }
+    labels = decision_data["labels"]
+    choice_ids = labels["choice"]["ids"] if isinstance(labels.get("choice"), dict) else labels["ids"][:26]
+    score_ids = labels["score"]["ids"] if isinstance(labels.get("score"), dict) else labels["ids"][:10]
+    noul_ids = labels["noul"]["ids"] if isinstance(labels.get("noul"), dict) else choice_ids[:2]
+
+    train_metrics = train_gguf_decision_head(
+        gguf_path=Path(dst_gguf),
+        tensor_info=tensors_layout["output.weight"],
+        choice_token_ids=choice_ids,
+        score_token_ids=score_ids,
+        noul_token_ids=noul_ids,
+        chat_template=chat_template_cfg,
+        records=records,
+        epochs=max(180, epochs * 30),
+        lr=lr,
+        l2_sp_weight=0.008,
+        n_threads=12,
+        add_bos=bool(decision_data.get("add_bos", True)),
+        final_logit_softcap=softcap_val,
+        emit=_emit_step,
+    )
+
+    oof_acc = train_metrics.get("oof_accuracy", train_metrics["post_quant_accuracy"])
+    pq_acc = train_metrics["post_quant_accuracy"]
     emit(
         {
-            "event": "status",
-            "message": f"Loaded {len(records)} decision samples for GGUF optimization ({base_model}).",
+            "event": "epoch",
+            "epoch": epochs,
+            "total_epochs": epochs,
+            "train_loss": round(1.0 - float(pq_acc["total"]), 4),
+            "train_acc": float(pq_acc["total"]),
+            "eval_loss": round(1.0 - float(oof_acc["total"]), 4),
+            "eval_acc": float(oof_acc["total"]),
         }
     )
 
-    # Train lightweight PyTorch decision representation + temperature calibration
-    d_dim = 256
-    proj = nn.Sequential(nn.Linear(d_dim, d_dim), nn.GELU(), nn.Linear(d_dim, 1))
-    opt = torch.optim.AdamW(proj.parameters(), lr=lr)
+    gguf_sha = sha256_file(dst_gguf)
+    if "gguf" in decision_data and isinstance(decision_data["gguf"], dict):
+        decision_data["gguf"]["sha256"] = gguf_sha
+        decision_data["gguf"]["size"] = os.path.getsize(dst_gguf)
 
-    def feat_vec(text: str) -> torch.Tensor:
-        v = torch.zeros(d_dim, dtype=torch.float32)
-        for idx, b in enumerate(text.encode("utf-8")[:512]):
-            slot = (b * 31 + idx * 17) % d_dim
-            v[slot] += 1.0
-        return F.normalize(v, dim=0)
+    with open(os.path.join(output_dir, "decision.json"), "w", encoding="utf-8") as f:
+        json.dump(decision_data, f, indent=2)
 
-    encoded_samples = []
-    for rec in records:
-        st_str = rec.state if isinstance(rec.state, str) else json.dumps(rec.state)
-        opt_vecs = []
-        for k in rec.option_keys:
-            opt_vecs.append(feat_vec(f"{st_str} | {rec.instructions} | {k}"))
-        if len(opt_vecs) >= 2:
-            encoded_samples.append((torch.stack(opt_vecs), min(rec.gold_index, len(opt_vecs) - 1), rec.qtype))
+    if ollaya_cfg_data:
+        with open(os.path.join(output_dir, "ollaya_config.json"), "w", encoding="utf-8") as f:
+            json.dump(ollaya_cfg_data, f, indent=2)
 
-    for ep in range(1, epochs + 1):
-        total_loss = 0.0
-        correct = 0
-        for x_mat, y_idx, _ in encoded_samples:
-            logits = proj(x_mat).squeeze(-1)
-            y = torch.tensor([y_idx], dtype=torch.long)
-            loss = F.cross_entropy(logits.unsqueeze(0), y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total_loss += float(loss.item())
-            if int(torch.argmax(logits).item()) == y_idx:
-                correct += 1
-        acc = correct / max(1, len(encoded_samples))
-        avg_loss = total_loss / max(1, len(encoded_samples))
-        emit(
-            {
-                "event": "epoch",
-                "epoch": ep,
-                "total_epochs": epochs,
-                "train_loss": round(avg_loss, 4),
-                "train_acc": round(acc, 4),
-                "eval_loss": round(avg_loss, 4),
-                "eval_acc": round(acc, 4),
-            }
-        )
-
-    qmap = {"choice": 0, "score": 1, "noul": 2}
-    all_logits, all_labels, all_qtypes = [], [], []
-    with torch.no_grad():
-        for x_mat, y_idx, qt_str in encoded_samples:
-            lg = proj(x_mat).squeeze(-1).numpy()
-            all_logits.append(lg)
-            all_labels.append(y_idx)
-            all_qtypes.append(qmap.get(qt_str, 0))
-
-    cal = fit_per_qtype_temperatures(all_logits, all_labels, all_qtypes)
-    temps = cal["temperature"]
-
-    if os.path.exists(gguf_path):
-        dst_gguf = os.path.join(output_dir, "model.gguf")
-        if os.path.abspath(gguf_path) != os.path.abspath(dst_gguf):
-            if os.path.lexists(dst_gguf):
-                os.remove(dst_gguf)
-            try:
-                os.link(os.path.realpath(gguf_path), dst_gguf)
-            except OSError:
-                shutil.copy2(gguf_path, dst_gguf)
-
-    if decision_data:
-        with open(os.path.join(output_dir, "decision.json"), "w", encoding="utf-8") as f:
-            json.dump(decision_data, f, indent=2)
-
+    temps = train_metrics["temperatures"]
+    temp_by_opts = train_metrics.get("temperature_by_options", {})
+    calibration = {
+        "temperature": temps,
+        "temperature_by_options": temp_by_opts,
+        "temperature_range": train_metrics.get("temperature_range", [0.25, 16.0]),
+        "baseline_accuracy": train_metrics["baseline_accuracy"],
+        "oof_accuracy": oof_acc,
+        "post_quant_accuracy": pq_acc,
+        "trained_samples": train_metrics["n_samples"],
+        "source": f"Trainaya Multi-Stage GGUF Decision Trainer (55/45 Kernel Ridge + Masked Softmax KL+Brier+RPS AdamW, 5-Fold OOF Calibrated)",
+    }
     with open(os.path.join(output_dir, "calibration.json"), "w", encoding="utf-8") as f:
-        json.dump({"temperature": temps, "temperature_by_options": {}}, f, indent=2)
+        json.dump(calibration, f, indent=2)
 
     emit(
         {
             "event": "complete",
             "output_dir": output_dir,
             "temperature": temps,
-            "ece_before": cal["ece_before"],
-            "ece_after": cal["ece_after"],
+            "temperature_by_options": temp_by_opts,
+            "oof_accuracy": oof_acc,
+            "post_quant_accuracy": pq_acc,
         }
     )
+
 
 
 def run_merge_job(job: Dict[str, Any], emit: Callable[[Dict[str, Any]], None]) -> None:

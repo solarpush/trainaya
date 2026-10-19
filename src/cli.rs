@@ -265,7 +265,7 @@ impl TrainOpts {
 
         let trainfile_path = if let Some(ref f) = self.file {
             Some(f.clone())
-        } else if self.data.is_none() {
+        } else if self.data.is_none() && self.base == "winnow:e4b" {
             Trainfile::find_default(Path::new("."))
         } else {
             None
@@ -368,16 +368,7 @@ impl TrainOpts {
             return Ok((args, register_name, models_dir));
         }
 
-        let data_path = match self.data {
-            Some(d) => d,
-            None => {
-                anyhow::bail!(
-                    "No dataset or Trainfile found.\n\
-                     Please either pass a Trainfile with '-f Trainfile' (or create a .Trainfile in the directory),\n\
-                     or pass a dataset file directly with '--data <PATH>'."
-                );
-            }
-        };
+        let data_path = self.data.unwrap_or_else(|| PathBuf::from("auto"));
 
         let mut lora = LoraConfig {
             r: self.lora_r.unwrap_or(16),
@@ -400,15 +391,27 @@ impl TrainOpts {
             crate::config::MergeMode::Auto
         };
 
+        let default_out_dir = {
+            let bp = PathBuf::from(&self.base);
+            if bp.is_dir() && bp.join("model.gguf").exists() {
+                bp
+            } else {
+                let cand = PathBuf::from("output").join(self.base.replace(':', "_"));
+                if cand.is_dir() && cand.join("model.gguf").exists() {
+                    cand
+                } else {
+                    PathBuf::from("./output_adapter")
+                }
+            }
+        };
+
         let args = TrainingArgs {
             base_model: self.base,
             family: self.family,
             data_path,
             eval_path: self.eval_data,
             eval_split: self.eval_split.unwrap_or(0.1),
-            output_dir: self
-                .output_dir
-                .unwrap_or_else(|| PathBuf::from("./output_adapter")),
+            output_dir: self.output_dir.unwrap_or(default_out_dir),
             task: self.task,
             epochs: self.epochs.unwrap_or(12),
             batch_size: self.batch_size.unwrap_or(8),
