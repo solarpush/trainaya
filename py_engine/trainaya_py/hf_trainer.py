@@ -242,6 +242,11 @@ def _run_gguf_calibration_and_adapter_job(
         "system": decision_data.get("system", SYSTEM_PROMPT),
         "assistant_prefix": decision_data.get("assistant_prefix", ""),
     }
+    from .adapt_engine import _resolve_gguf_label_table
+    tokens = meta.get("tokenizer.ggml.tokens", [])
+    resolved_labels = _resolve_gguf_label_table(tokens) if tokens else {}
+    yes_no_ids = resolved_labels.get("_yes_no_ids")
+
     labels = decision_data["labels"]
     choice_ids = labels["choice"]["ids"] if isinstance(labels.get("choice"), dict) else labels["ids"][:26]
     score_ids = labels["score"]["ids"] if isinstance(labels.get("score"), dict) else labels["ids"][:10]
@@ -260,6 +265,7 @@ def _run_gguf_calibration_and_adapter_job(
         l2_sp_weight=0.008,
         n_threads=12,
         add_bos=bool(decision_data.get("add_bos", True)),
+        yes_no_token_ids=yes_no_ids,
         final_logit_softcap=softcap_val,
         emit=_emit_step,
     )

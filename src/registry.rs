@@ -580,6 +580,9 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
             .stderr(std::process::Stdio::null())
             .status();
 
+        // Prune unreferenced blobs in Ollaya store so superseded model weights do not accumulate
+        let _ = prune_unreferenced_blobs(&models_dir);
+
         print_status(
             "Registered Model (Ollaya)",
             full_tag.green().bold().to_string(),
@@ -622,6 +625,9 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
                 custom_ollama_dir,
             ) {
                 Ok(ollama_manifest_path) => {
+                    if let Ok(odir) = get_ollama_models_dir(custom_ollama_dir) {
+                        let _ = prune_unreferenced_blobs(&odir);
+                    }
                     print_status(
                         "Registered Model (Ollama)",
                         format!("{}:{}", target_model, target_tag).cyan().bold().to_string(),
@@ -642,6 +648,92 @@ pub fn run_register(args: RegisterArgs) -> Result<()> {
         }
     }
 
+    // Invalidate any stale benchmark result caches for this model tag
+    let _ = prune_model_bench_cache(&target_model, &target_tag);
+
+    Ok(())
+}
+
+fn collect_manifest_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_manifest_files(&p, out);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Remove any `sha256-*` blob in `models_dir/blobs` that is not referenced by any manifest under `models_dir/manifests`
+pub fn prune_unreferenced_blobs(models_dir: &Path) -> Result<usize> {
+    use std::collections::HashSet;
+    let manifests_root = models_dir.join("manifests");
+    let blobs_dir = models_dir.join("blobs");
+    if !manifests_root.is_dir() || !blobs_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut manifest_files = Vec::new();
+    collect_manifest_files(&manifests_root, &mut manifest_files);
+    if manifest_files.is_empty() {
+        return Ok(0);
+    }
+    let mut referenced = HashSet::new();
+    for mf in manifest_files {
+        if let Ok(raw) = fs::read_to_string(&mf) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(d) = val.get("config").and_then(|c| c.get("digest")).and_then(|v| v.as_str()) {
+                    referenced.insert(d.replace(':', "-"));
+                }
+                if let Some(layers) = val.get("layers").and_then(|l| l.as_array()) {
+                    for layer in layers {
+                        if let Some(d) = layer.get("digest").and_then(|v| v.as_str()) {
+                            referenced.insert(d.replace(':', "-"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut removed = 0usize;
+    if let Ok(entries) = fs::read_dir(&blobs_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let fname = e.file_name().to_string_lossy().to_string();
+            if fname.starts_with("sha256-") && !referenced.contains(&fname) {
+                if fs::remove_file(&p).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn prune_model_bench_cache(target_model: &str, target_tag: &str) -> Result<()> {
+    let results_dir = crate::bench::get_benchmark_results_cache_dir();
+    if !results_dir.is_dir() {
+        return Ok(());
+    }
+    let prefix = format!("{}_{}_", target_model.replace(':', "_"), target_tag.replace(':', "_"));
+    if let Ok(entries) = fs::read_dir(&results_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let fname = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() && fname.starts_with(&prefix) {
+                let _ = fs::remove_dir_all(&p);
+            }
+        }
+    }
+    let memo_path = results_dir.join("blob_sha256_memo.json");
+    if memo_path.is_file() {
+        let _ = fs::remove_file(&memo_path);
+    }
     Ok(())
 }
 
