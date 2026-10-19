@@ -970,15 +970,22 @@ def _run_pytorch_lora_kl_brier_rps_pass(
         if len(vt_ms) > 0:
             ms_orth_t = torch.from_numpy(vt_ms.astype(np.float32)).to(device=dev)
 
-    # Group samples by (qtype, num_options) for fast vectorized batch evaluation
-    groups: Dict[Tuple[str, int], List[int]] = {}
-    for idx, s in enumerate(valid_samples):
-        k_opt = 2 if s.qtype == "noul" else int(s.num_options)
-        if k_opt >= 2:
-            groups.setdefault((s.qtype, k_opt), []).append(idx)
+    # Group NLI 3-way relational samples and 5-level ordinal score samples for trust-region LoRA refinement
+    nli_idxs = [
+        idx
+        for idx, s in enumerate(valid_samples)
+        if s.qtype == "choice" and s.num_options == 3 and s.subset in ("P0_nli", "synth_nli")
+    ]
+    score5_idxs = [
+        idx
+        for idx, s in enumerate(valid_samples)
+        if s.qtype == "score" and s.num_options == 5
+    ]
 
     compiled_groups = []
-    for (qt, k_opt), idxs in groups.items():
+    for qt, k_opt, idxs in [("choice", 3, nli_idxs), ("score", 5, score5_idxs)]:
+        if len(idxs) < 5:
+            continue
         idxs_t = torch.tensor(idxs, dtype=torch.long, device=dev)
         p_mat = np.zeros((len(idxs), k_opt), dtype=np.float32)
         w_vec = np.ones(len(idxs), dtype=np.float32)
@@ -989,9 +996,7 @@ def _run_pytorch_lora_kl_brier_rps_pass(
             if len(tp) < k_opt:
                 tp = list(tp) + [0.0] * (k_opt - len(tp))
             p_mat[j] = np.asarray(tp, dtype=np.float32)
-            # Boost Hard-Tier relational NLI & score calibration samples
-            w_mult = 1.6 if s.subset in ("P0_nli", "synth_nli") else 1.0
-            w_vec[j] = float(s.sample_weight) * w_mult
+            w_vec[j] = float(s.sample_weight)
             golds[j] = min(max(0, int(s.gold_index)), k_opt - 1)
         compiled_groups.append(
             (
@@ -1004,15 +1009,21 @@ def _run_pytorch_lora_kl_brier_rps_pass(
             )
         )
 
+    if not compiled_groups:
+        return wc_init, ws_init
+
     # Low-rank LoRA parameters (rank r=16) + Non-Linear SwiGLU Self-Distillation Teacher (rank r_mlp=64)
     r_lora = 16
     r_mlp = 64
-    lora_scale = 1.5 if not is_high_spread_arch else 6.0
+    c_base_norm = float(np.linalg.norm(wc_init[:3], axis=1).mean())
+    s_base_norm = float(np.linalg.norm(ws_init[:5], axis=1).mean())
+    max_c_delta = 0.025 * c_base_norm
+    max_s_delta = 0.015 * s_base_norm
 
     lora_c_a = nn.Parameter(torch.randn(r_lora, d_model, device=dev) * (1.0 / math.sqrt(d_model)))
-    lora_c_b = nn.Parameter(torch.zeros(26, r_lora, device=dev))
+    lora_c_b = nn.Parameter(torch.zeros(3, r_lora, device=dev))
     lora_s_a = nn.Parameter(torch.randn(r_lora, d_model, device=dev) * (1.0 / math.sqrt(d_model)))
-    lora_s_b = nn.Parameter(torch.zeros(10, r_lora, device=dev))
+    lora_s_b = nn.Parameter(torch.zeros(5, r_lora, device=dev))
 
     # Non-linear SwiGLU auxiliary teacher block (captures quadratic/bilinear Premise x Hypothesis interactions)
     mlp_gate = nn.Parameter(torch.randn(r_mlp, d_model, device=dev) * (0.5 / math.sqrt(d_model)))
@@ -1020,9 +1031,9 @@ def _run_pytorch_lora_kl_brier_rps_pass(
     mlp_down = nn.Parameter(torch.zeros(d_model, r_mlp, device=dev))
 
     def _project_heads() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        dw_c = (lora_c_b @ lora_c_a) * (lora_scale / r_lora) * g_gate_t.unsqueeze(0)
+        dw_c_3 = (lora_c_b @ lora_c_a) * (0.25 / r_lora) * g_gate_t.unsqueeze(0)
         # Zero-center across the 3 NLI rows so class prior is invariant
-        dw_c_3 = dw_c[:3] - dw_c[:3].mean(dim=0, keepdim=True)
+        dw_c_3 = dw_c_3 - dw_c_3.mean(dim=0, keepdim=True)
         if vt_prot_t is not None:
             dw_c_3 = dw_c_3 - (dw_c_3 @ vt_prot_t.t()) @ vt_prot_t
         if vt_bin_t is not None:
@@ -1033,18 +1044,20 @@ def _run_pytorch_lora_kl_brier_rps_pass(
                 [dw_c_3[0] - diff_proj_1d, dw_c_3[1] + diff_proj_1d, dw_c_3[2]],
                 dim=0,
             )
-        dw_c_rest = dw_c[3:] - dw_c[3:].mean(dim=0, keepdim=True)
-        if vt_prot_t is not None:
-            dw_c_rest = dw_c_rest - (dw_c_rest @ vt_prot_t.t()) @ vt_prot_t
-        dw_c_proj = torch.cat([dw_c_3, dw_c_rest], dim=0)
+        # Trust-region norm bound on NLI rows; keep D..Z untouched
+        c_norms = torch.norm(dw_c_3, dim=1, keepdim=True).clamp_min(1e-8)
+        dw_c_3 = dw_c_3 * torch.clamp(max_c_delta / c_norms, max=1.0)
+        dw_c_proj = torch.cat([dw_c_3, torch.zeros_like(wc_base_t[3:])], dim=0)
 
-        dw_s = (lora_s_b @ lora_s_a) * (lora_scale / r_lora)
-        dw_s_5 = dw_s[:5] - dw_s[:5].mean(dim=0, keepdim=True)
+        dw_s_5 = (lora_s_b @ lora_s_a) * (0.15 / r_lora)
+        dw_s_5 = dw_s_5 - dw_s_5.mean(dim=0, keepdim=True)
         if ms_orth_t is not None:
             dw_s_5 = dw_s_5 - (dw_s_5 @ ms_orth_t.t()) @ ms_orth_t
-        dw_s_proj = torch.cat([dw_s_5, torch.zeros_like(dw_s[5:])], dim=0)
+        s_norms = torch.norm(dw_s_5, dim=1, keepdim=True).clamp_min(1e-8)
+        dw_s_5 = dw_s_5 * torch.clamp(max_s_delta / s_norms, max=1.0)
+        dw_s_proj = torch.cat([dw_s_5, torch.zeros_like(ws_base_t[5:])], dim=0)
 
-        reg = torch.mean(dw_c_proj ** 2) + torch.mean(dw_s_proj ** 2)
+        reg = torch.mean(dw_c_3 ** 2) + torch.mean(dw_s_5 ** 2)
         return wc_base_t + dw_c_proj, ws_base_t + dw_s_proj, reg
 
     def _eval_heads(wc_t: torch.Tensor, ws_t: torch.Tensor) -> Tuple[float, float]:
@@ -1067,8 +1080,8 @@ def _run_pytorch_lora_kl_brier_rps_pass(
                     c_ok += ok
                     c_tot += len(idxs_t)
                     c_brier += brier
-            c_obj = (c_ok / max(1, c_tot)) - 0.15 * (c_brier / max(1, c_tot))
-            s_obj = (s_ok / max(1, s_tot)) - 0.15 * (s_brier / max(1, s_tot))
+            c_obj = (c_ok / max(1, c_tot)) - 0.25 * (c_brier / max(1, c_tot))
+            s_obj = (s_ok / max(1, s_tot)) - 0.25 * (s_brier / max(1, s_tot))
             return c_obj, s_obj
 
     best_c_obj, best_s_obj = _eval_heads(wc_base_t, ws_base_t)
@@ -1076,7 +1089,7 @@ def _run_pytorch_lora_kl_brier_rps_pass(
     best_ws = ws_init.copy()
 
     params = [lora_c_a, lora_c_b, lora_s_a, lora_s_b, mlp_gate, mlp_up, mlp_down]
-    opt = torch.optim.AdamW(params, lr=max(5e-4, min(3e-3, lr)), weight_decay=1e-4)
+    opt = torch.optim.AdamW(params, lr=max(5e-4, min(2e-3, lr)), weight_decay=1e-4)
 
     for _ in range(epochs):
         opt.zero_grad()
@@ -1393,6 +1406,14 @@ def train_gguf_decision_head(
                     delta_bias = (mean_k - mean_k.mean()) - target_bias
                     w_score_trained[:5] -= np.outer(delta_bias, u_k)
         else:
+            u_cons = U_s[0] / max(1e-6, float(np.linalg.norm(hidden_mat[s5_cons].mean(axis=0))))
+            l_cons = hidden_mat[s5_cons] @ w_score_trained[:5].T
+            gap_cons = float(l_cons[:, 4].mean() - l_cons[:, 0].mean())
+            if gap_cons < 1.35:
+                shift_cons = 1.45 - gap_cons
+                w_score_trained[4] += 0.65 * shift_cons * u_cons
+                w_score_trained[0] -= 0.35 * shift_cons * u_cons
+                w_score_trained[1] -= 0.30 * shift_cons * u_cons
             u_help = U_s[2] / max(1e-6, float(np.linalg.norm(hidden_mat[s5_help].mean(axis=0))))
             w_score_trained[4] += 1.15 * u_help
             w_score_trained[3] -= 1.15 * u_help

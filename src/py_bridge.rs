@@ -97,6 +97,7 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
         .unwrap_or_default();
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let cache_venv = Path::new(&home).join(".cache/trainaya/py_engine/.venv/bin/python");
     let uv_share = Path::new(&home).join(".local/share/uv");
     let sys_python = PathBuf::from("/usr/bin/python3");
 
@@ -106,6 +107,8 @@ fn build_python_command(engine_dir: &Path, subcmd: &str, cfg_arg: Option<&Path>)
         Some(engine_venv)
     } else if parent_venv.exists() {
         Some(parent_venv)
+    } else if cache_venv.exists() {
+        Some(cache_venv)
     } else if !uv_share.exists() && sys_python.exists() && find_installed_uv().is_none() {
         Some(sys_python.clone())
     } else {

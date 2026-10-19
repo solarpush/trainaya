@@ -12,12 +12,13 @@ from typing import Any, Dict
 os.environ["GGML_CUDA_DISABLE_GRAPHS"] = "1"
 os.environ["GGML_CUDA_DISABLE_FUSION"] = "1"
 
-# Automatically attach local or cached .venv site-packages if running under system python3
+# Automatically attach local or cached .venv site-packages if matching active Python version
+_py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
 for venv_root in (
     os.path.abspath(".venv"),
     os.path.expanduser("~/.cache/trainaya/py_engine/.venv"),
 ):
-    for sp in glob.glob(os.path.join(venv_root, "lib", "python*", "site-packages")):
+    for sp in glob.glob(os.path.join(venv_root, "lib", _py_ver, "site-packages")):
         if os.path.isdir(sp) and sp not in sys.path:
             sys.path.insert(0, sp)
 
