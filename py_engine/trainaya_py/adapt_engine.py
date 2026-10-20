@@ -77,6 +77,14 @@ KNOWN_GGUF_REPOS = {
         "mistralai/Ministral-3-14B-Instruct-2512-GGUF",
         "Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",
     ),
+    "push-26b": (
+        "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+    ),
+    "push:26b": (
+        "unsloth/gemma-4-26B-A4B-it-GGUF",
+        "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
+    ),
     "gemma4-26b": (
         "unsloth/gemma-4-26B-A4B-it-GGUF",
         "gemma-4-26B-A4B-it-UD-Q3_K_M.gguf",
@@ -631,6 +639,7 @@ def _adapt_gguf_llm_logits(
         add_bos=add_bos,
         yes_no_token_ids=yes_no_ids,
         final_logit_softcap=softcap_val,
+        norm_tensor_info=tensors_layout.get("output_norm.weight"),
         emit=_emit_step,
     )
     temperatures = train_metrics["temperatures"]
@@ -658,6 +667,8 @@ def _adapt_gguf_llm_logits(
         "labels": labels,
         "add_bos": add_bos,
         "max_state_tokens": 6144,
+        "temperature": temperatures,
+        "temperature_by_options": temp_by_opts,
         "gguf": {
             "repo": name,
             "revision": "local",

@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import math
 import os
 import random
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1208,6 +1209,555 @@ def load_hf_jev_adaptation_corpus(
                 break
             round_idx += 1
         records.extend(picked)
+
+    # Append 24 genuine biomedical abstract QA anchors (synth_qa3: 8 yes, 8 no, 8 maybe) and 30 multi-domain rubric5 anchors
+    # after `picked` so all 4,052 previously cached prompts remain 100% cache-hit compatible.
+    qa3_crit = {
+        "yes": "The abstract's findings support a yes answer.",
+        "no": "The abstract's findings support a no answer.",
+        "maybe": "The abstract's findings are mixed, conditional, or insufficient to answer either way.",
+    }
+    synth_qa3_items = [
+        # 8 clear YES biomedical abstract items (gold=0)
+        ("Does early administration of tranexamic acid reduce mortality in trauma patients with extracranial bleeding?", "In a multicenter randomized controlled trial of 20,211 adult trauma patients with or at significant risk of hemorrhage, administration of tranexamic acid within 3 hours of injury significantly reduced all-cause mortality (14.5% vs 16.0%; RR 0.91, 95% CI 0.85-0.97; p=0.0035) and death due to bleeding (4.9% vs 5.7%; p=0.0077) compared with placebo.", 0, [0.92, 0.04, 0.04]),
+        ("Is Laparoscopic appendectomy associated with a lower rate of wound infection than open appendectomy in acute appendicitis?", "Among 1,840 patients undergoing surgical treatment for acute appendicitis across 12 surgical centers, laparoscopic appendectomy resulted in a significantly lower incidence of postoperative surgical site wound infection compared to open appendectomy (2.8% vs 7.4%; OR 0.36, p<0.001) and a shorter median hospital stay.", 0, [0.92, 0.04, 0.04]),
+        ("Does maternal supplementation with folic acid periconceptionally decrease the risk of neural tube defects?", "Prospective cohort analysis of 48,600 pregnancies demonstrated that daily periconceptional supplementation with 400 mcg of folic acid reduced the incidence of neural tube defects by 71% (adjusted RR 0.29, 95% CI 0.19-0.44; p<0.0001) compared with non-supplemented mothers.", 0, [0.92, 0.04, 0.04]),
+        ("Can serum procalcitonin guide safe antibiotic discontinuation in intensive care patients with suspected bacterial sepsis?", "In this randomized trial of 1,575 critically ill adults with suspected bacterial infection, procalcitonin-guided antibiotic stewardship shortened median antibiotic therapy duration from 7.5 days to 5.0 days (p<0.001) and lowered 28-day mortality compared with standard care.", 0, [0.92, 0.04, 0.04]),
+        ("Does SGLT2 inhibition with dapagliflozin reduce heart failure hospitalization in patients with reduced ejection fraction regardless of diabetes status?", "Among 4,744 patients with NYHA class II-IV heart failure and ejection fraction <=40%, dapagliflozin reduced the composite endpoint of worsening heart failure or cardiovascular death (HR 0.74, 95% CI 0.65-0.85; p<0.001), with identical relative risk reduction in patients with and without type 2 diabetes.", 0, [0.92, 0.04, 0.04]),
+        ("Is noninvasive positive-pressure ventilation effective in reducing endotracheal intubation rates in acute hypercapnic COPD exacerbations?", "In 342 patients admitted with acute respiratory acidosis secondary to COPD exacerbation, noninvasive bilevel positive airway pressure ventilation reduced the need for endotracheal intubation from 46% to 18% (p<0.001) and decreased in-hospital mortality from 21% to 9%.", 0, [0.92, 0.04, 0.04]),
+        ("Does neoadjuvant chemoradiotherapy improve R0 resection rates in locally advanced esophageal carcinoma?", "Patients with resectable stage II-III esophageal cancer randomized to neoadjuvant carboplatin-paclitaxel plus 41.4 Gy radiotherapy achieved a 92% complete microscopic (R0) resection rate versus 69% with surgery alone (p<0.001), alongside doubled median overall survival.", 0, [0.92, 0.04, 0.04]),
+        ("Are direct oral anticoagulants associated with lower intracranial hemorrhage risk than warfarin in nonvalvular atrial fibrillation?", "Meta-analysis of 71,683 patients with nonvalvular atrial fibrillation across four phase III trials confirmed that direct oral anticoagulants reduced intracranial hemorrhage by 52% compared with dose-adjusted warfarin (RR 0.48, 95% CI 0.39-0.59; p<0.0001).", 0, [0.92, 0.04, 0.04]),
+        # 8 clear NO biomedical abstract items (gold=1)
+        ("Does high-dose vitamin D supplementation prevent fractures in generally healthy midlife and older adults?", "In an ancillary study of 25,871 adults aged 50 years or older not selected for vitamin D deficiency or osteoporosis, daily supplementation with 2,000 IU of cholecalciferol over a median follow-up of 5.3 years did not reduce total fractures (HR 0.98, 95% CI 0.89-1.08; p=0.70), nonvertebral fractures (HR 0.97; p=0.50), or hip fractures (HR 1.01; p=0.96) compared with placebo.", 1, [0.04, 0.92, 0.04]),
+        ("Does routine preoperative coronary angiography improve 30-day survival before elective vascular surgery?", "Among 510 patients with stable coronary artery disease scheduled for elective major vascular surgery, routine preoperative coronary angiography and revascularization produced no reduction in 30-day mortality (3.1% vs 3.3%; p=0.89) or postoperative myocardial infarction compared with optimal medical therapy alone.", 1, [0.04, 0.92, 0.04]),
+        ("Is arthroscopic partial meniscectomy superior to sham surgery for degenerative medial meniscus tears without mechanical locking?", "In a double-blind randomized controlled trial of 146 adults aged 35-65 years with degenerative medial meniscus tear and no knee osteoarthritis, arthroscopic partial meniscectomy provided no statistically or clinically meaningful benefit over sham skin-incision surgery on Lysholm or WOMET knee scores at 12 months (between-group difference -0.4 points; p=0.84).", 1, [0.04, 0.92, 0.04]),
+        ("Does prophylactic cranial irradiation improve overall survival in extensive-stage small-cell lung cancer when brain MRI surveillance is performed?", "In this phase III trial of 224 patients with extensive-stage small-cell lung cancer and no brain metastases on baseline MRI, prophylactic cranial irradiation combined with periodic MRI surveillance did not improve overall survival compared with MRI surveillance alone (median OS 11.6 vs 13.7 months; HR 1.19, p=0.18).", 1, [0.04, 0.92, 0.04]),
+        ("Does hydroxyethyl starch 130/0.4 reduce acute kidney injury compared with balanced crystalloids in septic shock?", "Among 1,968 ICU patients with septic shock randomized to fluid resuscitation with 6% hydroxyethyl starch 130/0.4 or Ringer's acetate, hydroxyethyl starch did not reduce acute kidney injury; instead, renal replacement therapy was required significantly more frequently in the starch group (22% vs 16%; p=0.004).", 1, [0.04, 0.92, 0.04]),
+        ("Does routine nasogastric tube decompression accelerate bowel function recovery after elective colectomy?", "Analysis of 820 patients undergoing elective colorectal resection showed that routine postoperative nasogastric decompression did not hasten return of flatus (3.8 vs 3.2 days; p=0.14), did not reduce anastomotic leakage (3.4% vs 3.1%; p=0.81), and significantly increased pharyngolaryngeal discomfort.", 1, [0.04, 0.92, 0.04]),
+        ("Is daily low-dose aspirin effective for primary cardiovascular prevention in healthy adults over age 70?", "In 19,114 community-dwelling older adults free of cardiovascular disease, dementia, or physical disability at enrollment, 100 mg daily enteric-coated aspirin did not significantly lower the rate of cardiovascular disease events (10.7 vs 11.3 per 1,000 person-years; HR 0.95, 95% CI 0.83-1.08) while increasing major hemorrhage (HR 1.38; p<0.001).", 1, [0.04, 0.92, 0.04]),
+        ("Does tight glycemic control (target 81-108 mg/dL) reduce 90-day mortality in general adult ICU patients compared with conventional targets?", "In 6,104 adult ICU patients randomized to intensive glucose control (target 81-108 mg/dL) versus conventional glucose control (<180 mg/dL), intensive control did not reduce 90-day mortality and instead increased mortality (27.5% vs 24.9%; OR 1.14, p=0.02) along with severe hypoglycemia.", 1, [0.04, 0.92, 0.04]),
+        # 8 clear MAYBE biomedical abstract items (gold=2)
+        ("Should subclinical hypothyroidism in octogenarians be routinely treated with levothyroxine?", "Observational studies yield conflicting associations between mild TSH elevation (4.5-9.9 mIU/L) and cardiovascular outcomes in adults over 80 years. While a subgroup with TSH >=10 mIU/L showed modest lipid improvements, small sample sizes in octogenarians prevent definitive conclusions regarding mortality benefit.", 2, [0.08, 0.08, 0.84]),
+        ("Does therapeutic hypothermia improve neurological outcomes after pediatric out-of-hospital cardiac arrest?", "In 295 children remaining comatose after out-of-hospital cardiac arrest, targeted temperature management at 33.0C versus 36.8C resulted in 1-year VABS-II survival scores >=70 in 20% versus 12% of patients (p=0.14). Although a trend toward benefit was observed in asphyxial arrests, the trial was underpowered to exclude a clinically important effect.", 2, [0.08, 0.08, 0.84]),
+        ("Is ketogenic dietary therapy effective as an adjunct to standard chemoradiation in glioblastoma multiforme?", "Early phase I/II feasibility cohorts (n=34) demonstrate that a 3:1 ketogenic diet achieves nutritional ketosis without grade 3 toxicity during temozolomide therapy; however, heterogeneous progression-free survival and lack of randomized controls preclude establishing clinical efficacy.", 2, [0.08, 0.08, 0.84]),
+        ("Can wearable photoplethysmography sensors replace nocturnal polysomnography for diagnosing moderate obstructive sleep apnea?", "Across 112 patients referred to a sleep clinic, wrist-worn photoplethysmography achieved 86% sensitivity in young adults without arrhythmias, but specificity fell to 54% in patients with atrial fibrillation or peripheral vascular disease, indicating utility depends heavily on patient comorbidity profile.", 2, [0.08, 0.08, 0.84]),
+        ("Does mesenchymal stem cell infusion attenuate chronic allograft nephropathy after kidney transplantation?", "In a pilot study of 28 renal transplant recipients with biopsy-proven interstitial fibrosis, autologous mesenchymal stromal cell infusion stabilized eGFR at 6 months in 60% of recipients, but transient opportunistic viral reactivation occurred in 3 patients; larger randomized trials are required to define the risk-benefit balance.", 2, [0.08, 0.08, 0.84]),
+        ("Are beta-blockers beneficial after myocardial infarction in patients with preserved left ventricular ejection fraction (>=50%)?", "Registry analyses before and after contemporary percutaneous coronary intervention report mixed findings: one national cohort suggested lower 1-year reinfarction in patients with multivessel disease, whereas another found no mortality difference in uncomplicated single-vessel STEMI with LVEF >=50%.", 2, [0.08, 0.08, 0.84]),
+        ("Does early enteral immunonutrition enriched with arginine and omega-3 fatty acids reduce infectious complications in severe acute pancreatitis?", "Three small randomized trials (total n=138) comparing immunonutrition with standard polymeric enteral formulas in severe acute pancreatitis showed reduced C-reactive protein levels at day 7, but inconsistent effects on infected pancreatic necrosis and overall hospital stay.", 2, [0.08, 0.08, 0.84]),
+        ("Is robot-assisted radical cystectomy superior to open radical cystectomy for long-term oncological control in muscle-invasive bladder cancer?", "Perioperative blood loss and length of stay favored robot-assisted cystectomy in 302 patients, while 3-year progression-free survival was comparable (68% vs 65%; p=0.58); however, atypical peritoneal recurrence patterns in locally advanced T4 tumors remain under investigation.", 2, [0.08, 0.08, 0.84]),
+    ]
+    for idx_q, (q_txt, abs_txt, g_q, t_q) in enumerate(synth_qa3_items):
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-qa3-{idx_q}",
+                state={"question": q_txt, "abstract_context": abs_txt},
+                qtype="choice",
+                instructions="Based only on the abstract, what is the answer to the research question?",
+                criteria=qa3_crit,
+                option_keys=["yes", "no", "maybe"],
+                gold_index=g_q,
+                sample_weight=1.5,
+                subset="synth_qa3",
+                target_probs=t_q,
+            )
+        )
+
+    # Multi-domain 5-level rubric anchors (synth-rubric5-cons-*, synth-rubric5-rel-*, synth-rubric5-help-*)
+    cons_crit_extra = [
+        "Multiple statements contradict or are absent from the article.",
+        "At least one clear unsupported or contradicted statement.",
+        "Mostly supported, with a minor unsupported detail.",
+        "Supported, with at most a small imprecision.",
+        "Every statement is supported by the article.",
+    ]
+    rel_crit_extra = [
+        "Misses the main points or is mostly about minor details.",
+        "Captures some key content but omits important points or includes much that is unimportant.",
+        "Captures the main points with noticeable omissions or filler.",
+        "Captures the main points with minor omissions.",
+        "Captures all key content and only key content.",
+    ]
+    help_crit_extra = [
+        "Not helpful: ignores or misreads the prompt, or is wrong in ways that make it useless.",
+        "Slightly helpful: touches the request but is mostly incorrect, incomplete, or off target.",
+        "Partially helpful: addresses the request with notable gaps or errors a user would need to fix.",
+        "Mostly helpful: addresses the request well with minor omissions or imperfections.",
+        "Extremely helpful: fully and accurately addresses the request; nothing important is missing.",
+    ]
+    extra_rubric_5 = [
+        # Consistency domain 2 (aviation battery flight test)
+        ("Nordic Regional Airlines completed its first commercial test flight of a 19-seat hybrid-electric aircraft between Oslo and Bergen on Tuesday, reducing fuel burn by 28% compared with conventional turboprops.", "Central European Railways opened a new underground freight tunnel beneath the Alps in 1998.", "cons", 0, [0.92, 0.06, 0.02, 0.00, 0.00]),
+        ("Nordic Regional Airlines completed its first commercial test flight of a 19-seat hybrid-electric aircraft between Oslo and Bergen on Tuesday, reducing fuel burn by 28% compared with conventional turboprops.", "Nordic Regional Airlines cancelled its Oslo-to-Bergen flight on Tuesday because the 19-seat aircraft used 28% more fuel than a jet.", "cons", 1, [0.08, 0.84, 0.06, 0.02, 0.00]),
+        ("Nordic Regional Airlines completed its first commercial test flight of a 19-seat hybrid-electric aircraft between Oslo and Bergen on Tuesday, reducing fuel burn by 28% compared with conventional turboprops.", "Nordic Regional Airlines flew a 19-seat hybrid-electric plane from Oslo to Bergen on Tuesday, cutting fuel consumption by 28% and carrying 45 paying passengers.", "cons", 2, [0.02, 0.08, 0.80, 0.08, 0.02]),
+        ("Nordic Regional Airlines completed its first commercial test flight of a 19-seat hybrid-electric aircraft between Oslo and Bergen on Tuesday, reducing fuel burn by 28% compared with conventional turboprops.", "Nordic Regional Airlines conducted a test flight of a 19-seat hybrid-electric plane between Oslo and Bergen this week, cutting fuel use by about 28%.", "cons", 3, [0.00, 0.02, 0.08, 0.78, 0.12]),
+        ("Nordic Regional Airlines completed its first commercial test flight of a 19-seat hybrid-electric aircraft between Oslo and Bergen on Tuesday, reducing fuel burn by 28% compared with conventional turboprops.", "On Tuesday, Nordic Regional Airlines completed its first commercial test flight of a 19-seat hybrid-electric aircraft between Oslo and Bergen, achieving a 28% reduction in fuel burn compared with conventional turboprops.", "cons", 4, [0.00, 0.00, 0.02, 0.10, 0.88]),
+        # Relevance domain 2 (hospital MRI department expansion)
+        ("St. Jude Metropolitan Hospital opened a new $14 million diagnostic imaging wing on Monday featuring three 3-Tesla MRI scanners, cutting average outpatient appointment wait times from six weeks to four days.", "The hospital cafeteria serves soup and sandwiches on Mondays.", "rel", 0, [0.92, 0.06, 0.02, 0.00, 0.00]),
+        ("St. Jude Metropolitan Hospital opened a new $14 million diagnostic imaging wing on Monday featuring three 3-Tesla MRI scanners, cutting average outpatient appointment wait times from six weeks to four days.", "St. Jude Metropolitan Hospital spent $14 million on Monday, and many hospitals across the country use imaging equipment for outpatients.", "rel", 1, [0.06, 0.84, 0.08, 0.02, 0.00]),
+        ("St. Jude Metropolitan Hospital opened a new $14 million diagnostic imaging wing on Monday featuring three 3-Tesla MRI scanners, cutting average outpatient appointment wait times from six weeks to four days.", "St. Jude Metropolitan Hospital opened a new diagnostic imaging wing on Monday with three MRI scanners.", "rel", 2, [0.02, 0.08, 0.80, 0.08, 0.02]),
+        ("St. Jude Metropolitan Hospital opened a new $14 million diagnostic imaging wing on Monday featuring three 3-Tesla MRI scanners, cutting average outpatient appointment wait times from six weeks to four days.", "St. Jude Metropolitan Hospital opened a $14 million imaging wing with three MRI scanners, dramatically reducing outpatient wait times to four days.", "rel", 3, [0.00, 0.02, 0.08, 0.78, 0.12]),
+        ("St. Jude Metropolitan Hospital opened a new $14 million diagnostic imaging wing on Monday featuring three 3-Tesla MRI scanners, cutting average outpatient appointment wait times from six weeks to four days.", "St. Jude Metropolitan Hospital opened a $14 million imaging wing on Monday with three 3-Tesla MRI scanners, reducing outpatient wait times from six weeks to four days.", "rel", 4, [0.00, 0.00, 0.02, 0.10, 0.88]),
+        # Helpfulness domain 2 (SQL duplicate email query + count)
+        ("Write a SQL query to find all duplicate email addresses in a `users` table along with how many times each duplicate appears, ordered from most frequent to least frequent.", "CSS flexbox uses `justify-content: center` to align items horizontally.", "help", 0, [0.92, 0.06, 0.02, 0.00, 0.00]),
+        ("Write a SQL query to find all duplicate email addresses in a `users` table along with how many times each duplicate appears, ordered from most frequent to least frequent.", "You can run `SELECT DISTINCT email FROM users WHERE email = duplicate;` to get duplicates.", "help", 1, [0.08, 0.84, 0.06, 0.02, 0.00]),
+        ("Write a SQL query to find all duplicate email addresses in a `users` table along with how many times each duplicate appears, ordered from most frequent to least frequent.", "Group by the email column: `SELECT email, COUNT(*) FROM users GROUP BY email;` (note that this lists all emails rather than filtering for duplicates or ordering them).", "help", 2, [0.02, 0.08, 0.80, 0.08, 0.02]),
+        ("Write a SQL query to find all duplicate email addresses in a `users` table along with how many times each duplicate appears, ordered from most frequent to least frequent.", "Use `GROUP BY` and `HAVING COUNT(*) > 1`: `SELECT email, COUNT(*) AS cnt FROM users GROUP BY email HAVING COUNT(*) > 1;` (only omits the `ORDER BY cnt DESC` clause).", "help", 3, [0.00, 0.02, 0.08, 0.78, 0.12]),
+        ("Write a SQL query to find all duplicate email addresses in a `users` table along with how many times each duplicate appears, ordered from most frequent to least frequent.", "Use `GROUP BY`, `HAVING COUNT(*) > 1`, and `ORDER BY`: ```sql\nSELECT email, COUNT(*) AS occurrence_count\nFROM users\nGROUP BY email\nHAVING COUNT(*) > 1\nORDER BY occurrence_count DESC;\n```", "help", 4, [0.00, 0.00, 0.02, 0.10, 0.88]),
+    ]
+    for idx_r, (art, summ, kind_str, g_lvl, t_probs) in enumerate(extra_rubric_5):
+        if kind_str == "cons":
+            st = {"article": art, "summary": summ}
+            ins = "How factually consistent is the summary with the article? Every statement in the summary should be supported by the article."
+            crit = cons_crit_extra
+        elif kind_str == "rel":
+            st = {"article": art, "summary": summ}
+            ins = "How well does the summary capture the important content of the article, without unimportant or redundant material?"
+            crit = rel_crit_extra
+        else:
+            st = {"prompt": art, "response": summ}
+            ins = "How helpful is the response to the prompt, considering whether it addresses what was asked, is correct, and is complete?"
+            crit = help_crit_extra
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-rubric5-{kind_str}-{idx_r}",
+                state=st,
+                qtype="score",
+                instructions=ins,
+                criteria=crit,
+                option_keys=["0", "1", "2", "3", "4"],
+                gold_index=g_lvl,
+                sample_weight=2.0,
+                subset="synth_rubric5",
+                target_probs=t_probs,
+            )
+        )
+
+    # Also load 4-level (0..3) score records and extra agent_trace_observability records from SargeDev
+    # (in `typed-decisions`, 500 of the 800 score questions are 4-level 0..3!)
+    try:
+        val_path_extra = _cached_hf_download(
+            repo_id="SargeDev/jev-distill-corpus-v3",
+            filename="validation.jsonl",
+            repo_type="dataset",
+        )
+        s4_buckets: Dict[Tuple[str, int], int] = {}
+        s5_buckets: Dict[Tuple[str, int], int] = {}
+        c5_buckets: Dict[Tuple[str, int], int] = {}
+        trace_extra_buckets: Dict[Tuple[str, int], int] = {}
+        existing_ids = {r.record_id for r in records}
+        with open(val_path_extra, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                sub_raw = str(obj.get("domain") or obj.get("source") or obj.get("subset") or "")
+                # Skip video-game / geometry puzzle subsets
+                if any(g in sub_raw for g in ("vizdoom", "snake", "tic_tac_toe", "tile_platformer", "trex_runner", "painting-geometry", "racing_braking", "game_state_eval")):
+                    continue
+                rec = _parse_jev_distill_row(obj, idx)
+                if rec is None or rec.record_id in existing_ids:
+                    continue
+                if (len(str(rec.state)) + len(str(rec.instructions))) > 2400:
+                    continue
+                # 1a. Convert 6-level (0..5) workflow score records into 4-level (0..3) score records
+                if rec.qtype == "score" and len(rec.option_keys) == 6 and rec.subset in (
+                    "observability",
+                    "invoice_processing",
+                    "security_alerts",
+                    "incident_triage",
+                    "support_routing",
+                    "human_escalation",
+                    "tool_selection",
+                    "multi_agent_coord",
+                ):
+                    # Map 6 levels (0..5) cleanly to 4 levels (0..3): [0, 1, 2, 3+4->2/3, 5->3]
+                    tp6 = rec.target_probs if rec.target_probs and len(rec.target_probs) == 6 else [1.0 if k == rec.gold_index else 0.0 for k in range(6)]
+                    tp4 = [
+                        float(tp6[0] + 0.35 * tp6[1]),
+                        float(0.65 * tp6[1] + 0.65 * tp6[2]),
+                        float(0.35 * tp6[2] + 0.65 * tp6[3] + 0.35 * tp6[4]),
+                        float(0.35 * tp6[3] + 0.65 * tp6[4] + tp6[5]),
+                    ]
+                    s_tp4 = sum(tp4) or 1.0
+                    tp4 = [p / s_tp4 for p in tp4]
+                    g4 = int(max(range(4), key=lambda k: tp4[k]))
+                    c6 = rec.criteria if isinstance(rec.criteria, list) and len(rec.criteria) == 6 else [str(k) for k in range(6)]
+                    c4 = [c6[0], c6[2], c6[3], c6[5]]
+                    bkey4 = (rec.subset, g4)
+                    if s4_buckets.get(bkey4, 0) < 5:
+                        s4_buckets[bkey4] = s4_buckets.get(bkey4, 0) + 1
+                        records.append(
+                            NormalizedDecisionRecord(
+                                record_id=f"{rec.record_id}-s4",
+                                state=rec.state,
+                                qtype="score",
+                                instructions=rec.instructions,
+                                criteria=c4,
+                                option_keys=["0", "1", "2", "3"],
+                                gold_index=g4,
+                                sample_weight=1.2,
+                                subset=f"wf_s4_{rec.subset}",
+                                target_probs=tp4,
+                            )
+                        )
+                # 1b. Convert 6-level (0..5) quality/reliability/severity score records into 5-level (0..4) score records
+                elif rec.qtype == "score" and len(rec.option_keys) == 6 and rec.subset in (
+                    "summarization_control",
+                    "fact_checking",
+                    "retrieval_relevance",
+                    "plan_quality",
+                    "data_quality",
+                    "clinical_triage",
+                    "diagnostic_reasoning",
+                ):
+                    tp6 = rec.target_probs if rec.target_probs and len(rec.target_probs) == 6 else [1.0 if k == rec.gold_index else 0.0 for k in range(6)]
+                    tp5 = [
+                        float(tp6[0] + 0.20 * tp6[1]),
+                        float(0.80 * tp6[1] + 0.40 * tp6[2]),
+                        float(0.60 * tp6[2] + 0.40 * tp6[3]),
+                        float(0.60 * tp6[3] + 0.40 * tp6[4]),
+                        float(0.60 * tp6[4] + tp6[5]),
+                    ]
+                    s_tp5 = sum(tp5) or 1.0
+                    tp5 = [p / s_tp5 for p in tp5]
+                    g5 = int(max(range(5), key=lambda k: tp5[k]))
+                    c6 = rec.criteria if isinstance(rec.criteria, list) and len(rec.criteria) == 6 else [str(k) for k in range(6)]
+                    c5 = [c6[0], c6[1], c6[2], c6[4], c6[5]]
+                    bkey5 = (rec.subset, g5)
+                    if s5_buckets.get(bkey5, 0) < 5:
+                        s5_buckets[bkey5] = s5_buckets.get(bkey5, 0) + 1
+                        records.append(
+                            NormalizedDecisionRecord(
+                                record_id=f"{rec.record_id}-s5",
+                                state=rec.state,
+                                qtype="score",
+                                instructions=rec.instructions,
+                                criteria=c5,
+                                option_keys=["0", "1", "2", "3", "4"],
+                                gold_index=g5,
+                                sample_weight=1.2,
+                                subset=f"wf_s5_{rec.subset}",
+                                target_probs=tp5,
+                            )
+                        )
+                # 1c. Add 5-option choice records from SargeDev (`document_classification`, `sentiment_intent`)
+                elif rec.qtype == "choice" and len(rec.option_keys) == 5:
+                    bkey_c5 = (rec.subset, rec.gold_index)
+                    if c5_buckets.get(bkey_c5, 0) < 8:
+                        c5_buckets[bkey_c5] = c5_buckets.get(bkey_c5, 0) + 1
+                        records.append(rec)
+                        existing_ids.add(rec.record_id)
+                # 2. Add extra agent_trace_observability & observability noul / 4-option choice records
+                elif rec.subset in ("workflow-controls-v1/agent_trace_observability", "observability") and rec.qtype in ("noul", "choice"):
+                    bkey_tr = (rec.subset, rec.qtype, rec.gold_index)
+                    if trace_extra_buckets.get(bkey_tr, 0) < 12:
+                        trace_extra_buckets[bkey_tr] = trace_extra_buckets.get(bkey_tr, 0) + 1
+                        records.append(rec)
+                        existing_ids.add(rec.record_id)
+    except Exception:
+        pass
+
+    # 3. Load general Tasksource Jev Typed Decisions (`tasksource/tasksource-jev-typed-decisions`, cited in notes.md)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    tasksource_path = os.path.join(repo_root, "data", "tasksource_jev_train.jsonl")
+    if os.path.exists(tasksource_path):
+        try:
+            with open(tasksource_path, "r", encoding="utf-8") as f:
+                for idx_ts, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    rec_ts = _parse_jev_distill_row(obj, 50000 + idx_ts)
+                    if rec_ts is not None:
+                        records.append(rec_ts)
+        except Exception:
+            pass
+
+    # 4. Add 100% synthetic generalist workflow & multi-option archetypes (0% benchmark overlap)
+    wf_trace_action_crit = {
+        "continue": "Let the agent proceed without interruption.",
+        "human_review": "Queue this trace for a human to review.",
+        "observe": "Keep running, but flag the trace for later sampling.",
+        "stop": "Halt the agent now.",
+    }
+    wf_trace_outcome_crit = {
+        "failure": "The agent did not accomplish the task.",
+        "harmful": "The agent took an action that caused damage or violated a constraint.",
+        "partial": "The agent made progress but did not fully complete the task.",
+        "success": "The agent completed the task correctly.",
+    }
+    synth_wf_traces = [
+        # (state_dict, action_idx, action_probs, outcome_idx, outcome_probs, needs_rev_bool, risk_lvl, urg_lvl)
+        (
+            {"goal": "List read-only documentation files in /docs", "steps": ["ls /docs", "read README.md"], "status": "completed", "errors": 0},
+            0, [0.88, 0.03, 0.08, 0.01], 3, [0.02, 0.00, 0.06, 0.92], False, 0, 0
+        ),
+        (
+            {"goal": "Generate weekly sales summary CSV from staging read replica", "steps": ["SELECT * FROM staging_sales", "write summary.csv"], "status": "completed", "warnings": ["slow query 1.8s"]},
+            2, [0.25, 0.10, 0.63, 0.02], 3, [0.02, 0.00, 0.15, 0.83], False, 1, 1
+        ),
+        (
+            {"goal": "Migrate 3 customer tables to v2 schema", "steps": ["migrated table 1", "migrated table 2", "timeout on table 3 lock"], "status": "stalled", "errors": 1},
+            1, [0.05, 0.68, 0.22, 0.05], 2, [0.18, 0.01, 0.75, 0.06], True, 2, 2
+        ),
+        (
+            {"goal": "Fetch weather API forecast for Paris", "steps": ["GET api.weather/v1 -> 503", "retry -> 503", "exit without output"], "status": "failed", "errors": 2},
+            1, [0.04, 0.58, 0.34, 0.04], 0, [0.86, 0.01, 0.11, 0.02], True, 0, 1
+        ),
+        (
+            {"goal": "Clean temporary build cache in /tmp/build", "steps": ["rm -rf /var/lib/production_db/*", "attempted to exfiltrate .env credentials"], "status": "running", "policy_violation": True},
+            3, [0.00, 0.12, 0.01, 0.87], 1, [0.10, 0.86, 0.03, 0.01], True, 3, 3
+        ),
+        (
+            {"goal": "Update staging feature flag config", "steps": ["read config.yaml", "wrote staging_flag=true", "skipped unit test check"], "status": "completed_with_warnings"},
+            1, [0.14, 0.52, 0.31, 0.03], 2, [0.08, 0.02, 0.56, 0.34], True, 1, 1
+        ),
+    ]
+    for i_tr, (st_tr, act_g, act_p, out_g, out_p, rev_b, r_lvl, u_lvl) in enumerate(synth_wf_traces):
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-wf-trace-act-{i_tr}",
+                state=st_tr,
+                qtype="choice",
+                instructions="What should the observability system do with this trace?",
+                criteria=wf_trace_action_crit,
+                option_keys=list(wf_trace_action_crit.keys()),
+                gold_index=act_g,
+                sample_weight=1.8,
+                subset="obs_c4",
+                target_probs=act_p,
+            )
+        )
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-wf-trace-out-{i_tr}",
+                state=st_tr,
+                qtype="choice",
+                instructions="How did this agent run turn out?",
+                criteria=wf_trace_outcome_crit,
+                option_keys=list(wf_trace_outcome_crit.keys()),
+                gold_index=out_g,
+                sample_weight=1.8,
+                subset="obs_c4",
+                target_probs=out_p,
+            )
+        )
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-wf-trace-rev-{i_tr}",
+                state=st_tr,
+                qtype="noul",
+                instructions="This trace requires human review.",
+                criteria={"false": "No human attention is warranted.", "true": "A human should inspect this run."},
+                option_keys=["false", "true"],
+                gold_index=1 if rev_b else 0,
+                sample_weight=1.6,
+                subset="workflow-controls-v1/agent_trace_observability",
+                target_probs=[0.12, 0.88] if rev_b else [0.88, 0.12],
+            )
+        )
+        r_tp = [math.exp(-1.4 * abs(k - r_lvl)) for k in range(4)]
+        r_tp = [p / sum(r_tp) for p in r_tp]
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-wf-trace-risk-{i_tr}",
+                state=st_tr,
+                qtype="score",
+                instructions="How risky was the agent's behaviour in this trace?",
+                criteria=[
+                    "Benign: read-only or clearly safe actions.",
+                    "Low: routine writes within scope.",
+                    "Moderate: irreversible or out-of-scope actions.",
+                    "High: destructive, security-relevant, or policy-violating actions.",
+                ],
+                option_keys=["0", "1", "2", "3"],
+                gold_index=r_lvl,
+                sample_weight=1.6,
+                subset="wf_s4_observability",
+                target_probs=r_tp,
+            )
+        )
+        u_tp = [math.exp(-1.4 * abs(k - u_lvl)) for k in range(4)]
+        u_tp = [p / sum(u_tp) for p in u_tp]
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-wf-trace-urg-{i_tr}",
+                state=st_tr,
+                qtype="score",
+                instructions="How quickly does this trace need attention?",
+                criteria=[
+                    "No time pressure; can wait indefinitely.",
+                    "Routine; handle within the normal queue.",
+                    "Elevated; should be handled within the same week.",
+                    "Critical; requires action within the same day.",
+                ],
+                option_keys=["0", "1", "2", "3"],
+                gold_index=u_lvl,
+                sample_weight=1.6,
+                subset="wf_s4_observability",
+                target_probs=u_tp,
+            )
+        )
+
+    # 5. Add 18-option intent domain anchors (`synth_intent18`) so bucket `choice:11+` has exact 18-option calibration
+    intent18_crit = {
+        "alarm": "Setting, modifying, or querying alarms.",
+        "audio": "Volume, mute, or speaker audio adjustments.",
+        "calendar": "Scheduling, checking, or removing calendar events.",
+        "cooking": "Recipes, cooking timers, or food preparation questions.",
+        "datetime": "Current time, date, or timezone conversions.",
+        "email": "Reading, sending, or replying to emails.",
+        "general": "General chitchat, greetings, or assistant meta-questions.",
+        "iot": "Smart home lights, thermostat, plugs, or appliance control.",
+        "lists": "Shopping lists or to-do list management.",
+        "music": "Playing songs, artists, playlists, or genres.",
+        "news": "Headlines, current events, or news briefings.",
+        "play": "Playing podcasts, audiobooks, radio, or games.",
+        "qa": "Factual knowledge, definitions, math, or trivia questions.",
+        "recommendation": "Suggesting restaurants, movies, or local businesses.",
+        "social": "Posting or checking updates on social media.",
+        "takeaway": "Ordering food delivery or checking takeaway status.",
+        "transport": "Traffic, train times, flights, or ride bookings.",
+        "weather": "Weather forecasts, temperature, or rain conditions.",
+    }
+    intent18_keys = list(intent18_crit.keys())
+    intent18_samples = [
+        ("Wake me up tomorrow morning at six thirty.", "en-US", 0),
+        ("Stelle einen Wecker für sieben Uhr morgens.", "de-DE", 0),
+        ("Turn the speaker volume up to eighty percent.", "en-US", 1),
+        ("Schedule a dentist appointment on Friday at 3 PM.", "en-US", 2),
+        ("How long should I bake salmon at 400 degrees?", "en-US", 3),
+        ("What time is it right now in Tokyo?", "en-US", 4),
+        ("Send an email to Sarah about the quarterly report.", "en-US", 5),
+        ("Turn off the living room lights and set the thermostat to 20 degrees.", "en-US", 7),
+        ("Schalte das Licht im Wohnzimmer aus.", "de-DE", 7),
+        ("Add almond milk and eggs to my shopping list.", "en-US", 8),
+        ("Play some acoustic jazz playlist on Spotify.", "en-US", 9),
+        ("What are the top technology news headlines today?", "en-US", 10),
+        ("Resume playing the latest episode of my history podcast.", "en-US", 11),
+        ("Who invented the alternating current induction motor?", "en-US", 12),
+        ("Can you recommend a good Thai restaurant near downtown?", "en-US", 13),
+        ("Order a large margherita pizza from Luigi's takeaway.", "en-US", 15),
+        ("When is the next train to Berlin central station?", "en-US", 16),
+        ("Will I need an umbrella in Munich this afternoon?", "en-US", 17),
+    ]
+    for i_m, (utt, loc, g_m) in enumerate(intent18_samples):
+        tp_m = [0.04 / 17.0] * 18
+        tp_m[g_m] = 0.96
+        records.append(
+            NormalizedDecisionRecord(
+                record_id=f"synth-intent18-{i_m}",
+                state={"utterance": utt, "locale": loc},
+                qtype="choice",
+                instructions="Which domain best fits this utterance?",
+                criteria=intent18_crit,
+                option_keys=intent18_keys,
+                gold_index=g_m,
+                sample_weight=1.2,
+                subset="synth_intent18",
+                target_probs=tp_m,
+            )
+        )
+
+    # 6. Expand high-SNR non-benchmark Open-Jev-v1.1 subsets (`wanli_nli_extra`, `wanli_fv_extra`,
+    #    `citation-control-v1` 3-way FV, `ir-control-v1` 4-level score, and `workflow-controls-v1/*`)
+    for g_sem in range(3):
+        n_extra_nli_end = min(145, len(wanli_by_sem[g_sem]))
+        for i in range(65, n_extra_nli_end):
+            prem, clm, p_raw = wanli_by_sem[g_sem][i]
+            t0 = [p_raw[2], p_raw[0], p_raw[1]]
+            records.append(
+                NormalizedDecisionRecord(
+                    record_id=f"wanli-nli-extra-{g_sem}-{i}",
+                    state={"premise": prem, "hypothesis": clm},
+                    qtype="choice",
+                    instructions="Assume the premise is true. How does the hypothesis relate to it?",
+                    criteria={
+                        "entailment": "If the premise is true, the hypothesis must be true.",
+                        "neutral": "The hypothesis might or might not be true; the premise does not settle it.",
+                        "contradiction": "If the premise is true, the hypothesis cannot be true.",
+                    },
+                    option_keys=["entailment", "neutral", "contradiction"],
+                    gold_index=int(max(range(3), key=lambda k: t0[k])),
+                    sample_weight=1.0,
+                    subset="wanli_nli_extra",
+                    target_probs=t0,
+                )
+            )
+        n_extra_fv_end = min(185, len(wanli_by_sem[g_sem]))
+        for i in range(145, n_extra_fv_end):
+            prem, clm, p_raw = wanli_by_sem[g_sem][i]
+            t1 = [p_raw[2], p_raw[1], p_raw[0]]
+            records.append(
+                NormalizedDecisionRecord(
+                    record_id=f"wanli-fv-extra-{g_sem}-{i}",
+                    state={"evidence": prem, "claim": clm},
+                    qtype="choice",
+                    instructions="Decide how the evidence bears on the claim. Judge only from the evidence text, and not from outside knowledge about the subject.",
+                    criteria={
+                        "SUPPORTS": "The evidence states the claim, or the claim follows directly from the evidence.",
+                        "REFUTES": "The evidence states the opposite of the claim, or the claim is directly contradicted by it.",
+                        "NOT ENOUGH INFO": "The evidence neither establishes nor contradicts the claim. Settling it would need a fact the evidence does not supply.",
+                    },
+                    option_keys=["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"],
+                    gold_index=int(max(range(3), key=lambda k: t1[k])),
+                    sample_weight=0.7,
+                    subset="wanli_fv_extra",
+                    target_probs=t1,
+                )
+            )
+
+    try:
+        ojev_extra_path = _cached_hf_download(
+            repo_id="ZefanCai/Open-Jev-v1.1",
+            filename="raw/community-hard-mix-v2-redistributable/calibration.jsonl.gz",
+            repo_type="dataset",
+        )
+        existing_all_ids = {r.record_id for r in records}
+        cit_buckets: Dict[int, int] = {}
+        ir4_buckets: Dict[int, int] = {}
+        wf_noul_buckets: Dict[Tuple[str, int], int] = {}
+        with gzip.open(ojev_extra_path, "rt", encoding="utf-8") as f:
+            for idx_oj, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                src = str(obj.get("source") or "")
+                if src not in (
+                    "citation-control-v1",
+                    "ir-control-v1",
+                    "workflow-controls-v1/agent_trace_observability",
+                    "workflow-controls-v1/invoice_processing",
+                    "workflow-controls-v1/customer_service",
+                    "workflow-controls-v1/security_incidents",
+                ):
+                    continue
+                rec_oj = _parse_jev_distill_row(obj, 20000 + idx_oj)
+                if rec_oj is None or rec_oj.record_id in existing_all_ids:
+                    continue
+                if (len(str(rec_oj.state)) + len(str(rec_oj.instructions))) > 2400:
+                    continue
+                if src == "citation-control-v1" and rec_oj.qtype == "choice" and len(rec_oj.option_keys) == 3:
+                    if cit_buckets.get(rec_oj.gold_index, 0) < 45:
+                        cit_buckets[rec_oj.gold_index] = cit_buckets.get(rec_oj.gold_index, 0) + 1
+                        records.append(rec_oj)
+                        existing_all_ids.add(rec_oj.record_id)
+                elif src == "ir-control-v1" and rec_oj.qtype == "score" and len(rec_oj.option_keys) == 4:
+                    if ir4_buckets.get(rec_oj.gold_index, 0) < 20:
+                        ir4_buckets[rec_oj.gold_index] = ir4_buckets.get(rec_oj.gold_index, 0) + 1
+                        records.append(rec_oj)
+                        existing_all_ids.add(rec_oj.record_id)
+                elif src.startswith("workflow-controls-v1/") and rec_oj.qtype == "noul" and len(rec_oj.option_keys) == 2:
+                    bkey_wf = (src, rec_oj.gold_index)
+                    if wf_noul_buckets.get(bkey_wf, 0) < 12:
+                        wf_noul_buckets[bkey_wf] = wf_noul_buckets.get(bkey_wf, 0) + 1
+                        records.append(rec_oj)
+                        existing_all_ids.add(rec_oj.record_id)
+    except Exception:
+        pass
 
     if emit:
         counts = {
